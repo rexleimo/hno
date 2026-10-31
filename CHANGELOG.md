@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ Added
+- **Sandbox contract layer** (`pkg/hno/sandbox`): a provider-neutral execution
+  contract that replaces the one-shot `Run`/`Close` shape of
+  `pkg/hno/tools/run` without touching it. One `execute()` pipeline backs both
+  `Sandbox.Run` and `Session.Exec`, so policy, audit, failure classification,
+  artefacts, and replayable-spec semantics are identical in both paths.
+  - Isolation is an enum (`IsolationNone` … `IsolationMicroVMHosted`) and
+    deployment shape is a separate axis (`FormationInProc`/`Remote`/`Sidecar`/
+    `Hosted`); neither is a magic number any more.
+  - Failures return as typed errors **and** a populated `Report` — seven
+    classes (`user-code`, `denied`, `permanent`, `transient`, `resource`,
+    `timeout`, `lost`) that feed the existing `graph.RetryConfig` instead of a
+    second retry engine.
+  - Extension points are split by what they may affect: `Policy` (may deny or
+    tighten, never widen — enforced by comparing a privilege score),
+    `Observer` (events only), `Sink` (streaming only). A panicking policy fails
+    closed.
+  - Replayable spec: `Install`/`Setup`/`SetEnv`/file steps record `Step` entries
+    so `RebuildFromSpec` (default, D-11) re-renders an environment instead of
+    replaying disk history, with step-level caching.
+  - `lockdown` (`detect` for development, `enforce` for production) converts an
+    undeclared `pip install` into `Failure.NextAction = use_install_api` plus the
+    equivalent `Install(Pip(...))` call.
+  - `Preflight(ctx, ...Option)` diagnoses "why can't this run here?" before a
+    handle exists — the case `Sandbox.Diagnose` cannot reach, since it needs a
+    provider that already resolved.
+- **Reference provider** (`pkg/hno/sandbox/sandboxtest`): an in-memory engine
+  that implements the optional interfaces (sessions, file bridge, streaming,
+  snapshots, rebuild, egress allow-list, lease sweep) so the contract is testable
+  without BoxLite, `/dev/kvm`, containers, or network egress.
+- **Design record**: `docs/design/sandbox-runtime-architecture.html` (v1.0, 17
+  sections, decision ledger `D-01`…`D-19`) and
+  `docs/design/sandbox-litebox-evaluation-and-provider-plan.md`, including the
+  Microsoft LiteBox rejection and the BoxLite provider plan.
+
 ## [3.0.0] - 2026-09-29
 
 The v3 program: a lock-free control-flow graph engine with policies,
