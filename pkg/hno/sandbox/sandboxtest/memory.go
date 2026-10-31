@@ -365,6 +365,23 @@ func (e *Env) interpret(ctx context.Context, spec sandbox.RunSpec, sink sandbox.
 		}
 		return line + "\n", "", 0, nil
 
+	case strings.HasPrefix(code, "#!fail "):
+		// `#!fail <exit> <message>` writes message to stderr and exits with the
+		// given code. It exists because #!exit produces a fixed message, which is
+		// no use for asserting that a phase keeps the *payload's own* diagnostic —
+		// the thing a model has to read in order to fix its code (§16.4).
+		rest := strings.TrimPrefix(code, "#!fail ")
+		raw, msg, found := strings.Cut(rest, " ")
+		if !found {
+			return "", "no message given", 1, nil
+		}
+		var n int
+		fmt.Sscanf(raw, "%d", &n)
+		if n == 0 {
+			n = 1
+		}
+		return "", msg + "\n", n, nil
+
 	case strings.HasPrefix(code, "#!exit "):
 		var n int
 		fmt.Sscanf(strings.TrimPrefix(code, "#!exit "), "%d", &n)

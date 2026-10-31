@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"path"
 	"sort"
 	"strings"
@@ -186,7 +185,11 @@ func (c *collector) collectFile(ctx context.Context, spec ArtifactSpec, limit in
 		}
 		c.dropped = append(c.dropped, spec.Path)
 	}
-	add(artifactFrom(ctx, c.fs, spec, limit, truncated))
+	collected, err := artifactFrom(ctx, spec, limit, truncated, info.Size, c.fs)
+	if err != nil {
+		return false, 0, err
+	}
+	add(collected)
 	return true, minInt64(info.Size, maxInt64(limit, 1)), nil
 }
 
@@ -247,32 +250,42 @@ func (c *collector) collectGlob(ctx context.Context, spec ArtifactSpec, limit in
 	return found, total, nil
 }
 
-// artifactFrom builds a lazily readable handle bound to the byte budget.
-func artifactFrom(ctx context.Context, fs envFileSource, spec ArtifactSpec, limit int64, truncated bool) Artifact {
+// artifactFrom collects one artefact's content within the byte budget.
+//
+// The read happens now, during collection, while the environment is certainly
+// alive. Returning a lazy handle into the environment would break two ways: a
+// one-shot run closes its environment before the caller receives the report, and a
+// session that expires later would invalidate artefacts a workflow already consumed.
+// The report is the deliverable, so the bytes travel inside it, bounded by
+// Limits.ArtifactMaxBytes and the set total (§13.4).
+func artifactFrom(ctx context.Context, spec ArtifactSpec, limit int64, truncated bool, size int64, fs envFileSource) (Artifact, error) {
 	name := spec.As
 	if name == "" {
 		name = spec.Path
 	}
-	src := spec // capture by value: the caller's spec may be reused
+	data, err := fs.Read(ctx, spec.Path)
+	if err != nil {
+		return Artifact{}, fmt.Errorf("sandbox: read artefact %q: %w", spec.Path, err)
+	}
+	// The budget is applied here rather than trusted from the engine, because a
+	// provider that ignores MaxBytes must not be able to hand the caller an
+	// over-limit blob.
+	if limit > 0 && int64(len(data)) > limit {
+		data = data[:limit]
+		truncated = true
+	}
+	sum := sha256.Sum256(data)
 	return Artifact{
 		Name:      name,
-		Path:      src.Path,
-		Kind:      inferKind(src),
+		Path:      spec.Path,
+		Kind:      inferKind(spec),
+		Size:      int64(len(data)),
 		Truncated: truncated,
-		opener: func(ctx context.Context) (io.ReadCloser, error) {
-			data, err := fs.Read(ctx, src.Path)
-			if err != nil {
-				return nil, fmt.Errorf("sandbox: read artefact %q: %w", src.Path, err)
-			}
-			if limit > 0 && int64(len(data)) > limit {
-				data = data[:limit]
-			}
-			return io.NopCloser(strings.NewReader(string(data))), nil
-		},
-	}
+		Digest:    "sha256:" + hex.EncodeToString(sum[:]),
+		data:      data,
+	}, nil
 }
 
-// filesOf resolves the file surface of an environment.
 func (sb *Sandbox) filesOf(ctx context.Context, env Environment) (envFileSource, error) {
 	if !sb.caps.Has(CapFileBridge) {
 		return nil, &CapabilityError{Provider: sb.name, Missing: CapFileBridge, Wanted: sb.caps}
@@ -281,11 +294,35 @@ func (sb *Sandbox) filesOf(ctx context.Context, env Environment) (envFileSource,
 	if !ok {
 		return nil, &CapabilityError{Provider: sb.name, Missing: CapFileBridge, Wanted: sb.caps}
 	}
-	fs, err := bridge.Files(ctx, env)
+	fs, err := bridge.Files(ctx, rawEnvironment(env))
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: file bridge: %w", err)
 	}
 	return fs, nil
+}
+
+// rawEnvironment unwraps core decorations so a provider is handed an environment
+// object it created itself.
+//
+// The core wraps a one-shot environment in closerOnce to guarantee cleanup. Passing
+// that wrapper to FileBridge.Files hands the provider a type it never built, and a
+// provider that checks (as it should) rejects it as foreign — which surfaced as
+// "file bridge: foreign environment" on any single Run that declared outputs.
+func rawEnvironment(env Environment) Environment {
+	for {
+		switch w := env.(type) {
+		case closerOnce:
+			env = w.Environment
+		case interface{ Unwrap() Environment }:
+			if inner := w.Unwrap(); inner != nil && inner != env {
+				env = inner
+				continue
+			}
+			return env
+		default:
+			return env
+		}
+	}
 }
 
 // --- path helpers ----------------------------------------------------------
@@ -397,9 +434,25 @@ type fanout struct {
 	closed bool
 }
 
-// newFanout prepares output delivery for one run.
-func (sb *Sandbox) newFanout(runID string) *fanout {
-	return &fanout{sb: sb, runID: runID, sinks: sb.cfg.Sinks}
+// defaultSinkBuffer is the per-sink queue depth when a binding does not state
+// one. It is shared with config resolution so handle-level and per-run sinks
+// cannot end up with different defaults.
+const defaultSinkBuffer = 256
+
+// newFanout prepares output delivery for one run. Per-run bindings are appended
+// to the handle's, because WithRunSink exists for the caller who wants output for
+// exactly this run: dropping it silently would be the failure mode D-05 forbids.
+func (sb *Sandbox) newFanout(runID string, extra ...SinkBinding) *fanout {
+	sinks := append(append([]SinkBinding(nil), sb.cfg.Sinks...), extra...)
+	for i := range sinks {
+		if sinks[i].Buffered <= 0 {
+			sinks[i].Buffered = defaultSinkBuffer
+		}
+		if sinks[i].OnOverflow == OverflowUnset {
+			sinks[i].OnOverflow = sb.cfg.Limits.Overflow
+		}
+	}
+	return &fanout{sb: sb, runID: runID, sinks: sinks}
 }
 
 // enabled reports whether anybody is listening.

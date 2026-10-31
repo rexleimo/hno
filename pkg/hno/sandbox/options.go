@@ -22,6 +22,19 @@ type Limits struct {
 	ArtifactTotalMaxBytes int64
 	// EnvMaxEntries bounds declared environment entries.
 	EnvMaxEntries int
+	// CPUCount caps the processors an environment may use. Zero means the engine
+	// default, which the core never guesses upward: a provider that needs a number
+	// either gets one from the profile or leaves the engine alone.
+	CPUCount int
+	// MemoryMB caps resident memory per environment. Zero means engine default.
+	// Enforced by the engine, not by counting inside the sandbox, since a guest
+	// that reports its own usage is not a limit (§16.1).
+	MemoryMB int64
+	// PidsLimit caps processes, which is what stops a fork bomb from consuming
+	// the engine's process table. Zero means engine default.
+	PidsLimit int
+	// DiskMB caps the writable workspace. Zero means engine default.
+	DiskMB int64
 	// SessionMaxConcurrentRuns bounds overlapping Exec per session when the
 	// lock mode allows parallelism.
 	SessionMaxConcurrentRuns int
@@ -404,7 +417,7 @@ func (c *Config) resolve() error {
 	}
 	for i := range c.Sinks {
 		if c.Sinks[i].Buffered <= 0 {
-			c.Sinks[i].Buffered = 256
+			c.Sinks[i].Buffered = defaultSinkBuffer
 		}
 		if c.Sinks[i].OnOverflow == OverflowUnset {
 			c.Sinks[i].OnOverflow = c.Limits.Overflow
@@ -438,6 +451,10 @@ func mergeLimits(base, over Limits) Limits {
 	base.EnvMaxEntries = int(pick(int64(base.EnvMaxEntries), int64(over.EnvMaxEntries)))
 	base.SessionMaxConcurrentRuns = int(pick(int64(base.SessionMaxConcurrentRuns), int64(over.SessionMaxConcurrentRuns)))
 	base.SnapshotKeep = int(pick(int64(base.SnapshotKeep), int64(over.SnapshotKeep)))
+	base.CPUCount = int(pick(int64(base.CPUCount), int64(over.CPUCount)))
+	base.MemoryMB = pick(base.MemoryMB, over.MemoryMB)
+	base.PidsLimit = int(pick(int64(base.PidsLimit), int64(over.PidsLimit)))
+	base.DiskMB = pick(base.DiskMB, over.DiskMB)
 	if over.SnapshotTTL != 0 {
 		base.SnapshotTTL = over.SnapshotTTL
 	}

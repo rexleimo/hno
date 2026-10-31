@@ -193,3 +193,107 @@ func TestRunOptionsOnlyTightenProfile(t *testing.T) {
 		t.Fatalf("run option widened the output ceiling: %d > %d", ro.Limits.OutputMaxBytes, cfg.Limits.OutputMaxBytes)
 	}
 }
+
+// TestNestedUnavailableDoesNotRepeatItself guards the diagnosis quality found
+// while running against a real engine: a provider-level UnavailableError that was
+// re-serialised into the core's attempt string made the same daemon sentence
+// appear three times and the same fix twice in one message. A reader has to parse
+// noise before reaching the one fact that matters, so the splicing is a testable
+// property, not a style preference.
+func TestNestedUnavailableDoesNotRepeatItself(t *testing.T) {
+	inner := &UnavailableError{
+		Reason: "provider answers version but refuses container create: not supported here",
+		Tried: []Attempt{{
+			Provider:  "docker",
+			Isolation: IsolationContainer,
+			Reason:    "provider answers version but refuses container create: not supported here",
+			Fixes:     []string{"register the provider against an engine that creates containers"},
+		}},
+		Want: IsolationContainer,
+	}
+	tried := appendAttempt(nil, "docker", inner)
+	if len(tried) != 1 {
+		t.Fatalf("expected the inner attempt spliced through, got %d", len(tried))
+	}
+	if tried[0].Provider != "docker" {
+		t.Fatalf("attempt should keep the provider identity, got %q", tried[0].Provider)
+	}
+	if tried[0].Fix == "" {
+		t.Fatal("the fix must survive the splice; dropping it restores the old DX failure")
+	}
+
+	outer := &UnavailableError{Tried: tried, Want: IsolationContainer}
+	msg := outer.Error()
+	if n := strings.Count(msg, "refuses container create"); n > 1 {
+		t.Fatalf("finding repeated %d times in one message:\n%s", n, msg)
+	}
+	if n := strings.Count(msg, "register the provider against"); n > 1 {
+		t.Fatalf("fix repeated %d times:\n%s", n, msg)
+	}
+}
+
+func TestAppendAttemptFallsBackToPlainError(t *testing.T) {
+	tried := appendAttempt(nil, "p", errors.New("boom"))
+	if len(tried) != 1 || tried[0].Reason != "boom" {
+		t.Fatalf("a plain error should still be recorded verbatim: %+v", tried)
+	}
+	if tried[0].Provider != "p" {
+		t.Fatalf("provider name missing: %+v", tried[0])
+	}
+}
+
+// TestMergeLimitsCoversEveryField guards the class of bug where a newly added
+// limit is declared on Limits but silently dropped on the per-run merge path, so
+// a caller tightens CPU and the engine never hears about it. Any field added to
+// Limits must participate in mergeLimits, and only ever in the tightening
+// direction.
+func TestMergeLimitsCoversEveryField(t *testing.T) {
+	base := Limits{
+		InlineFileMaxBytes: 100, OutputMaxBytes: 200, WorkspaceMaxBytes: 300,
+		ArtifactMaxBytes: 400, ArtifactTotalMaxBytes: 500, EnvMaxEntries: 60,
+		SessionMaxConcurrentRuns: 70, SnapshotKeep: 80,
+		CPUCount: 4, MemoryMB: 2048, PidsLimit: 512, DiskMB: 1024,
+	}
+	over := Limits{
+		InlineFileMaxBytes: 50, OutputMaxBytes: 0, WorkspaceMaxBytes: 0,
+		ArtifactMaxBytes: 0, ArtifactTotalMaxBytes: 0, EnvMaxEntries: 0,
+		SessionMaxConcurrentRuns: 0, SnapshotKeep: 0,
+		CPUCount: 2, MemoryMB: 512, PidsLimit: 100, DiskMB: 256,
+	}
+	got := mergeLimits(base, over)
+	if got.InlineFileMaxBytes != 50 {
+		t.Fatalf("byte tightening lost: %d", got.InlineFileMaxBytes)
+	}
+	if got.CPUCount != 2 || got.MemoryMB != 512 || got.PidsLimit != 100 || got.DiskMB != 256 {
+		t.Fatalf("compute limits dropped: %+v", got)
+	}
+	// Unstated on the override side must keep the profile value, never zero it.
+	if g := mergeLimits(base, Limits{}); g.CPUCount != 4 || g.MemoryMB != 2048 || g.PidsLimit != 512 {
+		t.Fatalf("an unstated per-run limit wiped the profile: %+v", g)
+	}
+	// A per-run widening must be refused, the same rule that protects the byte
+	// ceilings: one caller must not undo the profile's decision.
+	if g := mergeLimits(base, Limits{CPUCount: 64, MemoryMB: 1 << 30}); g.CPUCount != 4 || g.MemoryMB != 2048 {
+		t.Fatalf("per-run options widened a production ceiling: %+v", g)
+	}
+}
+
+func TestTailExcerptKeepsTheReason(t *testing.T) {
+	long := strings.Repeat("noise line\n", 500) + "the real error: cannot find module"
+	got := tailExcerpt(long, 200)
+	if !strings.Contains(got, "cannot find module") {
+		t.Fatalf("tail excerpt lost the last line: %q", got)
+	}
+	if !strings.HasPrefix(got, "[…") {
+		t.Fatalf("omission not marked, so a reader cannot tell it is a fragment: %q", got)
+	}
+	if len(got) > 400 {
+		t.Fatalf("excerpt far exceeded the cap: %d bytes", len(got))
+	}
+	if tailExcerpt("short", 100) != "short" {
+		t.Fatal("a short string must pass through unchanged")
+	}
+	if tailExcerpt("", 100) != "" {
+		t.Fatal("empty in, empty out")
+	}
+}

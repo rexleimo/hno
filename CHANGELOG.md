@@ -41,6 +41,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sections, decision ledger `D-01`…`D-19`) and
   `docs/design/sandbox-litebox-evaluation-and-provider-plan.md`, including the
   Microsoft LiteBox rejection and the BoxLite provider plan.
+- **Container provider** (`pkg/hno/sandbox/provider/docker`): a real engine
+  behind the same contract, driven through the CLI so it needs no daemon SDK. It
+  speaks two dialects — Docker and Apple Containerization — which differ only in
+  the questions they answer (`version` vs `--version`, `ps` vs `list --all`,
+  nested label JSON, `--pids-limit` availability); the lifecycle is shared, so a
+  dialect is a value rather than a second provider. Real container support is
+  opt-in: `HNO_SANDBOX_DOCKER=1` runs live gates, and the skip reason names the
+  unmet gate instead of quietly passing.
+- **Workspace staging in the core** (`staging.go`): a declared directory is now
+  actually shipped to the environment. The core validates `Request.Workspace`
+  and owns the walk (deterministic order, ignore patterns, byte ceiling, symlink
+  refusal) because per-provider copies drift invisibly.
+- **Engine-side orphan reclamation is operator-reachable**: `Sandbox.Reclaimer()`
+  exposes `Sweep`/`Prune` without running a full `Diagnose`, so residue from a
+  crash can be reclaimed by name after a restart.
+- Resource ceilings the engine can enforce (`Limits.CPUCount`, `MemoryMB`,
+  `PidsLimit`, `DiskMB`); zero means engine default and renders no flag, and
+  per-run options may only tighten them.
+
+### 🐛 Fixed
+Nine defects the real engine exposed, all now covered by tests. A fake that
+agrees with your assumptions cannot find any of these:
+
+- **Probe lied.** `docker` on this host is a shim that answers `version` and
+  refuses `container create`, so a version-only probe reported a usable engine
+  and every run failed later. Probe now asks a second question — does `create`
+  work — with `--pull=never` so a missing image reads as "not local", not
+  "engine broken".
+- **`ProviderConfig.Raw` was never populated**, so engine-specific config had no
+  channel and the only alternative was process globals (the D-03 habit).
+- **A healthy container was reported as lost.** `alive()` hard-coded Docker's
+  `inspect --format`, which exits nonzero on Apple; the caller would then rebuild
+  and retry against good work — the most expensive error class. It is now a
+  dialect question.
+- **Provider output capture was unbounded** (`cmd.Output()`), so a large payload
+  output allocated the same size on the host and `OutputMaxBytes` was a lie;
+  stderr was also dropped on success. Capture is now bounded and reports the
+  number of bytes dropped.
+- **A failed phase was stamped `succeeded`** because status came only from the Go
+  error; user-code failure is data, not an error.
+- **A failed build reported only "command exited with code 1"** — the compiler
+  message existed nowhere in the API, so the model that `ActionModelFix` routes to
+  had nothing to fix. `PhaseReport` now carries `Stdout`/`Stderr` with a bounded
+  tail, and the core owns the wording while the provider owns the class.
+- **`Workspace.SourceDir` was validated but never copied**, so project runs failed
+  with "go.mod file not found" in a workspace that had been checked as legal.
+- **`statProbe` embedded unbalanced quotes**, so the container's `sh` failed with
+  "Unterminated quoted string"; nonzero was read as "file not found", making every
+  `Stat` claim a missing file that `Read` returned correctly.
+- **`Artifact.Size`/`Digest` were documented but never set**, so a required
+  artefact always read as zero bytes and an empty file was indistinguishable from
+  a collection that never measured. Artefacts are now captured during collection:
+  lazy handles into a one-shot environment were unreadable after cleanup, which
+  failed exactly on the paths that pass.
+- **Error text repeated itself**: a nested `UnavailableError` re-serialised its
+  inner attempts as prose, printing the same daemon sentence three times and
+  hiding the one fact that mattered; attempts are now spliced and the remedy
+  derived from `Fixes` when `Fix` is empty.
+- **`WorkspaceMaxBytes: 0` rejected every file**, so a zero-value configuration
+  could not stage any directory input; a non-positive ceiling now means
+  "unbounded here", consistent with the rest of `Limits`.
 
 ## [3.0.0] - 2026-09-29
 

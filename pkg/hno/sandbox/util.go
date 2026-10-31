@@ -50,15 +50,26 @@ func describeFailure(rep *Report) string {
 	if rep == nil {
 		return "no report"
 	}
+	// The payload's own diagnostic is appended whenever there is one. "command
+	// exited with code 1" is not something a model can act on; the reason lives in
+	// the output the run already captured, and dropping it is what made the old
+	// run toolkit look broken when user code merely failed (§16.4).
+	withDetail := func(head string) string {
+		detail := tailExcerpt(rep.Stderr, failureDetailBytes)
+		if detail == "" {
+			return head
+		}
+		return head + ": " + detail
+	}
 	switch {
 	case rep.Lost:
-		return "environment lost during run"
+		return withDetail("environment lost during run")
 	case rep.TimedOut:
-		return "run exceeded its deadline"
+		return withDetail("run exceeded its deadline")
 	case rep.ExitCode != 0:
-		return fmt.Sprintf("command exited with code %d", rep.ExitCode)
+		return withDetail(fmt.Sprintf("command exited with code %d", rep.ExitCode))
 	default:
-		return "run did not succeed"
+		return withDetail("run did not succeed")
 	}
 }
 
@@ -99,4 +110,28 @@ func fixesOf(err error) []string {
 		return f.Remediation()
 	}
 	return nil
+}
+
+// failureDetailBytes bounds how much of a phase's output goes into a Failure
+// cause. Enough for a compiler to name the file and line, small enough that a
+// failure that travels into a tool result cannot swamp the context window.
+const failureDetailBytes = 1200
+
+// tailExcerpt keeps the last maxBytes of s on a line boundary, prefixed with an
+// omission marker when bytes were dropped. The tail rather than the head because
+// build and test tools print the reason last.
+func tailExcerpt(s string, maxBytes int) string {
+	s = strings.TrimSpace(s)
+	if s == "" || maxBytes <= 0 {
+		return s
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := len(s) - maxBytes
+	// Advance to the next line start so the excerpt does not begin mid-token.
+	if nl := strings.IndexByte(s[cut:], '\n'); nl >= 0 && cut+nl+1 < len(s) {
+		cut += nl + 1
+	}
+	return fmt.Sprintf("[…%d bytes omitted] %s", cut, strings.TrimSpace(s[cut:]))
 }

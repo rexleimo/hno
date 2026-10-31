@@ -99,16 +99,22 @@ func (sb *Sandbox) bind(ctx context.Context) error {
 			Formation: sb.cfg.Formation,
 			Timeout:   Duration(sb.cfg.Timeouts.Connect),
 			Labels:    labelAttrs(sb.cfg.Attrs),
+			// Raw carries the engine-specific half of WithAttrs. Without it the
+			// field exists in the contract but nothing can ever reach a provider,
+			// which leaves an engine with no way to be configured except through
+			// process globals (the pre-registration PATH-scanning habit D-03
+			// removed).
+			Raw: sb.cfg.Attrs,
 		})
 		if berr != nil {
-			tried = append(tried, Attempt{Provider: name, Reason: errString(berr), Fix: fixOf(berr)})
+			tried = appendAttempt(tried, name, berr)
 			continue
 		}
 		pctx, cancel := context.WithTimeout(ctx, sb.cfg.Timeouts.Probe)
 		perr := prov.Probe(pctx)
 		cancel()
 		if perr != nil {
-			tried = append(tried, Attempt{Provider: name, Reason: errString(perr), Fix: fixOf(perr)})
+			tried = appendAttempt(tried, name, perr)
 			_ = prov.Close(ctx)
 			continue
 		}
@@ -502,4 +508,48 @@ func hashOf(data []byte) string {
 	h := fnv.New64a()
 	_, _ = h.Write(data)
 	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+// appendAttempt records why one candidate was rejected.
+//
+// When the rejection is itself an UnavailableError from the provider, its
+// attempts are spliced in rather than dumped as a string. Re-serialising the
+// inner error produced messages where the same daemon sentence appeared three
+// times and the same fix twice, which a reader has to parse before noticing the
+// one fact that mattered; a provider's diagnosis is structure, not prose.
+func appendAttempt(tried []Attempt, name string, err error) []Attempt {
+	var nested *UnavailableError
+	if errors.As(err, &nested) {
+		if len(nested.Tried) > 0 {
+			for _, a := range nested.Tried {
+				if a.Provider == "" {
+					a.Provider = name
+				}
+				// A provider may fill Fixes without Fix. The rendered attempt only
+				// shows Fix, so deriving it keeps the remedy visible after splicing.
+				if a.Fix == "" {
+					a.Fix = firstString(a.Fixes)
+				}
+				if a.Fix == "" {
+					a.Fix = firstString(nested.Fixes)
+				}
+				tried = append(tried, a)
+			}
+			return tried
+		}
+		if nested.Reason != "" {
+			return append(tried, Attempt{Provider: name, Reason: nested.Reason, Fix: firstString(nested.Fixes)})
+		}
+	}
+	return append(tried, Attempt{Provider: name, Reason: errString(err), Fix: fixOf(err)})
+}
+
+// firstString returns the first non-empty value.
+func firstString(in []string) string {
+	for _, s := range in {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }

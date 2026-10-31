@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -116,23 +117,32 @@ type Artifact struct {
 	// when Truncated is set.
 	Size      int64
 	Truncated bool
-	// Digest is a content hash when the provider could compute one.
+	// Digest is a content hash when the content could be read during collection.
 	Digest string
-	// opener streams the artefact from the environment. A nil opener means
-	// the content was already dropped by a limit.
-	opener func(ctx context.Context) (io.ReadCloser, error)
+	// data holds the collected bytes.
+	//
+	// Collection reads eagerly rather than handing back a live pointer into the
+	// environment. A one-shot run closes its environment before the caller gets the
+	// report, so a lazy opener produced a handle that could only ever error — and a
+	// session that expires later would invalidate artefacts the workflow already
+	// relied on. The report is the deliverable, so the bytes travel with it, bounded
+	// by Limits.ArtifactMaxBytes and the set total (§13.4).
+	data []byte
 }
 
 // ErrArtifactUnreadable is returned when an artefact handle exists but its
 // content is gone (session destroyed, retention expired, limit dropped it).
 var ErrArtifactUnreadable = errors.New("sandbox: artefact content is no longer readable")
 
+// Content returns the collected bytes.
+func (a Artifact) Content() []byte { return a.data }
+
 // Reader streams the artefact. The caller must close it.
-func (a Artifact) Reader(ctx context.Context) (io.ReadCloser, error) {
-	if a.opener == nil {
+func (a Artifact) Reader(_ context.Context) (io.ReadCloser, error) {
+	if a.data == nil {
 		return nil, fmt.Errorf("%w: %s", ErrArtifactUnreadable, a.Name)
 	}
-	return a.opener(ctx)
+	return io.NopCloser(bytes.NewReader(a.data)), nil
 }
 
 // Bytes loads the artefact into memory.

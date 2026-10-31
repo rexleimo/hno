@@ -130,6 +130,27 @@ type PhaseReport struct {
 	// Err holds the phase failure when Status is not succeeded. It is the
 	// typed failure, so classification survives the project wrapper.
 	Err error
+	// Stdout and Stderr carry the phase's own captured output.
+	//
+	// Without them a failed build phase reports "command exited with code 1" and
+	// the compiler's actual message exists nowhere in the result. That defeats the
+	// reason this layer returns typed failures at all: the model is supposed to
+	// read its error and fix it (§16.4). The text is already bounded by
+	// Limits.OutputMaxBytes, so this does not turn a project report into an
+	// unbounded blob.
+	Stdout string
+	Stderr string
+}
+
+// Excerpt returns the tail of the phase's stderr (or stdout when stderr is empty)
+// capped for use inside a failure message. A full log belongs in the phase report;
+// a Failure cause needs the part that names the error.
+func (p PhaseReport) Excerpt(maxBytes int) string {
+	src := p.Stderr
+	if strings.TrimSpace(src) == "" {
+		src = p.Stdout
+	}
+	return tailExcerpt(src, maxBytes)
 }
 
 // Validate rejects projects that cannot produce a meaningful result.

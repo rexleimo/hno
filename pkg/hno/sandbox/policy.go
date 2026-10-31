@@ -71,6 +71,11 @@ type RunContext struct {
 	Budget    Budget
 	Limits    Limits
 	Attrs     map[string]any
+	// Sinks are the per-run output bindings, merged with the handle-level ones
+	// at fan-out. They live here because a Sink is an extension point: policy
+	// must be able to see who is receiving output, and a per-run sink that never
+	// reached the fan-out would be a silent no-op (§7).
+	Sinks []SinkBinding
 }
 
 // RunKind distinguishes the three execution shapes (§6.4).

@@ -78,8 +78,22 @@ func (sb *Sandbox) execute(ctx context.Context, sess *Session, req Request, ro r
 		sess.sb = sb
 	}
 
-	// 5. Stream fan-out for this run.
-	fan := sb.newFanout(rc.RunID)
+	// 5. Stream fan-out for this run, including sinks bound per-run.
+	fan := sb.newFanout(rc.RunID, rc.Sinks...)
+
+	// 5b. Stage declared inputs. Doing this here — inside the one pipeline, before
+	// any engine runs a payload — is what makes "the files I declared are the files
+	// that were there" true for every provider instead of being each engine's own
+	// best effort (§13.1).
+	if serr := sb.stageInputs(ctx, env, rc.Request); serr != nil {
+		// Staging failures take the same exit as a denial: a populated report, a
+		// typed error, and the outcome committed, so nothing that declared inputs
+		// can fail silently half-materialised.
+		rep := deniedReport(sb, rc, serr, time.Now())
+		sb.commitOutcome(ctx, rc, rep, serr)
+		sb.recordAudit(ctx, rc, rep, serr)
+		return rep, serr
+	}
 
 	// 6. Run. Events bracket the execution so a dashboard can see a phase even
 	// when it fails (§6.3).
@@ -152,6 +166,7 @@ func (sb *Sandbox) buildRunContext(sess *Session, req Request, ro resolvedRunOpt
 		Provider: sb.name,
 		Budget:   sb.resolveBudget(req, ro),
 		Limits:   ro.Limits,
+		Sinks:    ro.Sinks,
 		Attrs:    mergeMaps(sb.cfg.Attrs, ro.Attrs),
 	}
 	if sess != nil {
@@ -439,6 +454,13 @@ func (sb *Sandbox) normalizeReport(rep *Report, err error, rc *RunContext, start
 	}
 	if rep.Failure == nil && rep.Failed() {
 		rep.Failure = classifyReport(sb, rep, err)
+	} else if rep.Failure != nil && rep.Failure.Class == ClassUserCode {
+		// A provider may state that user code failed — it owns that fact. It must
+		// not own the wording: providers each composed "exit code 1", which
+		// overrode the core's describeFailure and left the model with an exit
+		// number instead of the compiler message it needs to fix anything (§16.4).
+		// The class stays as the provider set it; the cause is the core's.
+		rep.Failure.Cause = errors.New(describeFailure(rep))
 	}
 	sb.lastReport.set(rep)
 	return rep

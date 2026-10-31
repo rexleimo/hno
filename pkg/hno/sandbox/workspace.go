@@ -80,6 +80,26 @@ const (
 	SourceImage
 )
 
+// String names the source kind for reports, events and provider errors. The
+// kind appears in every "why did my project not materialise" message, so an
+// unnamed enum there reads as a number.
+func (k SourceKind) String() string {
+	switch k {
+	case SourceDir:
+		return "dir"
+	case SourceArchive:
+		return "archive"
+	case SourceGit:
+		return "git"
+	case SourceArtifacts:
+		return "artifacts"
+	case SourceImage:
+		return "image"
+	default:
+		return "unknown"
+	}
+}
+
 // GitSource is a declarative checkout request.
 type GitSource struct {
 	URL      string

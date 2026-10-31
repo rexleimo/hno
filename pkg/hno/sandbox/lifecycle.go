@@ -201,12 +201,21 @@ func (sb *Sandbox) runProject(ctx context.Context, sess *Session, proj Project, 
 			req.Mode = resolveMount(proj.Mode, sb.cfg.Limits.DefaultMountMode)
 		}
 		rep, err := sb.execute(ctx, sess, req, ro)
+		// A report that contradicts itself is worse than a missing one: an earlier
+		// version stamped Status "succeeded" while ExitCode said 1, because a user
+		// code failure is data rather than an error and the status was derived only
+		// from the error. Status therefore comes from the report's own outcome.
 		pr := PhaseReport{Name: phase.Name, Status: ProjectSucceeded}
 		if rep != nil {
 			pr.RunID = rep.RunID
 			pr.ExitCode = rep.ExitCode
 			pr.Duration = rep.Duration
 			pr.Truncated = rep.Truncated
+			pr.Stdout = rep.Stdout
+			pr.Stderr = rep.Stderr
+			if rep.Failed() {
+				pr.Status = ProjectFailed
+			}
 		}
 		if err != nil {
 			pr.Err = err
@@ -217,6 +226,8 @@ func (sb *Sandbox) runProject(ctx context.Context, sess *Session, proj Project, 
 			result.Failure = rep.Failure
 		}
 		if result.Failure == nil && rep != nil && rep.Failed() {
+			// describeFailure already folds in the phase's captured output, and the
+			// report this failure came from has the same Stderr the phase carries.
 			result.Failure = &Failure{Class: ClassUserCode, NextAction: ActionModelFix, Cause: errors.New(describeFailure(rep))}
 		}
 		result.Phases = append(result.Phases, pr)
@@ -424,4 +435,33 @@ func hookGuard(name string, fn func() error) (err error) {
 		}
 	}()
 	return fn()
+}
+
+// Reclaimer is the operator-facing view of a provider's orphan inventory.
+type Reclaimer interface {
+	// Sweep reports engine-held environments this handle no longer owns.
+	Sweep(ctx context.Context) ([]string, error)
+	// Prune deletes what Sweep reported and returns the ids removed.
+	Prune(ctx context.Context) ([]string, error)
+}
+
+// Reclaimer exposes the provider's orphan reclamation, when the provider has one.
+//
+// Diagnose can reach a sweeper, but that couples "reclaim what leaked" to "run a
+// full health report". Cleanup truth is supposed to be observable and actionable on
+// its own (§17.1), and a restart leaves residue that no in-process map can see, so
+// this is what an operator or a cron job calls.
+//
+// It reports false for a provider that cannot enumerate engine-side residue, which
+// is a capability answer, not an error: claiming a sweep exists when it does not
+// would let a caller believe leaked environments were reclaimed.
+func (sb *Sandbox) Reclaimer() (Reclaimer, bool) {
+	sb.mu.Lock()
+	provider := sb.provider
+	sb.mu.Unlock()
+	if provider == nil {
+		return nil, false
+	}
+	r, ok := provider.(Reclaimer)
+	return r, ok
 }

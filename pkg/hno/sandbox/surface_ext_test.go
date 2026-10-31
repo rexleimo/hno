@@ -3,6 +3,7 @@ package sandbox_test
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -326,5 +327,141 @@ func TestPreflightWithoutProvidersIsActionable(t *testing.T) {
 	}
 	if len(rep.Fixes) == 0 {
 		t.Fatalf("expected a fix, got %+v", rep)
+	}
+}
+
+// TestPerRunSinkReceivesChunks guards a bug the handle-level sink test could not
+// see: WithRunSink bound a sink that never reached the fan-out, so a caller
+// asking for output on exactly one run silently received nothing. A silent
+// no-op on an extension point is the failure class D-05 exists to remove, so
+// both sink shapes need their own test.
+func TestPerRunSinkReceivesChunks(t *testing.T) {
+	ctx := context.Background()
+	sb := openHandle(t)
+
+	var perRun strings.Builder
+	var handle strings.Builder
+	if _, err := sb.Run(ctx,
+		sandbox.Request{Runtime: "sh", Code: "#!echo streamed-line"},
+		sandbox.WithRunSink("per-run", sandbox.SinkFunc(func(_ context.Context, c sandbox.OutputChunk) error {
+			perRun.Write(c.Bytes)
+			return nil
+		})),
+	); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if perRun.Len() == 0 {
+		t.Fatal("a per-run sink received no chunks")
+	}
+
+	sb2 := openHandle(t, sandbox.WithSink("handle", sandbox.SinkFunc(func(_ context.Context, c sandbox.OutputChunk) error {
+		handle.Write(c.Bytes)
+		return nil
+	})))
+	if _, err := sb2.Run(ctx, sandbox.Request{Runtime: "sh", Code: "#!echo handle-line"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if handle.Len() == 0 {
+		t.Fatal("the handle-level sink stopped receiving chunks")
+	}
+}
+
+// TestPhaseStatusAgreesWithExitCode guards a report that contradicted itself: a
+// phase whose payload exited 1 was stamped Status "succeeded", because status was
+// derived only from the returned error and a user-code failure is data rather than
+// an error. A caller that trusted Status would continue as if the build worked.
+func TestPhaseStatusAgreesWithExitCode(t *testing.T) {
+	ctx := context.Background()
+	sb := openHandle(t)
+	res, err := sb.RunProject(ctx, sandbox.Project{
+		Phases: []sandbox.Phase{{
+			Name:     "compile",
+			Required: true,
+			Run:      sandbox.Request{Runtime: "sh", Code: "#!exit 3"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("RunProject: %v", err)
+	}
+	if len(res.Phases) != 1 {
+		t.Fatalf("phases = %d", len(res.Phases))
+	}
+	p := res.Phases[0]
+	if p.ExitCode != 3 {
+		t.Fatalf("exit = %d, want 3", p.ExitCode)
+	}
+	if p.Status != sandbox.ProjectFailed {
+		t.Fatalf("status %v while exit is %d — the report disagrees with itself", p.Status, p.ExitCode)
+	}
+	if res.Status != sandbox.ProjectFailed {
+		t.Fatalf("project status = %v, want failed", res.Status)
+	}
+}
+
+// TestFailedPhaseKeepsItsOwnOutput is the §16.4 promise in concrete form: the
+// model has to be able to read the error it just made. A phase report that carried
+// only an exit code made "command exited with code 1" the entire diagnosis, and the
+// compiler message existed nowhere in the result.
+func TestFailedPhaseKeepsItsOwnOutput(t *testing.T) {
+	ctx := context.Background()
+	sb := openHandle(t)
+	res, err := sb.RunProject(ctx, sandbox.Project{
+		Phases: []sandbox.Phase{{
+			Name:     "compile",
+			Required: true,
+			Run:      sandbox.Request{Runtime: "sh", Code: "#!fail 1 main.go:5:2: undefined: thing"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("RunProject: %v", err)
+	}
+	p := res.Phases[0]
+	if !strings.Contains(p.Stderr, "undefined: thing") {
+		t.Fatalf("the phase lost its own compiler message: stderr=%q", p.Stderr)
+	}
+	if res.Failure == nil {
+		t.Fatal("a required phase failure must carry a Failure")
+	}
+	if !strings.Contains(res.Failure.Cause.Error(), "undefined: thing") {
+		t.Fatalf("the failure the caller sees should name the error, got %q", res.Failure.Cause.Error())
+	}
+	if res.Failure.Class != sandbox.ClassUserCode || res.Failure.NextAction != sandbox.ActionModelFix {
+		t.Fatalf("a build error is the model's to fix, got %+v", res.Failure)
+	}
+}
+
+// TestCollectedArtifactReportsItsSize pins the field the collector used to drop.
+// A required artefact that always reads back as zero bytes cannot be validated, so
+// "I got the file" and "I got an empty file" were indistinguishable.
+func TestCollectedArtifactReportsItsSize(t *testing.T) {
+	ctx := context.Background()
+	sb := openHandle(t)
+	body := strings.Repeat("x", 4096)
+	rep, err := sb.Run(ctx, sandbox.Request{
+		Runtime: "sh",
+		Code:    "#!write out/result.bin " + body,
+		Outputs: []sandbox.ArtifactSpec{{Path: "out/result.bin", Required: true}},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	a, ok := rep.Artifacts.Get("out/result.bin")
+	if !ok {
+		t.Fatalf("artefact missing: %v", rep.Artifacts.Names())
+	}
+	if a.Size != int64(len(body)) {
+		t.Fatalf("Size = %d, want %d — the stat result must reach the caller", a.Size, len(body))
+	}
+	rc, err := a.Reader(ctx)
+	if err != nil {
+		t.Fatalf("Reader: %v", err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(data) != int(a.Size) {
+		t.Fatalf("Size %d disagrees with the bytes actually readable: %d", a.Size, len(data))
 	}
 }
