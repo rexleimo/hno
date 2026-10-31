@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -104,19 +105,57 @@ func (t *CodeExecutionToolkit) runCode(ctx context.Context, args map[string]inte
 	}
 
 	result, err := t.executor.Run(ctx, spec)
-	if err != nil {
-		return map[string]interface{}{
-			"exit_code": result.ExitCode,
-			"stdout":    result.Stdout,
-			"stderr":    result.Stderr,
-			"timed_out": result.TimedOut,
-			"error":     err.Error(),
-		}, nil
-	}
-	return map[string]interface{}{
+	payload := map[string]interface{}{
 		"exit_code": result.ExitCode,
 		"stdout":    result.Stdout,
 		"stderr":    result.Stderr,
 		"timed_out": result.TimedOut,
-	}, nil
+	}
+	if err == nil {
+		return payload, nil
+	}
+	// The error text stays in the map because callers already read it there.
+	payload["error"] = err.Error()
+	if isEnvironmentFailure(err, result) {
+		// Double write: the map for callers that read tool output, a real error for the
+		// agent's logger, its per-call outcome, and anything watching failures. Returning
+		// nil here recorded an unusable sandbox as a successful tool call everywhere except
+		// in the text the model was shown.
+		payload["failure"] = "the execution environment failed; the code did not report an exit status"
+		return payload, fmt.Errorf("run_code: %w", err)
+	}
+	return payload, nil
+}
+
+// isEnvironmentFailure separates "the sandbox is broken" from "my code is wrong". That
+// separation is the whole point of returning an error at all: without it, a payload that
+// exited non-zero would be reported as an outage, which sends the model retrying working
+// code against a healthy engine.
+//
+// The evidence available at this layer is what the executors actually produce:
+//   - ErrTimeout arrives with TimedOut set, because the payload ran past its own budget.
+//   - podman and local derive ExitCode from *exec.ExitError and use -1 when the failure was
+//     not an exit status, and e2b initialises ExitCode to -1 until the service reports one.
+//     A positive exit code therefore means the payload really ran.
+//   - Sentinels for a missing engine, an unknown backend, or a refusal from the sandbox
+//     adapter describe a configuration that cannot run anything at all.
+//
+// Known imprecision, kept deliberate rather than silent: podman reports an output-capture
+// fault alongside the exit code it did observe, and this rule files that as payload data. The
+// full error text is still in the map; only the typed signal is missing, and only for that
+// combination.
+func isEnvironmentFailure(err error, result Result) bool {
+	switch {
+	case errors.Is(err, ErrNoProvider),
+		errors.Is(err, ErrUnsupportedBackend),
+		errors.Is(err, ErrSandboxUnsupported),
+		errors.Is(err, ErrSandboxLimitMismatch):
+		return true
+	case result.TimedOut:
+		return false
+	case result.ExitCode > 0:
+		return false
+	default:
+		return true
+	}
 }
