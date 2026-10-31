@@ -3,8 +3,11 @@ package docker
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/rexleimo/agno-go/pkg/hno/sandbox"
 )
@@ -72,7 +75,21 @@ func (s sweeper) Inspect(ctx context.Context) (*SweepDetail, error) {
 			detail.Owned = append(detail.Owned, it)
 			continue
 		}
+		// "Not in my map" is not evidence of abandonment. Another live process on this
+		// host may be between create and start, or may have a session idle on disk: its
+		// stopped container is its working data, not residue. The owner label answers
+		// the question the in-memory map cannot (measured: a concurrent gate run's
+		// just-created container was pruned out from under it).
+		if it.Owner != "" && ownerAlive(it.Owner) {
+			if it.Running {
+				detail.RunningForeign = append(detail.RunningForeign, it)
+			} else {
+				detail.HeldElsewhere = append(detail.HeldElsewhere, it)
+			}
+			continue
+		}
 		if it.Running {
+			// Running with no reachable owner: still someone's live workload, so refuse.
 			detail.RunningForeign = append(detail.RunningForeign, it)
 			continue
 		}
@@ -90,11 +107,18 @@ type SweepDetail struct {
 	// RunningForeign is managed and running under another process. Deleting it is
 	// data loss, so Prune refuses unless the provider opts into PruneRunning.
 	RunningForeign []listedContainer
+	// HeldElsewhere is a stopped container whose owner process is alive on this host.
+	// Its owner is between operations, not gone, so Prune refuses it too: a concurrent
+	// run's container was deleted between create and start by another process's prune.
+	HeldElsewhere []listedContainer
 }
 
 // Refused names what a safe Prune declined to delete, for an operator report.
 func (d *SweepDetail) Refused() []string {
 	var out []string
+	for _, c := range d.HeldElsewhere {
+		out = append(out, fmt.Sprintf("%s (stopped but owner %s is alive)", c.ID, c.Owner))
+	}
 	for _, c := range d.RunningForeign {
 		who := c.Owner
 		if who == "" {
@@ -122,11 +146,11 @@ func (s sweeper) Prune(ctx context.Context) ([]string, error) {
 		}
 		removed = append(removed, it.ID)
 	}
-	if len(detail.RunningForeign) > 0 {
+	if len(detail.RunningForeign) > 0 || len(detail.HeldElsewhere) > 0 {
 		if !s.p.d.PruneRunning {
 			s.p.noteSkippedPrune(detail.Refused())
 		} else {
-			for _, it := range detail.RunningForeign {
+			for _, it := range append(append([]listedContainer{}, detail.RunningForeign...), detail.HeldElsewhere...) {
 				if err := s.p.remove(ctx, it.ID); err != nil {
 					return removed, err
 				}
@@ -183,4 +207,39 @@ func newEngineError(msg string) error {
 		trimmed = "the container engine reported no reason"
 	}
 	return &engineError{msg: fmt.Sprintf("container engine: %s", trimmed)}
+}
+
+// ownerAlive reports whether the process named by an owner label is still running on this
+// host. The label is host/pid/nonce; a label from a different host proves nothing about
+// liveness here, so it is treated as unreachable and the container stays reclaimable only
+// if it is stopped with no other claim.
+func ownerAlive(owner string) bool {
+	host, rest, _ := strings.Cut(owner, "/")
+	if host != ownerHostOf(ownerID) {
+		return false
+	}
+	pidStr, _, _ := strings.Cut(rest, "/")
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil || pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	// Signal 0 checks existence without disturbing the process.
+	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+// ownerHostOf extracts the host part of an owner label.
+func ownerHostOf(owner string) string {
+	host, _, _ := strings.Cut(owner, "/")
+	return host
+}
+
+// splitOwner breaks an owner label into its host, pid and nonce parts.
+func splitOwner(owner string) (host, pid, nonce string) {
+	host, rest, _ := strings.Cut(owner, "/")
+	pid, nonce, _ = strings.Cut(rest, "/")
+	return host, pid, nonce
 }

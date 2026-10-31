@@ -270,9 +270,15 @@ func WithOverflow(p OverflowPolicy) SinkOption { return func(b *SinkBinding) { b
 // WithJournal installs the idempotency store. Delivery promises require it.
 func WithJournal(j JournalStore) Option { return func(c *Config) { c.Journal = j } }
 
-// WithStepCache installs the replay cache used by RebuildFromSpec. Without it
-// every rebuild re-runs every step, which turns the safe default retry mode
-// into the expensive one (§17.2).
+// WithStepCache installs a store for replayed spec steps.
+//
+// Its reach is narrower than it looks, and deliberately so (D-20): a hit may skip a
+// step only when the environment being built carries the state that step produced,
+// which is decided from the box's state lineage and its inheritance watermark. A box
+// rendered from the base image inherits nothing, so RebuildFromSpec always replays it
+// in full -- correct, and the cost the mode's name already promises. The cache earns
+// its keep where state really is carried: a clone of a session, or a restore to a
+// checkpoint that already covered the step.
 func WithStepCache(c JournalStore) Option { return func(cfg *Config) { cfg.StepCache = c } }
 
 // WithSessionStore installs session persistence for restart recovery (§15).
@@ -409,9 +415,13 @@ func (c *Config) resolve() error {
 	// Journal stays nil unless the caller installs one: an idempotency promise
 	// backed by process memory is a lie across a restart, so the core refuses
 	// the promise instead (§16.3).
-	if c.StepCache == nil {
-		c.StepCache = newMemoryJournal()
-	}
+	//
+	// The step cache follows the same rule now. It used to be auto-installed with a
+	// process-memory journal, which meant a default handle carried a cache that could
+	// suppress a step in a container it knew nothing about -- measured as
+	// cached=1 replayed=0 with an empty box, including across two different sessions
+	// (D-20). Nothing is cached unless the caller installs a store, so the default
+	// behaviour is the correct one: replay every recorded step.
 	if c.Journal == nil {
 		c.Journal = nil
 	}

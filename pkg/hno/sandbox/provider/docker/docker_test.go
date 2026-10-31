@@ -547,32 +547,41 @@ func TestWriteHandleCommitsOnClose(t *testing.T) {
 
 // --- rebuild + spec replay (§17 gate) --------------------------------------
 
-func TestReplayRunsOnlyUncachedSteps(t *testing.T) {
+// TestReplayedStepRunsThroughExec covers the guarantee the old provider-side
+// replay() claimed. The core owns step replay since D-20 and drives it through
+// Environment.Exec, so what matters here is that an exec of a recorded install
+// actually reaches the engine.
+func TestReplayedStepRunsThroughExec(t *testing.T) {
 	fr := &fakeRunner{}
 	p := newTestProvider(t, fr)
-	spec := sandbox.SessionSpec{Base: "golang:1.26"}
-	_, err := p.NewEnvironment(context.Background(), sandbox.EnvSpec{
+	env, err := p.NewEnvironment(context.Background(), sandbox.EnvSpec{
 		SessionID: "replay",
 		Image:     "golang:1.26",
-		Spec:      spec,
-		ReplayFrom: []sandbox.Step{
-			{Kind: sandbox.StepInstall, Tool: "go", Argv: []string{"go", "get", "example.com/x"}},
-		},
 	})
 	if err != nil {
 		t.Fatalf("NewEnvironment: %v", err)
 	}
-	// One create, one start, and exactly the replayed install.
-	if fr.calls("exec", "container-1", "go", "get", "example.com/x") != 1 {
-		calls := []string{}
+	// This is what the core does to replay one recorded install step.
+	_, err = env.Exec(context.Background(), sandbox.RunSpec{
+		RunID:   "replay-1",
+		Request: sandbox.Request{Argv: []string{"go", "get", "example.com/x"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if fr.calls("exec", "-i", "container-1", "go", "get", "example.com/x") != 1 {
+		var calls []string
 		for _, c := range fr.seen {
 			calls = append(calls, strings.Join(c.Args, " "))
 		}
-		t.Fatalf("replay step did not run:\n%s", strings.Join(calls, "\n"))
+		t.Fatalf("the replayed install did not reach the engine:\n%s", strings.Join(calls, "\n"))
 	}
 }
 
-func TestReplayFailureIsTypedStepError(t *testing.T) {
+// TestExecFailureIsTypedStepError keeps the typed-failure guarantee at the layer that
+// now owns replay: a nonzero exit from a step must be a classified error the core can
+// report, and the container must not be abandoned.
+func TestExecFailureIsTypedStepError(t *testing.T) {
 	fr := &fakeRunner{respond: func(c Command) (Outcome, bool) {
 		if len(c.Args) > 0 && c.Args[0] == "exec" {
 			return Outcome{Exit: 1, Stderr: "dial tcp: no network"}, true
@@ -580,21 +589,33 @@ func TestReplayFailureIsTypedStepError(t *testing.T) {
 		return defaultResponse(c), true
 	}}
 	p := newTestProvider(t, fr)
-	_, err := p.NewEnvironment(context.Background(), sandbox.EnvSpec{
+	env, err := p.NewEnvironment(context.Background(), sandbox.EnvSpec{
 		SessionID: "replay-fail",
 		Image:     "golang:1.26",
-		ReplayFrom: []sandbox.Step{
-			{Kind: sandbox.StepInstall, Tool: "go", Argv: []string{"go", "get", "x"}},
-		},
 	})
-	var stepErr *sandbox.StepReplayError
-	if !errors.As(err, &stepErr) {
-		t.Fatalf("err = %v, want *StepReplayError", err)
+	if err != nil {
+		t.Fatalf("NewEnvironment: %v", err)
 	}
-	// A container left behind after a failed replay is the leak that turns one
-	// bad session into a full disk.
-	if fr.calls("rm", "-f") == 0 {
-		t.Fatal("a failed environment must be removed, not abandoned")
+	rep, err := env.Exec(context.Background(), sandbox.RunSpec{
+		RunID:   "replay-fail-1",
+		Request: sandbox.Request{Argv: []string{"go", "get", "x"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	// The provider reports a failing payload as a Report plus a nil error, which is the
+	// run contract. What the replay layer depends on is that the report tells the
+	// truth: a nonzero exit must be visible there, and classified, or a failed install
+	// would be replayed as if it had succeeded.
+	if rep.ExitCode == 0 {
+		t.Fatal("a step whose command exited nonzero was reported as exit 0")
+	}
+	if rep.Failure == nil || rep.Failure.Class != sandbox.ClassUserCode {
+		t.Fatalf("a failing step must carry a classified failure for the retry layer, got %+v", rep.Failure)
+	}
+	// The engine saw the command; the failure is the command's, not the sandbox's.
+	if fr.calls("exec", "-i", "container-1", "go", "get", "x") == 0 {
+		t.Fatal("the step never reached the engine")
 	}
 }
 

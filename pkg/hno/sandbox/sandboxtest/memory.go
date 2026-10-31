@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/rexleimo/agno-go/pkg/hno/sandbox"
@@ -53,7 +54,11 @@ type ProbedProvider struct {
 
 // NewProvider returns a fresh in-memory provider.
 func NewProvider(cfg sandbox.ProviderConfig) (sandbox.Provider, error) {
-	return &Provider{cfg: cfg, envs: map[string]*Env{}}, nil
+	p := &Provider{cfg: cfg, envs: map[string]*Env{}}
+	liveInstances.Lock()
+	liveInstances.list = append(liveInstances.list, p)
+	liveInstances.Unlock()
+	return p, nil
 }
 
 // Register installs the in-memory provider under "memory". It is called from
@@ -64,6 +69,13 @@ func Register() error {
 		return nil
 	}
 	return sandbox.RegisterProvider("memory", NewProvider)
+}
+
+// liveInstances records every provider instance the factory built, so tests can reach
+// the one that actually holds a session's environment.
+var liveInstances struct {
+	sync.RWMutex
+	list []*Provider
 }
 
 // Name implements sandbox.Provider.
@@ -164,6 +176,24 @@ func (p *Provider) DeleteSession(ctx context.Context, id string) error {
 // matching the given text. It answers a question History cannot: History tells a test
 // what was run, while this tells it what the box ended up containing — the difference
 // between "the step was replayed" and "the step was cached and skipped".
+// HasEnvironment reports whether this instance currently holds a live environment for a
+// session id.
+func (p *Provider) HasEnvironment(sessionID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.envs[sessionID]
+	return ok
+}
+
+// Instances reports how many provider instances the factory has built. More than one is
+// normal -- every Open builds its own -- which is why reaching the instance that holds a
+// session needs tracking rather than a registry lookup.
+func Instances() int {
+	liveInstances.RLock()
+	defer liveInstances.RUnlock()
+	return len(liveInstances.list)
+}
+
 func (p *Provider) InstalledIn(sessionID, want string) bool {
 	p.mu.Lock()
 	env := p.envs[sessionID]
@@ -442,6 +472,16 @@ func (e *Env) interpret(ctx context.Context, spec sandbox.RunSpec, sink sandbox.
 	if code != "" {
 		e.history = append(e.history, req.Runtime+" "+code)
 	}
+	// Benign shell statements succeed. The default branch below reports a syntax error
+	// for anything it does not understand, which is right for a payload that should
+	// fail, but it made ordinary setup lines (`export FOO=bar`, `cd /app`, `set -e`)
+	// fail too -- and a double that fails a command a real shell would accept cannot be
+	// used to test the replay of a setup step at all.
+	if req.Runtime == "sh" || req.Runtime == "shell" || req.Runtime == "bash" {
+		if benignShellScript(code) {
+			return "", "", 0, nil
+		}
+	}
 	switch {
 	case code == "":
 		// argv-style run: installs are recorded into the replayable spec so
@@ -587,10 +627,18 @@ func (e *Env) clone(id string) *Env {
 		provider:  e.provider,
 		files:     map[string][]byte{},
 		installed: map[string]string{},
+		history:   append([]string(nil), e.history...),
 		spec:      e.spec.Clone(),
 	}
 	for k, v := range e.files {
 		out.files[k] = append([]byte(nil), v...)
+	}
+	// A clone copies the whole filesystem, installed packages included. Dropping them
+	// here made the double disagree with every real engine on the one property the
+	// replay rule depends on -- that a clone inherits state -- so a test of inherited
+	// state could never be trusted.
+	for k, v := range e.installed {
+		out.installed[k] = v
 	}
 	return out
 }
@@ -955,3 +1003,80 @@ func (r *Records) IDs() []string {
 }
 
 var _ sandbox.SessionStore = (*Records)(nil)
+
+// benignShellScript reports whether a script consists only of statements that cannot
+// fail: variable exports, directory changes, option toggles and comments.
+func benignShellScript(code string) bool {
+	for _, raw := range strings.Split(code, ";") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		// A shell comment is benign, but the double's own directives are not: #!fail,
+		// #!exit and the rest all start with '#', and skipping them as comments made a
+		// failing command report success -- which is the exact class of defect this
+		// whole exercise is about, so it must not be reintroduced by the fixture.
+		if strings.HasPrefix(line, "#!") {
+			return false
+		}
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		switch fields[0] {
+		case "export", "set", "cd":
+			continue
+		}
+		if strings.Contains(fields[0], "=") && !strings.HasPrefix(fields[0], "=") {
+			continue // bare assignment
+		}
+		return false
+	}
+	return true
+}
+
+// DropEnvironment makes a loss real for every live in-memory provider instance.
+//
+// MarkLost alone is not enough: the provider still holds the environment, so
+// NewEnvironment hands the same container back and the generation boundary a replay
+// assertion depends on never appears. Instances are tracked because the registry builds
+// a new provider per Open, so asking the registry for one would return a different
+// provider that has never seen the session.
+func DropEnvironment(t *testing.T, sessionID string) {
+	t.Helper()
+	liveInstances.RLock()
+	instances := append([]*Provider(nil), liveInstances.list...)
+	liveInstances.RUnlock()
+	if len(instances) == 0 {
+		t.Skip("no in-memory provider instance is live")
+	}
+	dropped := 0
+	for _, p := range instances {
+		if p.HasEnvironment(sessionID) {
+			p.DropEnvironment(sessionID)
+			dropped++
+		}
+	}
+	if dropped == 0 {
+		t.Fatalf("no live instance holds environment %q, so nothing was really lost", sessionID)
+	}
+}
+
+// InstalledIn reports whether the live environment of a session carries a package, by
+// asking the provider instance that actually holds it.
+func InstalledIn(t *testing.T, sessionID, want string) bool {
+	t.Helper()
+	liveInstances.RLock()
+	instances := append([]*Provider(nil), liveInstances.list...)
+	liveInstances.RUnlock()
+	for _, p := range instances {
+		if p.HasEnvironment(sessionID) {
+			return p.InstalledIn(sessionID, want)
+		}
+	}
+	t.Fatalf("no live instance holds environment %q", sessionID)
+	return false
+}

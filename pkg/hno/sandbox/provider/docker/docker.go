@@ -629,10 +629,10 @@ func (p *Provider) NewEnvironment(ctx context.Context, spec sandbox.EnvSpec) (sa
 		_ = env.Close(context.WithoutCancel(ctx))
 		return nil, err
 	}
-	if err := env.replay(ctx, spec); err != nil {
-		_ = env.Close(context.WithoutCancel(ctx))
-		return nil, err
-	}
+	// Recorded steps are replayed by the core through Environment.Exec. That is the
+	// single owner since D-20: a provider replaying them itself would be a second
+	// owner with its own, narrower notion of what a step is -- this one handled only
+	// installs and would have dropped setup and materialise steps without a word.
 	return env, nil
 }
 
@@ -665,35 +665,6 @@ func (e *Environment) materialise(ctx context.Context, spec sandbox.EnvSpec) err
 		}
 		if err := e.materialiseStep(ctx, step); err != nil {
 			return err
-		}
-	}
-	return nil
-}
-
-// replay re-runs recorded install steps that the cache could not answer. The
-// core passes what remains in ReplayFrom, so this provider never invents its own
-// retry policy.
-func (e *Environment) replay(ctx context.Context, spec sandbox.EnvSpec) error {
-	for _, step := range spec.ReplayFrom {
-		if step.Kind != sandbox.StepInstall {
-			continue
-		}
-		argv := step.Argv
-		if len(argv) == 0 {
-			argv = append([]string(nil), step.Args...)
-		}
-		if len(argv) == 0 {
-			continue
-		}
-		res, err := e.runner().Run(ctx, Command{
-			Bin:  e.provider.bin,
-			Args: append([]string{"exec", e.id}, argv...),
-		})
-		if err != nil {
-			return &sandbox.StepReplayError{Step: step, Cause: err}
-		}
-		if res.Exit != 0 {
-			return &sandbox.StepReplayError{Step: step, Cause: fmt.Errorf("replay exited %d: %s", res.Exit, strings.TrimSpace(res.Stderr))}
 		}
 	}
 	return nil

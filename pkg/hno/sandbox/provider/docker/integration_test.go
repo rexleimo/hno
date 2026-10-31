@@ -442,8 +442,14 @@ func TestRealPruneRefusesAnotherProcessesContainer(t *testing.T) {
 	// fixed in Probe: two concurrent runs fight over one engine-global name, and the
 	// loser skips (or, worse, reports the engine as broken).
 	name := fmt.Sprintf("hno-foreign-live-%d", os.Getpid())
+	// The stand-in claims an owner that is alive: a parent process of the test run.
+	// Without this label the container is indistinguishable from crash residue, and
+	// that is exactly how a concurrent run's stopped container got deleted between
+	// create and start.
+	owner := fmt.Sprintf("%s/%d/standin", ownerHostOf(ownerID), os.Getppid())
 	out, err := runCLI(bin, "create", "--name", name, "--network", "none",
-		"--label", LabelManaged+"=true", "--label", LabelSession+"=other-process", image, "sleep", "infinity")
+		"--label", LabelManaged+"=true", "--label", LabelSession+"=other-process",
+		"--label", LabelOwner+"="+owner, image, "sleep", "infinity")
 	if err != nil {
 		t.Skipf("could not create the stand-in container: %v\n%s", err, out)
 	}
@@ -458,6 +464,26 @@ func TestRealPruneRefusesAnotherProcessesContainer(t *testing.T) {
 	r, ok := sb.Reclaimer()
 	if !ok {
 		t.Fatal("the docker provider must implement Reclaimer")
+	}
+	// A stopped container owned by a live process must survive a prune. This is the
+	// half the running-only guard left open: the container exists, is nobody's current
+	// workload in this process, and is not safe to delete.
+	if _, err := runCLI(bin, "create", "--name", name+"-stopped", "--network", "none",
+		"--label", LabelManaged+"=true", "--label", LabelOwner+"="+owner, image, "true"); err != nil {
+		t.Skipf("could not create the stopped stand-in: %v", err)
+	}
+	t.Cleanup(func() { _, _ = runCLI(bin, "rm", "-f", name+"-stopped") })
+	if removed, err := r.Prune(ctx); err != nil {
+		t.Fatalf("Prune: %v", err)
+	} else {
+		for _, id := range removed {
+			if id == name+"-stopped" {
+				t.Fatalf("Prune deleted a stopped container whose owner process is alive -- this is the other process's data, not residue")
+			}
+		}
+	}
+	if out, err := runCLI(bin, "inspect", name+"-stopped"); err != nil {
+		t.Fatalf("the stopped stand-in should still exist after a safe prune: %v\n%s", err, out)
 	}
 	ids, err := r.Sweep(ctx)
 	if err != nil {

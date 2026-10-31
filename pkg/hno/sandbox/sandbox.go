@@ -23,8 +23,10 @@ type Sandbox struct {
 	caps     CapabilitySet
 	iso      Isolation
 
-	mu        sync.RWMutex
-	sessions  map[string]*Session
+	mu       sync.RWMutex
+	sessions map[string]*Session
+	// snapMarks records how far each snapshot's spec had been satisfied.
+	snapMarks map[string]snapshotMark
 	createdAt time.Time
 	closed    bool
 
@@ -329,18 +331,23 @@ func (sb *Sandbox) Session(ctx context.Context, id string, opts ...SessionOption
 	if len(opt.Expose) > 0 {
 		spec.Expose = append([]PortMap(nil), opt.Expose...)
 	}
-	env, err := sb.newEnvironment(ctx, id, spec, spec.Expose)
+	env, prov, err := sb.newEnvironment(ctx, id, spec, spec.Expose)
 	if err != nil {
 		return nil, err
 	}
 	sess := sb.adopt(id, env, spec)
+	// Adopt mints a lineage for reporting; the provenance the creator returned is what
+	// the replay decision uses, so the two cannot drift apart.
+	sess.mu.Lock()
+	sess.lineage, sess.inherited, sess.stateSource = prov.lineage, prov.upto, prov.source
+	sess.mu.Unlock()
 	// A record with steps means this environment is a reconstruction, not the box that
 	// ran them. Replaying is the difference between "resumed" and "empty and claiming
 	// to be ready": without it every install and setup a workflow recorded is gone, and
 	// the first failure gets attributed to the caller's code.
 	if rec != nil && len(spec.Steps) > 0 {
-		rep := &RebuildReport{SessionID: id}
-		if rerr := sb.replayRecorded(ctx, env, spec, rep); rerr != nil {
+		rep := &RebuildReport{SessionID: id, StateSource: prov.source}
+		if rerr := sb.replayRecorded(ctx, env, spec, rep, prov); rerr != nil {
 			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sb.cfg.Timeouts.Cleanup)
 			_ = env.Close(cctx)
 			cancel()
@@ -382,7 +389,30 @@ func (sb *Sandbox) pickImage(opt sessionConfig, rec *SessionRecord) string {
 }
 
 // newEnvironment provisions the substrate for a session.
-func (sb *Sandbox) newEnvironment(ctx context.Context, id string, spec SessionSpec, expose []PortMap) (Environment, error) {
+// boxProvenance records what a freshly created environment inherited. The function that
+// creates the box is the only place that can say, because it is the only one that knows
+// how the box was made.
+//
+// This exists so a replay decision is taken from a fact about the container rather than
+// from a lookup that can miss it: an earlier version recovered the lineage by scanning
+// the live sessions for a matching environment, and a rebuild nils the session's
+// environment before replaying, so the scan always came back empty and the step cache
+// silently never recorded anything (D-20).
+type boxProvenance struct {
+	lineage string
+	// upto is the highest recorded step whose effects the box already carries; -1 for
+	// a box rendered from the base image, which carries none.
+	upto   int
+	source string
+}
+
+// scratchBox describes a box rendered from the base image: it inherits nothing, so every
+// recorded step has to run in it.
+func scratchBox() boxProvenance {
+	return boxProvenance{lineage: "gen:" + newRunID(), upto: -1, source: "base image"}
+}
+
+func (sb *Sandbox) newEnvironment(ctx context.Context, id string, spec SessionSpec, expose []PortMap) (Environment, boxProvenance, error) {
 	sb.emit(ctx, Event{Kind: EventProvisioning, SessionID: id, Provider: sb.name, Isolation: sb.iso})
 	pctx, cancel := context.WithTimeout(ctx, sb.cfg.Timeouts.Provision)
 	defer cancel()
@@ -399,10 +429,13 @@ func (sb *Sandbox) newEnvironment(ctx context.Context, id string, spec SessionSp
 	})
 	if err != nil {
 		fix := "hno sandbox doctor"
-		return nil, &ProvisionError{Provider: sb.name, Stage: "create environment", Cause: err, Fix: fix}
+		return nil, boxProvenance{}, &ProvisionError{Provider: sb.name, Stage: "create environment", Cause: err, Fix: fix}
 	}
 	sb.emit(ctx, Event{Kind: EventReady, SessionID: id, Provider: sb.name, Isolation: sb.iso})
-	return env, nil
+	// The provider rendered this box from spec.Base. There is no path today in which
+	// newEnvironment restores a snapshot, so the honest answer is that it carries
+	// nothing; a state-inheriting creation must return its own provenance here.
+	return env, scratchBox(), nil
 }
 
 // adopt registers a live environment as a session owned by this handle.
@@ -417,17 +450,22 @@ func (sb *Sandbox) adoptWorkspace(id string, env Environment, spec SessionSpec, 
 		cap = sb.cfg.Limits.SessionMaxConcurrentRuns
 	}
 	sess := &Session{
-		sb:        sb,
-		id:        id,
-		env:       env,
-		spec:      spec.Clone(),
-		state:     StateReady,
-		image:     spec.Base,
-		isolation: sb.iso,
-		provider:  sb.name,
-		workspace: cloneSource(ws),
-		lock:      make(chan struct{}, cap),
-		lastSeen:  time.Now(),
+		sb:  sb,
+		id:  id,
+		env: env,
+		// Overwritten by the creator's provenance wherever that is known; these are the
+		// safe values for a box this handle has not traced (D-20).
+		lineage:     "gen:" + newRunID(),
+		inherited:   -1,
+		stateSource: "base image",
+		spec:        spec.Clone(),
+		state:       StateReady,
+		image:       spec.Base,
+		isolation:   sb.iso,
+		provider:    sb.name,
+		workspace:   cloneSource(ws),
+		lock:        make(chan struct{}, cap),
+		lastSeen:    time.Now(),
 	}
 	sb.mu.Lock()
 	sb.sessions[id] = sess

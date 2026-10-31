@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"time"
 )
 
@@ -35,7 +36,7 @@ func (sb *Sandbox) rebuild(ctx context.Context, sess *Session) (*RebuildReport, 
 		cancel()
 	}
 
-	env, err := sb.newEnvironment(ctx, sess.id, spec, spec.Expose)
+	env, prov, err := sb.newEnvironment(ctx, sess.id, spec, spec.Expose)
 	if err != nil {
 		sess.mu.Lock()
 		sess.state = StateLost
@@ -44,8 +45,11 @@ func (sb *Sandbox) rebuild(ctx context.Context, sess *Session) (*RebuildReport, 
 	}
 	sb.setSessionWorkspace(sess, workspace)
 
-	rep := &RebuildReport{SessionID: sess.id, Duration: time.Since(started)}
-	if err := sb.replayRecorded(ctx, env, spec, rep); err != nil {
+	// Describe the box that has just been built, not the session that asked for it.
+	// Under this mode the new environment is rendered from the base image, so it
+	// inherited nothing whoever its caller used to be.
+	rep := &RebuildReport{SessionID: sess.id, Duration: time.Since(started), StateSource: prov.source}
+	if err := sb.replayRecorded(ctx, env, spec, rep, prov); err != nil {
 		_ = env.Close(ctx)
 		sess.mu.Lock()
 		sess.state = StateLost
@@ -77,10 +81,16 @@ func (sb *Sandbox) rebuild(ctx context.Context, sess *Session) (*RebuildReport, 
 // work ends up done twice or, worse, never: EnvSpec.ReplayFrom was documented as the
 // channel for it, the core never filled the field, and a provider loop over it was
 // therefore unreachable while the resumed session still reported itself Ready.
-func (sb *Sandbox) replayRecorded(ctx context.Context, env Environment, spec SessionSpec, rep *RebuildReport) error {
+func (sb *Sandbox) replayRecorded(ctx context.Context, env Environment, spec SessionSpec, rep *RebuildReport, prov boxProvenance) error {
+	lin, upto := prov.lineage, prov.upto
 	for _, step := range spec.Steps {
 		res := StepResult{Step: step}
-		if cached, ok := sb.stepCached(step); ok && cached {
+		// A cached hit may skip work only when this environment actually carries the
+		// state the step produced. That is the whole of D-20 option B, and it is decided
+		// from a fact about the box rather than from the step's content: a box built from
+		// the base image has inherited nothing, so nothing can be skipped and the
+		// workflow's dependencies are guaranteed to be reinstalled.
+		if cached, ok := sb.stepCached(lin, upto, step); ok && cached {
 			res.Cached = true
 			rep.Cached++
 			continue
@@ -93,7 +103,7 @@ func (sb *Sandbox) replayRecorded(ctx context.Context, env Environment, spec Ses
 		}
 		res.Elapsed = time.Since(stepStart)
 		rep.Replayed = append(rep.Replayed, res)
-		sb.rememberStep(step)
+		sb.rememberStep(lin, step)
 	}
 	return nil
 }
@@ -120,7 +130,7 @@ func (sb *Sandbox) replayStep(ctx context.Context, env Environment, step Step) e
 	default:
 		return fmt.Errorf("cannot replay step kind %s", step.Kind)
 	}
-	_, err := env.Exec(ctx, RunSpec{
+	rep, err := env.Exec(ctx, RunSpec{
 		RunID:     newRunID(),
 		SessionID: env.ID(),
 		Request:   req,
@@ -128,16 +138,43 @@ func (sb *Sandbox) replayStep(ctx context.Context, env Environment, step Step) e
 		Budget:    Budget{ExecTimeout: sb.cfg.Timeouts.Exec, SetupTimeout: sb.cfg.Timeouts.Setup, OutputLimit: sb.cfg.Limits.OutputMaxBytes},
 		Limits:    sb.cfg.Limits,
 	}, nil)
-	return err
+	if err != nil {
+		return err
+	}
+	// A step that exits nonzero did not happen, whatever the provider returned for it.
+	// Providers report a failing payload as a Report plus a nil error -- correctly,
+	// because a nonzero exit is the user's result, not the sandbox's fault -- so a
+	// replay that only checks err would stamp a failed install as satisfied and then
+	// cache that conclusion. Same class as the phase status bug fixed in B2a, at the
+	// one call site that still had it.
+	if rep != nil && rep.ExitCode != 0 {
+		detail := strings.TrimSpace(rep.Stderr)
+		if detail == "" {
+			detail = strings.TrimSpace(rep.Stdout)
+		}
+		if len(detail) > failureDetailBytes {
+			detail = "..." + detail[len(detail)-failureDetailBytes:]
+		}
+		if detail == "" {
+			detail = "no output captured"
+		}
+		return fmt.Errorf("step exited %d: %s", rep.ExitCode, detail)
+	}
+	return nil
 }
 
 // stepCached consults the replay cache. Caching is step-level, so a changed
 // source file does not invalidate an expensive install (§17.2).
-func (sb *Sandbox) stepCached(step Step) (bool, bool) {
-	if sb.cfg.StepCache == nil {
+func (sb *Sandbox) stepCached(lineage string, inherited int, step Step) (bool, bool) {
+	if sb.cfg.StepCache == nil || lineage == "" {
 		return false, false
 	}
-	key := step.Key()
+	// The watermark is the decisive half. A fresh box inherits nothing (inherited < 0),
+	// so no entry under any lineage can justify skipping it.
+	if step.Sequence > inherited {
+		return false, false
+	}
+	key := stepCacheKey(lineage, step)
 	_, ok, err := sb.cfg.StepCache.Load(context.Background(), key)
 	if err != nil {
 		sb.emit(context.Background(), Event{Kind: EventHookFault, Detail: map[string]any{"cache": "step", "error": err.Error()}})
@@ -147,11 +184,11 @@ func (sb *Sandbox) stepCached(step Step) (bool, bool) {
 }
 
 // rememberStep records a replayed step as cached.
-func (sb *Sandbox) rememberStep(step Step) {
-	if sb.cfg.StepCache == nil {
+func (sb *Sandbox) rememberStep(lineage string, step Step) {
+	if sb.cfg.StepCache == nil || lineage == "" {
 		return
 	}
-	entry := JournalEntry{Key: step.Key(), RunID: "step", State: RunStateDone, PayloadHash: step.Digest}
+	entry := JournalEntry{Key: stepCacheKey(lineage, step), RunID: "step", State: RunStateDone, PayloadHash: step.Digest}
 	if err := sb.cfg.StepCache.Save(context.Background(), entry); err != nil {
 		sb.emit(context.Background(), Event{Kind: EventHookFault, Detail: map[string]any{"cache": "step", "error": err.Error()}})
 	}
@@ -499,4 +536,49 @@ func (sb *Sandbox) Reclaimer() (Reclaimer, bool) {
 	}
 	r, ok := provider.(Reclaimer)
 	return r, ok
+}
+
+// stepCacheKey scopes a satisfied step to the state lineage that carries its effect.
+//
+// Step content alone is not enough to decide anything: the same pip install satisfied in
+// one container says nothing about another, and a digest-keyed cache let one session's
+// step suppress a different session's install (measured: cached=1 replayed=0 with an
+// empty box). Binding the entry to the lineage that carries the effect is what turns a
+// cache hit back into evidence.
+func stepCacheKey(lineage string, step Step) string {
+	return lineage + "|" + step.Key()
+}
+
+// snapshotMark records how far a session's spec had been satisfied when a snapshot was
+// taken, which is what makes a later Restore able to say which steps its box contains.
+type snapshotMark struct {
+	lineage string
+	upto    int
+	source  string
+}
+
+// rememberSnapshotMark stores the mark for one handle.
+func (sb *Sandbox) rememberSnapshotMark(handle SnapshotHandle, mark snapshotMark) {
+	if handle.ID == "" {
+		handle.ID = handle.SessionID + "/" + handle.Name
+	}
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	if sb.snapMarks == nil {
+		sb.snapMarks = map[string]snapshotMark{}
+	}
+	sb.snapMarks[handle.ID] = mark
+}
+
+// snapshotMarkFor looks a mark up by handle id, then by session and name.
+func (sb *Sandbox) snapshotMarkFor(handle SnapshotHandle) (snapshotMark, bool) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	if len(sb.snapMarks) == 0 {
+		return snapshotMark{}, false
+	}
+	if m, ok := sb.snapMarks[handle.ID]; ok {
+		return m, true
+	}
+	return snapshotMark{}, false
 }

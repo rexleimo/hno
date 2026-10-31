@@ -35,15 +35,13 @@ type EnvSpec struct {
 	SessionID string
 	Image     string
 	// Workspace is the declared working tree to materialise at creation.
-	Workspace   *WorkspaceSource
-	Isolation   Isolation
-	Spec        SessionSpec
-	MountMode   MountMode
-	Budget      Budget
-	Limits      Limits
-	ReplayFrom  []Step // steps that still need replaying after cache lookup
-	CachedSteps []string
-	Labels      map[string]string
+	Workspace *WorkspaceSource
+	Isolation Isolation
+	Spec      SessionSpec
+	MountMode MountMode
+	Budget    Budget
+	Limits    Limits
+	Labels    map[string]string
 	// Expose lists the guest ports the caller asked to publish. It arrives here rather
 	// than only in RunSpec.Request because a provider has to act on it at create:
 	// anything else would silently discard the request.

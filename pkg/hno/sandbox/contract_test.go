@@ -11,11 +11,20 @@ import (
 	"github.com/rexleimo/agno-go/pkg/hno/sandbox/sandboxtest"
 )
 
-// TestStepCacheSkipsReplay proves the replay cache is step-level: a session
-// that rebuilds reuses an expensive install instead of paying for it again
-// (§17.2). This matters because the default retry mode is RebuildFromSpec:
-// without a cache, every rebuild would reinstall everything.
-func TestStepCacheSkipsReplay(t *testing.T) {
+// TestRebuildFromBaseImageReplaysEveryStep is the D-20 contract, chosen over the
+// alternative that kept the old behaviour.
+//
+// The old test asserted the opposite: that a second rebuild skips the install because a
+// cache entry exists. That skip was never sound. RebuildFromSpec renders a brand-new box
+// from the base image, so the package the step installed is not in it, while
+// Step.Key() hashed step content alone -- no session, no image, no environment
+// generation -- so an entry written by any earlier box in the process, including a
+// different session's, authorised the skip. Measured before the change: cached=1,
+// replayed=0, and the fresh box empty.
+//
+// A cache hit may skip work only when the environment being built carries the state the
+// step produced. A box from the base image carries nothing, so it replays everything.
+func TestRebuildFromBaseImageReplaysEveryStep(t *testing.T) {
 	ctx := context.Background()
 	cache := sandbox.NewMemoryJournal()
 	sb := openHandle(t, sandbox.WithStepCache(cache))
@@ -27,7 +36,6 @@ func TestStepCacheSkipsReplay(t *testing.T) {
 	if err := sess.Install(ctx, sandbox.Pip("pandas==2.0.3")); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	// First rebuild: the install already ran, so it is replayed once, then cached.
 	first, err := sess.Rebuild(ctx)
 	if err != nil {
 		t.Fatalf("first Rebuild: %v", err)
@@ -35,14 +43,97 @@ func TestStepCacheSkipsReplay(t *testing.T) {
 	if len(first.Replayed) == 0 {
 		t.Fatalf("first rebuild replayed no steps: %+v", first)
 	}
+	if first.StateSource != "base image" {
+		t.Fatalf("a rebuild from the base image must say so, got %q", first.StateSource)
+	}
 
 	sess.MarkLost(errors.New("simulated loss"))
+	// The box must really go: the reference provider hands back an existing environment
+	// for a known session id, which would hide the generation boundary entirely.
+	sandboxtest.DropEnvironment(t, "cached")
 	second, err := sess.Rebuild(ctx)
 	if err != nil {
 		t.Fatalf("second Rebuild: %v", err)
 	}
-	if second.Cached == 0 {
-		t.Fatalf("second rebuild replayed everything (%d steps, %d cached); step cache is not doing its job: %+v", len(second.Replayed), second.Cached, second)
+	if second.Cached != 0 {
+		t.Fatalf("a box rendered from the base image reported %d cached steps; nothing was inherited, so nothing may be skipped: %+v", second.Cached, second)
+	}
+	if len(second.Replayed) != len(first.Replayed) {
+		t.Fatalf("second rebuild replayed %d steps, first replayed %d", len(second.Replayed), len(first.Replayed))
+	}
+}
+
+// TestCloneCarriesStateAndRebuildDoesNot is the measured other half of D-20.
+//
+// A clone inherits the parent's state, and says so. A rebuild of that clone renders a
+// box from the base image, and inherits nothing -- so it replays every step even though
+// the session it belongs to was created by cloning. Asserting a skip here would have
+// encoded the same mistake D-20 removed, just with a longer provenance chain.
+func TestCloneCarriesStateAndRebuildDoesNot(t *testing.T) {
+	ctx := context.Background()
+	cache := sandbox.NewMemoryJournal()
+	sb := openHandle(t, sandbox.WithStepCache(cache))
+
+	sess, err := sb.Session(ctx, "parent", sandbox.WithCreateIfMissing(true))
+	if err != nil {
+		t.Fatalf("Session: %v", err)
+	}
+	if err := sess.Install(ctx, sandbox.Pip("scipy==1.11.0")); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if _, err := sess.Rebuild(ctx); err != nil {
+		t.Fatalf("parent Rebuild: %v", err)
+	}
+	clone, err := sess.CloneAs(ctx, "child")
+	if err != nil {
+		t.Fatalf("CloneAs: %v", err)
+	}
+	if src := clone.StateSource(); src != "clone:parent" {
+		t.Fatalf("a cloned session must report the state it inherited, got %q", src)
+	}
+	// The cloned box carries the parent's installed packages, so running the workflow
+	// there needs no replay at all.
+	if _, err := clone.Exec(ctx, sandbox.Shell("echo run")); err != nil {
+		t.Fatalf("clone Exec: %v", err)
+	}
+	if !sandboxtest.InstalledIn(t, "child", "scipy==1.11.0") {
+		t.Fatal("the clone did not carry the parent's installed state")
+	}
+	rep, err := clone.Rebuild(ctx)
+	if err != nil {
+		t.Fatalf("clone Rebuild: %v", err)
+	}
+	if rep.StateSource != "base image" {
+		t.Fatalf("a from-spec rebuild must report what the new box inherited, got %q", rep.StateSource)
+	}
+	if rep.Cached != 0 {
+		t.Fatalf("the rebuilt box carries nothing, yet %d steps were skipped: %+v", rep.Cached, rep)
+	}
+	if len(rep.Replayed) == 0 {
+		t.Fatal("the rebuild replayed no steps")
+	}
+}
+
+// TestFailingInstallIsNotRecordedAsState closes the third site of the same class found
+// while implementing D-20. A nonzero exit with a nil error is the ordinary run contract's
+// correct answer for a payload, and it is the wrong question for Install and Setup: their
+// promise is that state now exists.
+func TestFailingInstallIsNotRecordedAsState(t *testing.T) {
+	ctx := context.Background()
+	sb := openHandle(t)
+	sess, err := sb.Session(ctx, "bad-install", sandbox.WithCreateIfMissing(true))
+	if err != nil {
+		t.Fatalf("Session: %v", err)
+	}
+	err = sess.Setup(ctx, "#!fail 7 dependency install failed")
+	if err == nil {
+		t.Fatal("a setup whose command exited 7 reported success")
+	}
+	if len(sess.Spec().Steps) != 0 {
+		t.Fatalf("the failed step was recorded as replayable state: %d steps -- every rebuild would re-run a known failure", len(sess.Spec().Steps))
+	}
+	if sandbox.ClassOf(err) == sandbox.ClassUnknown {
+		t.Fatalf("the failure must be classified, got %T", err)
 	}
 }
 

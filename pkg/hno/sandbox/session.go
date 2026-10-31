@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,6 +30,15 @@ type Session struct {
 	// events when no call context exists yet.
 	ctx context.Context
 
+	// lineage identifies the state this environment carries, and inherited is the
+	// highest recorded step whose effects are part of that state. Both exist so a
+	// replay decision can be made from a fact about the box instead of a guess about
+	// the step: see D-20.
+	lineage   string
+	inherited int
+	// stateSource names how this environment got the state it has, for reports.
+	stateSource string
+
 	runs     int
 	queued   int
 	lastSeen time.Time
@@ -44,6 +54,17 @@ type Session struct {
 func (s *Session) ID() string { return s.id }
 
 // Status snapshots the session state for dashboards and readiness checks.
+// StateSource reports how the live environment acquired its state.
+func (s *Session) StateSource() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stateSource == "" {
+		return "base image"
+	}
+	return s.stateSource
+}
+
+// Status returns the observable session state.
 func (s *Session) Status() SessionStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -121,10 +142,70 @@ func (s *Session) Install(ctx context.Context, pkg PackageSpec) error {
 		return err
 	}
 	req := pkg.toRequest()
-	if _, err := s.Exec(ctx, req); err != nil {
-		return fmt.Errorf("install %s: %w", pkg.String(), err)
+	if err := s.runStateful(ctx, req, "install "+pkg.String()); err != nil {
+		return err
 	}
 	return nil
+}
+
+// runStateful executes a request whose promise is about state, not about a result:
+// Install and Setup record steps that later rebuilds will faithfully re-run.
+//
+// These two cannot use the ordinary run contract, where a nonzero exit is the payload's
+// own outcome reported in the Report with a nil error. That is right for "run my code
+// and tell me what happened" and wrong for "make this dependency exist": a step that
+// exited 7 did not make anything exist, yet it had been recorded as replayable state and
+// returned nil, so the caller proceeded and every future rebuild re-ran a command known
+// to fail. The exit code is the only evidence here, and the step must not be recorded
+// unless it says the work happened.
+func (s *Session) runStateful(ctx context.Context, req Request, what string) error {
+	rep, err := s.Exec(ctx, req)
+	if err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	if rep == nil {
+		return fmt.Errorf("%s: provider returned no report", what)
+	}
+	if rep.ExitCode != 0 {
+		detail := strings.TrimSpace(rep.Stderr)
+		if detail == "" {
+			detail = strings.TrimSpace(rep.Stdout)
+		}
+		if detail == "" {
+			detail = "no output captured"
+		} else if len(detail) > failureDetailBytes {
+			detail = "..." + detail[len(detail)-failureDetailBytes:]
+		}
+		s.dropLastStep()
+		return &StepReplayError{
+			Step:     s.lastRecordedStep(),
+			Cause:    fmt.Errorf("%s exited %d: %s", what, rep.ExitCode, detail),
+			Replayed: 0,
+		}
+	}
+	return nil
+}
+
+// dropLastStep removes the step just recorded by the caller, because a step that failed
+// is not replayable state: recording it means every rebuild faithfully re-runs a known
+// failure and reports the resulting problem as the caller's own.
+func (s *Session) dropLastStep() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.spec.Steps) == 0 {
+		return
+	}
+	s.spec.Steps = s.spec.Steps[:len(s.spec.Steps)-1]
+}
+
+// lastRecordedStep returns the step most recently appended, for error reporting.
+func (s *Session) lastRecordedStep() Step {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.spec.Steps) == 0 {
+		return Step{}
+	}
+	return s.spec.Steps[len(s.spec.Steps)-1]
 }
 
 // Setup runs a declared script and records it as replayable state.
@@ -133,8 +214,8 @@ func (s *Session) Setup(ctx context.Context, script string) error {
 	if err := s.record(step); err != nil {
 		return err
 	}
-	if _, err := s.Exec(ctx, Shell(script)); err != nil {
-		return fmt.Errorf("setup step: %w", err)
+	if err := s.runStateful(ctx, Shell(script), "setup step"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -175,6 +256,17 @@ func (s *Session) Checkpoint(ctx context.Context, name string) (SnapshotHandle, 
 	if handle.SessionID == "" {
 		handle.SessionID = s.id
 	}
+	// Record how far the spec had been satisfied at the moment this snapshot was taken.
+	// A later Restore can then tell which steps the restored box really contains;
+	// without the mark it must replay everything rather than guess.
+	s.mu.Lock()
+	lin, upto, src := s.lineage, len(s.spec.Steps)-1, s.stateSource
+	if upto < 0 {
+		// Nothing had been satisfied yet, so the snapshot captured an untouched box.
+		lin = ""
+	}
+	s.mu.Unlock()
+	s.sb.rememberSnapshotMark(handle, snapshotMark{lineage: lin, upto: upto, source: src})
 	s.mu.Lock()
 	s.snapshots = append(s.snapshots, handle)
 	if keep := s.sb.cfg.Limits.SnapshotKeep; keep > 0 && len(s.snapshots) > keep {
@@ -202,6 +294,20 @@ func (s *Session) Restore(ctx context.Context, handle SnapshotHandle) error {
 	if err := snap.Restore(ctx, s.env, handle); err != nil {
 		return fmt.Errorf("sandbox: restore %q: %w", handle.Name, err)
 	}
+	s.mu.Lock()
+	// A restored box holds the state the snapshot captured, so only steps recorded up
+	// to the checkpoint can be assumed present. Without a recorded mark the safe
+	// direction is to inherit nothing: an unknown watermark must never authorize a
+	// skip.
+	if mark, ok := s.sb.snapshotMarkFor(handle); ok {
+		s.lineage = mark.lineage
+		s.inherited = mark.upto
+		s.stateSource = "snapshot:" + handle.Name
+	} else {
+		s.inherited = -1
+		s.stateSource = "snapshot:" + handle.Name + " (no step mark; replaying all)"
+	}
+	s.mu.Unlock()
 	s.sb.emit(ctx, Event{Kind: EventRestored, SessionID: s.id, Provider: s.provider, Detail: map[string]any{"name": handle.Name}})
 	return nil
 }
@@ -223,8 +329,18 @@ func (s *Session) CloneAs(ctx context.Context, as string) (*Session, error) {
 	}
 	s.mu.Lock()
 	spec := s.spec.Clone()
+	parentLin := s.lineage
 	s.mu.Unlock()
 	child := s.sb.adopt(as, env, spec)
+	// A clone carries whatever the parent's box had, so every step the parent had
+	// satisfied is present in the child. That is the condition under which a replay may
+	// skip work, so the child takes the parent's state lineage and a watermark covering
+	// the parent's recorded steps instead of starting from nothing (D-20).
+	child.mu.Lock()
+	child.lineage = parentLin
+	child.inherited = len(spec.Steps) - 1
+	child.stateSource = "clone:" + s.id
+	child.mu.Unlock()
 	s.sb.emit(ctx, Event{Kind: EventCloned, SessionID: s.id, RunID: as, Provider: s.provider})
 	return child, nil
 }
@@ -543,9 +659,15 @@ type RebuildReport struct {
 	SessionID string
 	Replayed  []StepResult
 	Cached    int
-	Dropped   []string
-	Drift     []string
-	Duration  time.Duration
+	// StateSource says what the new environment inherited, which is the only thing
+	// that can make a cached step legitimate: "base image" replays everything,
+	// "clone:<id>" and "snapshot:<name>" carry the state earlier steps produced. A
+	// caller comparing rebuild costs needs this, because Cached without it is
+	// unexplainable.
+	StateSource string
+	Dropped     []string
+	Drift       []string
+	Duration    time.Duration
 }
 
 // HasDrift reports whether the rebuilt environment may differ from what the

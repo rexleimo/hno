@@ -399,7 +399,7 @@ func (sb *Sandbox) guardAttempt(rc *RunContext) error {
 // environmentFor resolves the execution substrate for a run.
 func (sb *Sandbox) environmentFor(ctx context.Context, sess *Session, rc *RunContext) (Environment, error) {
 	if sess == nil {
-		env, err := sb.newEnvironment(ctx, "", SessionSpec{Base: sb.cfg.Image, MountMode: rc.Request.Mode}, rc.Request.Expose)
+		env, _, err := sb.newEnvironment(ctx, "", SessionSpec{Base: sb.cfg.Image, MountMode: rc.Request.Mode}, rc.Request.Expose)
 		if err != nil {
 			return nil, err
 		}

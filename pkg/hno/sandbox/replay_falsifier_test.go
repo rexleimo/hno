@@ -2,7 +2,6 @@ package sandbox_test
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 
@@ -128,65 +127,46 @@ func TestResumedSessionReportsReplayedSteps(t *testing.T) {
 	}
 }
 
-// TestStepCacheIsNotEvidenceAboutAFreshBox measures a defect that needs a design
-// decision before it can be fixed, so it reports rather than redlines.
-//
-// The step cache is installed by default with a process-memory journal
-// (Config.normalize: `if c.StepCache == nil { c.StepCache = newMemoryJournal() }`), the
-// same shape the code two lines below refuses for the idempotency Journal because "an
-// idempotency promise backed by process memory is a lie across a restart". Step.Key()
-// hashes step content only -- no session, no image, no environment generation -- and
-// replayRecorded treats a hit as permission to skip. But RebuildFromSpec builds the new
-// box from spec.Base and restores no snapshot, so the box has provably never run the
-// step. A cache hit is being used as evidence about a container that cannot contain the
-// effect.
-//
-// Measured on this double, after dropping the box so the loss is real:
-//
-//	same session:  cached=1 replayed=0 history=[]   (workflow's own deps vanish)
-//	cross session: cached=1 replayed=0 history=[]   (B skipped because A ran it)
-//
-// Any resulting failure is classified ClassUserCode, so the sandbox blames the caller
-// for a skip the sandbox performed.
-func TestStepCacheIsNotEvidenceAboutAFreshBox(t *testing.T) {
+// TestStepCacheCannotSilentlySkipAgain is the regression gate for D-20. It replaced a
+// visible SKIP that carried the measurement while the decision was open; the decision is
+// now made, so the same evidence has to fail the build instead of printing a warning.
+func TestStepCacheCannotSilentlySkipAgain(t *testing.T) {
 	ctx := context.Background()
 	cache := sandbox.NewMemoryJournal()
-	f := newResumeFixtureWith(t, "cache-lineage", cache)
+	sb := openHandle(t, sandbox.WithStepCache(cache))
 
-	sess, err := f.sb.Session(ctx, "lineage-1", sandbox.WithCreateIfMissing(true))
+	a, err := sb.Session(ctx, "lineage-a", sandbox.WithCreateIfMissing(true))
 	if err != nil {
-		t.Fatalf("Session: %v", err)
+		t.Fatalf("Session a: %v", err)
 	}
-	if err := sess.Install(ctx, sandbox.Pip("scikit-learn")); err != nil {
-		t.Fatalf("Install: %v", err)
+	if err := a.Install(ctx, sandbox.Pip("pandas==2.0.3")); err != nil {
+		t.Fatalf("Install a: %v", err)
 	}
-	if _, err := sess.Rebuild(ctx); err != nil {
-		t.Fatalf("first Rebuild: %v", err)
-	}
-	if !f.prov.InstalledIn("lineage-1", "scikit-learn") {
-		t.Fatalf("first rebuild lost the package: %v", f.prov.History("lineage-1"))
+	if _, err := a.Rebuild(ctx); err != nil {
+		t.Fatalf("Rebuild a: %v", err)
 	}
 
-	sess.MarkLost(errors.New("simulated loss"))
-	// Real loss means the box is gone from the engine, not merely unlinked from the
-	// session: otherwise the provider hands the same container back and there is no
-	// fresh box to be wrong about.
-	f.prov.DropEnvironment("lineage-1")
-	second, err := sess.Rebuild(ctx)
+	// A different session, same step content, whose box has never seen the install.
+	b, err := sb.Session(ctx, "lineage-b", sandbox.WithCreateIfMissing(true))
 	if err != nil {
-		t.Fatalf("second Rebuild: %v", err)
+		t.Fatalf("Session b: %v", err)
 	}
-	present := f.prov.InstalledIn("lineage-1", "scikit-learn")
-	if second.Cached > 0 && !present {
-		t.Skipf("D-20 OPEN (measured, not fixed pending a decision): rebuild reported cached=%d "+
-			"and replayed=%d on a box built from the base image, and that box has no scikit-learn: history=%q. "+
-			"A step-cache hit is being read as evidence about a container that never ran the step. "+
-			"Resolution needs a human call: replay-always-for-scratch-boxes, or rebuild restores the "+
-			"latest snapshot and only steps predating it may be skipped.",
-			second.Cached, len(second.Replayed), f.prov.History("lineage-1"))
+	if err := b.Install(ctx, sandbox.Pip("pandas==2.0.3")); err != nil {
+		t.Fatalf("Install b: %v", err)
 	}
-	if !present {
-		t.Fatalf("the fresh box has no scikit-learn and nothing said so: cached=%d replayed=%d history=%q",
-			second.Cached, len(second.Replayed), f.prov.History("lineage-1"))
+	// Make the loss real, then rebuild into a fresh container.
+	sandboxtest.DropEnvironment(t, "lineage-b")
+	rep, err := b.Rebuild(ctx)
+	if err != nil {
+		t.Fatalf("Rebuild b: %v", err)
+	}
+	if rep.Cached != 0 {
+		t.Fatalf("session b skipped %d steps it never satisfied in this container: %+v", rep.Cached, rep)
+	}
+	if len(rep.Replayed) == 0 {
+		t.Fatal("session b replayed no steps at all")
+	}
+	if got := sandboxtest.InstalledIn(t, "lineage-b", "pandas==2.0.3"); !got {
+		t.Fatal("replay did not actually reinstall into the fresh box")
 	}
 }
