@@ -74,20 +74,18 @@ func (a Ask) Answer(ctx context.Context, sb *sandbox.Sandbox, approved bool, who
 	if a.Session == "" {
 		return nil, errors.New("sandboxgraph: answer needs a session name")
 	}
-	// Cheap existence guard before touching the session machinery. It is deliberately not
-	// presented as proof of this particular approval: the handle reports a count, so a
-	// zero count rules this handle out, while a nonzero count still needs the precise check
-	// below. The reason to bother is cost, not correctness: Session() with
-	// WithCreateIfMissing(false) does not refuse an unknown id on a store-less handle, so
-	// answering a stale record would boot a fresh environment for a box nobody asked for.
-	// The error names what the guard actually established: this approval is not outstanding
-	// here. It says nothing about whether the session is alive, and claiming otherwise would
-	// send a caller off to look for a missing box when the question was already answered.
-	if diag, err := sb.Diagnose(ctx); err == nil && !holdsAnyApproval(diag) {
-		return nil, fmt.Errorf("%w %q: this handle has no outstanding approvals at all", ErrNoApproval, a.Approval)
-	}
+	// The core refuses an unknown id on a handle that cannot verify it, which is exactly the
+	// signal an out-of-band answer needs: no environment is booted, and a stale record cannot
+	// be spent on a fresh box. This used to need a pre-check against the handle's approval
+	// count because WithCreateIfMissing(false) was a silent no-op without a session store;
+	// that defect is fixed, so the workaround goes with it rather than staying as a second
+	// authority on the same question.
 	sess, err := sb.Session(ctx, a.Session, sandbox.WithCreateIfMissing(false))
 	if err != nil {
+		var stale *sandbox.StaleSessionError
+		if errors.As(err, &stale) {
+			return nil, fmt.Errorf("%w %q: %w", ErrNoSession, a.Session, err)
+		}
 		return nil, fmt.Errorf("sandboxgraph: re-acquire session %q: %w", a.Session, err)
 	}
 	// The approval book is the authority on whether this question is still open here.
@@ -126,19 +124,6 @@ func askAncestor(ctx context.Context, sess *sandbox.Session, a Ask, who string) 
 		return nil, fmt.Errorf("sandboxgraph: resume %q: %w", a.Approval, err)
 	}
 	return &Result{Run: rep, State: StateRan, Ask: a}, nil
-}
-
-// holdsAnyApproval reads the handle's approval count out of a diagnostic report.
-func holdsAnyApproval(diag *sandbox.DiagReport) bool {
-	if diag == nil {
-		return true
-	}
-	for _, c := range diag.Checks {
-		if c.Env == "approvals" {
-			return !c.OK
-		}
-	}
-	return false
 }
 
 // openApproval checks the approval book directly, which is the only precise answer to

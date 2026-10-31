@@ -346,8 +346,10 @@ func TestAnswerFromCheckpoint(t *testing.T) {
 	fresh := openSandbox(t, sandbox.WithPolicy(policyOn("deploy")))
 	if _, err := asked[0].Answer(ctx, fresh, true, "second-process"); err == nil {
 		t.Fatal("a handle that does not hold the session must say so rather than answer blindly")
-	} else if !errors.Is(err, sgraph.ErrNoApproval) {
-		t.Fatalf("want ErrNoApproval, got %v", err)
+	} else if !errors.Is(err, sgraph.ErrNoSession) {
+		t.Fatalf("want ErrNoSession, got %v", err)
+	} else if !strings.Contains(err.Error(), "cannot be verified as a resumption") {
+		t.Fatalf("the refusal should come from the core's own check, not from this package's guess, got %q", err)
 	}
 
 	res, err := asked[0].Answer(ctx, sb, true, "second-process")
@@ -369,15 +371,19 @@ func TestAnswerRefusesToInventASession(t *testing.T) {
 	sb := openSandbox(t)
 	ask := sgraph.Ask{Node: "work", Session: "never-created", Approval: "ap-1"}
 	_, err := ask.Answer(ctx, sb, true, "x")
-	if !errors.Is(err, sgraph.ErrNoApproval) {
-		t.Fatalf("an approval nobody is holding must not be answered, got %v", err)
+	if !errors.Is(err, sgraph.ErrNoSession) {
+		t.Fatalf("a session nobody can verify must not be answered, got %v", err)
 	}
-	// The refusal has to come before any session lookup, because Session() on a store-less
-	// handle does not honour WithCreateIfMissing(false): consulting the handle's approval
-	// count first is what keeps a stale record from booting an environment nobody asked for.
-	// Recorded as an upstream finding in the B4 plan rather than patched in the core here.
+	// Asserted against the core directly too, so this package's guarantee does not rest only
+	// on the adapter's mapping: the same id asked of the handle is refused as unverifiable.
+	// This is the defect that used to force a pre-check here; it is now a tested contract.
 	if _, err := sb.Session(ctx, "never-created", sandbox.WithCreateIfMissing(false)); err == nil {
-		t.Log("upstream: WithCreateIfMissing(false) is a silent no-op without a session store")
+		t.Fatal("core: WithCreateIfMissing(false) must refuse an unknown id even with no session store")
+	} else {
+		var stale *sandbox.StaleSessionError
+		if !errors.As(err, &stale) {
+			t.Fatalf("core: want *StaleSessionError, got %T: %v", err, err)
+		}
 	}
 }
 

@@ -249,7 +249,9 @@ func (sb *Sandbox) RunProject(ctx context.Context, proj Project, opts ...RunOpti
 	if id == "" {
 		id = "project-" + newRunID()
 	}
-	sess, err := sb.Session(ctx, id)
+	// RunProject creates the session it runs on, so it says so: with the unknown-id refusal
+	// now honoured, an implicit "just boot it" would fail for a pinned id nobody has seen.
+	sess, err := sb.Session(ctx, id, WithCreateIfMissing(true))
 	if err != nil {
 		return nil, err
 	}
@@ -368,10 +370,18 @@ func (sb *Sandbox) Session(ctx context.Context, id string, opts ...SessionOption
 		return nil, err
 	}
 	if !found && !opt.CreateIfMissing && !opt.Replay {
-		// An unknown id with no store record is a caller bug or a stale resume.
-		if sb.cfg.Sessions != nil {
-			return nil, &StaleSessionError{SessionID: id, Provider: sb.name, Cause: errors.New("no session record; use WithCreateIfMissing to start fresh")}
+		// An unknown id with no store record is a caller bug or a stale resume, and the
+		// refusal has to happen either way. It used to be guarded on a session store being
+		// configured, so on a store-less handle the option was a silent no-op that booted a
+		// fresh environment and handed it back as if it were the session being resumed: a
+		// workflow that believed it was continuing a project would find an empty box and
+		// attribute the missing state to its own code. Whether a store exists changes only
+		// what can be said about the cause, not whether to refuse.
+		cause := errors.New("no session record for this id; use WithCreateIfMissing to start fresh")
+		if sb.cfg.Sessions == nil {
+			cause = errors.New("this handle has no session store, so an unknown id cannot be verified as a resumption; use WithCreateIfMissing to start fresh")
 		}
+		return nil, &StaleSessionError{SessionID: id, Provider: sb.name, Cause: cause}
 	}
 
 	spec := SessionSpec{Base: sb.cfg.Image, MountMode: sb.cfg.Limits.DefaultMountMode}

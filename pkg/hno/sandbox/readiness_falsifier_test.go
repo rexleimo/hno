@@ -269,7 +269,7 @@ func TestExposeOnExistingSessionIsRefused(t *testing.T) {
 	// refusal is the capability gate; either way the caller is told rather than misled.
 	sb := openHandle(t)
 	ctx := context.Background()
-	sess, err := sb.Session(ctx, "expose-none")
+	sess, err := sb.Session(ctx, "expose-none", sandbox.WithCreateIfMissing(true))
 	if err != nil {
 		t.Fatalf("Session: %v", err)
 	}
@@ -312,6 +312,7 @@ func TestEnvSpecCarriesExpose(t *testing.T) {
 	defer sb.Close()
 
 	if _, err := sb.Session(context.Background(), "with-expose",
+		sandbox.WithCreateIfMissing(true),
 		sandbox.WithSessionExpose(sandbox.PortMap{HostPort: 9099, GuestPort: 80}),
 	); err != nil {
 		t.Fatalf("Session: %v", err)
@@ -376,6 +377,7 @@ func TestExposeOnForwardingSessionIsRefusedWhenNotPublished(t *testing.T) {
 	defer sb.Close()
 
 	sess, err := sb.Session(context.Background(), "fwd-1",
+		sandbox.WithCreateIfMissing(true),
 		sandbox.WithSessionExpose(sandbox.PortMap{HostPort: 1234, GuestPort: 80}),
 	)
 	if err != nil {
@@ -420,6 +422,7 @@ func TestExposeMatchingWhatWasPublishedIsAccepted(t *testing.T) {
 	defer sb.Close()
 
 	sess, err := sb.Session(context.Background(), "fwd-2",
+		sandbox.WithCreateIfMissing(true),
 		sandbox.WithSessionExpose(sandbox.PortMap{HostPort: 8080, GuestPort: 8080}),
 	)
 	if err != nil {
