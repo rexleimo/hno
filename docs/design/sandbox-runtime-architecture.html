@@ -1,0 +1,915 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HNO 沙盒运行时 · API 契约与生命周期设计（评审稿 v0.7）</title>
+<style>
+  :root{
+    --bg:#0b0f16;--panel:#121a26;--panel2:#0f1622;--line:#22304a;--line2:#2f4266;
+    --fg:#dce6f5;--muted:#8fa3c0;--dim:#6b7f9c;
+    --surface:#4cc2ff;--assembly:#7aa2ff;--ext:#f0b429;--service:#38d39f;--provider:#ff8f6b;--engine:#e6697a;
+    --ok:#38d39f;--warn:#f0b429;--bad:#ff6b81;--mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  @media(prefers-color-scheme:light){
+    :root{--bg:#f7f9fc;--panel:#fff;--panel2:#f2f5fa;--line:#d9e2f0;--line2:#c2cfe3;--fg:#17233a;--muted:#47597a;--dim:#6c7f9c}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  header{padding:32px 28px 20px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(76,194,255,.07),transparent)}
+  h1{margin:0 0 6px;font-size:24px}
+  .sub{color:var(--muted);max-width:110ch;font-size:14px}
+  nav{display:flex;flex-wrap:wrap;gap:7px;margin-top:14px}
+  nav a{font:12px var(--mono);color:var(--muted);text-decoration:none;border:1px solid var(--line2);
+    border-radius:999px;padding:3px 10px}nav a:hover{color:var(--surface);border-color:var(--surface)}
+  main{padding:22px 28px 90px;max-width:1260px;margin:0 auto}
+  section{margin:0 0 36px;scroll-margin-top:12px}
+  h2{font-size:18.5px;margin:0 0 3px}
+  h3{font-size:13.6px;margin:22px 0 8px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em}
+  p{margin:7px 0}
+  .lead{color:var(--muted);font-size:14px;margin:2px 0 14px;max-width:112ch}
+  code{font-family:var(--mono);font-size:12.5px;background:var(--panel2);padding:1.5px 5px;border-radius:4px;border:1px solid var(--line)}
+  pre{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:13px 15px;overflow:auto;
+    font-family:var(--mono);font-size:12.3px;line-height:1.62;margin:9px 0}
+  pre b{color:var(--surface);font-weight:600}pre i{color:var(--dim);font-style:normal}
+  pre u{color:var(--ext);text-decoration:none}pre s{color:var(--ok);text-decoration:none}
+  table{width:100%;border-collapse:collapse;font-size:13.2px;margin:8px 0}
+  th,td{border-bottom:1px solid var(--line);padding:8px 9px;text-align:left;vertical-align:top}
+  th{color:var(--muted);font-size:11.6px;text-transform:uppercase;letter-spacing:.05em;background:var(--panel2)}
+  td.n,th.n{font-family:var(--mono);white-space:nowrap}
+  .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.mut{color:var(--muted)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:13px 15px;margin:9px 0}
+  .api{border-left:3px solid var(--surface)}
+  .api h4{margin:0 0 2px;font-family:var(--mono);font-size:13.2px;color:var(--fg)}
+  .api .meta{font-size:12px;color:var(--dim);margin-bottom:6px}
+  .api dl{margin:6px 0 0;font-size:13px}.api dt{color:var(--muted);font-size:11.4px;text-transform:uppercase;margin-top:7px}
+  .api dd{margin:1px 0 0}
+  .grid{display:grid;gap:11px}.g2{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+  .g3{grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}
+  .stack{display:flex;flex-direction:column;gap:8px}
+  .layer{border:1px solid var(--line2);border-left:4px solid var(--dim);border-radius:10px;background:var(--panel);padding:10px 13px}
+  .layer b{font-size:14.4px}.layer .who{float:right;font:11.5px var(--mono);color:var(--dim)}
+  .layer div.d{color:var(--muted);font-size:13.2px;margin-top:4px}
+  .a-surface{border-left-color:var(--surface)}.a-assembly{border-left-color:var(--assembly)}
+  .a-jie{border-left-color:var(--ext)}.a-service{border-left-color:var(--service)}
+  .a-provider{border-left-color:var(--provider)}.a-engine{border-left-color:var(--engine)}
+  .down{text-align:center;color:var(--dim);line-height:1;font-size:14px}
+  .state{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .st{font:11.8px var(--mono);border:1px solid var(--line2);border-radius:8px;padding:4px 9px;background:var(--panel2)}
+  .st.hot{border-color:var(--ok);color:var(--ok)}.st.cold{border-color:var(--bad);color:var(--bad)}
+  .st.wait{border-color:var(--warn);color:var(--warn)}
+  .sep{color:var(--dim)}
+  .note{border:1px dashed var(--line2);border-radius:10px;padding:11px 13px;color:var(--muted);font-size:13.2px;background:var(--panel2)}
+  .flag{border-left:3px solid var(--warn);padding-left:11px;color:var(--muted);font-size:13.3px;margin:9px 0}
+  .flag.bad{border-left-color:var(--bad)}.flag.ok{border-left-color:var(--ok)}
+  ul{margin:5px 0 0;padding-left:19px}li{margin:3px 0}
+  footer{border-top:1px solid var(--line);padding:16px 28px;color:var(--dim);font-size:12.4px}
+  @media(max-width:820px){header,main,footer{padding-left:14px;padding-right:14px}}
+</style>
+</head>
+<body>
+<header>
+<h1>HNO 沙盒运行时 · API 契约与生命周期</h1>
+<div class="sub"><b>v1.0 · 定稿</b>。本次修订只做一件事：命名去掉自造黑话，每个 API 给出签名与错误语义，
+生命周期改成状态机 + 可用性矩阵。引擎选型已定：<b>BoxLite</b>（本地 micro-VM）+ <b>gVisor runsc</b>（容器级 syscall 过滤）。
+<br><b>v0.3 增补</b>：针对「要嵌进别的流程」「整个项目怎么进/怎么出」「异常与复杂场景」三类缺口，新增 <a href="#s13">§13 项目级工作区</a>、<a href="#s14">§14 嵌入别人的流程</a>、<a href="#s15">§15 异常与复杂场景矩阵</a>；并修订 §5.3 的 <code>Request.Files</code> 设计缺陷。<br><b>v0.4 增补</b>：<a href="#s16">§16 失败分类与重试预算</a> —— v0.3 只写了 <code>IdempotencyKey</code>/<code>EffectClass</code> 两个词，<b>没有真正的重试策略</b>，现补齐。</div>
+<nav>
+  <a href="#s1">1 命名修订</a><a href="#s2">2 术语</a><a href="#s3">3 分层</a><a href="#s4">4 对象模型</a>
+  <a href="#s5">5 API 手册</a><a href="#s6">6 生命周期</a><a href="#s7">7 三个介入点</a>
+  <a href="#s8">8 怎么用</a><a href="#s9">9 装机与封装</a><a href="#s10">10 安全矩阵</a><a href="#s11">11 性能契约</a><a href="#s12">12 分期与待决</a>
+  <a href="#s13">13 项目级工作区 ★</a><a href="#s14">14 编排与嵌入 ★</a><a href="#s15">15 异常场景矩阵 ★</a><a href="#s16">16 失败分类与重试 ★</a><a href="#s17">17 可重放 Spec ★</a>
+</nav>
+</header>
+<main>
+
+<!-- ═══════════════ 1 ═══════════════ -->
+<section id="s1">
+<h2>1 · 命名修订表（你指出的第一问题）</h2>
+<p class="lead">旧稿最伤人的地方：<code>L1/L2/L3</code> 同时表示「架构分层」和「隔离强度」，读者必然串台。现在分层用<b>词</b>，隔离用<b>枚举名</b>，编号全部废除。</p>
+<table>
+<tr><th>旧稿（不清楚）</th><th>新命名</th><th>为什么</th></tr>
+<tr><td class="n">L1 · 开发者面</td><td class="n">Developer Surface</td><td>与隔离级 L1 撞名</td></tr>
+<tr><td class="n">L2 · 封装与装配</td><td class="n">Assembly &amp; Options</td><td>同上</td></tr>
+<tr><td class="n">L3 · 钩子总线（Hook Bus）</td><td class="n">Extension Points（三类：<b>Policy / Observer / Sink</b>）</td><td>「总线」是黑话；实际是三种不同语义的接口，必须分开命名</td></tr>
+<tr><td class="n">L4 · SandboxService</td><td class="n">Core（Policy·Session·Admission·Audit）</td><td>—</td></tr>
+<tr><td class="n">L5 · Provider 插件</td><td class="n">Provider</td><td>—</td></tr>
+<tr><td class="n">L6 · 隔离梯度 L0–L4</td><td class="n"><code>IsolationNone / Container / SyscallFiltered / MicroVM / MicroVMHosted</code></td><td>隔离级是<b>枚举值</b>，不是层级编号；日志里要能读</td></tr>
+<tr><td class="n">doctor</td><td class="n"><code>sandbox.Diagnose()</code>，CLI 子命令仍叫 <code>hno sandbox doctor</code></td><td>API 用动词，CLI 用人类词</td></tr>
+<tr><td class="n">fake / stub（测试替身）</td><td class="n"><code>stub.New()</code>（包 <code>sandbox/stub</code>）</td><td>避免和 <code>fakeExecutor</code> 混</td></tr>
+<tr><td class="n">OnTierChange</td><td class="n">事件 <code>EventIsolationChanged</code></td><td>事件是数据不是回调，统一 <code>Event*</code></td></tr>
+<tr><td class="n">OnAcquire/OnRelease/BeforeExec…</td><td class="n">统一进 <code>Observer.Observe(ctx, Event)</code>，用 <code>EventKind</code> 区分</td><td>旧稿 11 个回调名 = 11 套记忆负担；改成 1 个方法 + 枚举</td></tr>
+<tr><td class="n">sb.Run / disconnect event</td><td class="n">一次性 <code>Run</code>；有状态 <code>Session.Exec</code>；流式 <code>Sink.Emit</code></td><td>旧稿里 <code>disconnect</code> 从未定义，属于笔误，删除</td></tr>
+</table>
+</section>
+
+<!-- ═══════════════ 2 ═══════════════ -->
+<section id="s2">
+<h2>2 · 术语（本文档只用这几个词）</h2>
+<table>
+<tr><th class="n">术语</th><th>定义</th></tr>
+<tr><td class="n">Sandbox</td><td>应用级的<b>配置与资源句柄</b>：持有一组 Options、Provider、池、审计出口。<code>Open()</code> 返回它。它<i>不是</i>一个虚拟机。</td></tr>
+<tr><td class="n">Request</td><td>一次执行的输入形状（runtime + code/args + 文件 + 限额 + 出网）。<b>值类型</b>，可被 Policy 改写（只收紧）。</td></tr>
+<tr><td class="n">Run</td><td>一次执行的<i>过程</i>及其结果 <code>Report</code>。一次性、结束即清理。</td></tr>
+<tr><td class="n">Session</td><td>一个<b>跨调用存活的隔离环境</b>（绑定业务会话 ID）：同一个 box/容器，磁盘与已装依赖保留。</td></tr>
+<tr><td class="n">Provider</td><td>把 Request 落到某种隔离实现上的插件（boxlite / runsc / container / e2b / stub）。</td></tr>
+<tr><td class="n">Isolation</td><td>该次执行<i>实际</i>生效的隔离强度枚举。与 Provider 有关，与配置要求可能不同 → 差值必须告警。</td></tr>
+<tr><td class="n">Admission</td><td>额度闸：并发数、内存水位、租户配额。决定能否进入 <code>Provisioning</code>。</td></tr>
+<tr><td class="n">Policy / Observer / Sink</td><td>三个介入点：可否决并改写 / 只观察状态变化 / 只接收执行输出流。</td></tr>
+</table>
+</section>
+
+<!-- ═══════════════ 3 ═══════════════ -->
+<section id="s3">
+<h2>3 · 分层（谁负责什么，谁可以调用）</h2>
+<div class="stack">
+  <div class="layer a-surface"><span class="who">业务 / agent 开发者</span><b>Developer Surface</b><span class="mut"> — pkg/hno/sandbox</span>
+    <div class="d"><code>Open · Run · Session · Files · Status · Close</code>。开发者<b>只该知道这一层</b>。不认识 provider 名字，不认识 KVM/QCOW2/vsock。</div></div>
+  <div class="down">▼</div>
+  <div class="layer a-assembly"><span class="who">应用配置 / SRE</span><b>Assembly &amp; Options</b><span class="mut"> — Option 函数 + Profile</span>
+    <div class="d">声明要求：最低隔离级、限额、出网白名单、会话 TTL、provider 装配方式（in-proc / sidecar / remote REST）。</div></div>
+  <div class="down">▼</div>
+  <div class="layer a-jie"><span class="who">安全 / 平台 / 前端</span><b>Extension Points</b><span class="mut"> — Policy · Observer · Sink</span>
+    <div class="d">介入点。<b>只允许收紧，不允许放宽硬边界</b>（继承今天「策略参数不可由调用方修改」的原则）。</div></div>
+  <div class="down">▼</div>
+  <div class="layer a-service"><span class="who">框架内核</span><b>Core</b><span class="mut"> — policy engine · session pool · admission · audit</span>
+    <div class="d">生命周期状态机的唯一拥有者；钩子的 panic/超时隔离在这里执行；每个 Run 落一条审计。</div></div>
+  <div class="down">▼</div>
+  <div class="layer a-provider"><span class="who">平台团队</span><b>Provider</b><span class="mut"> — sandbox/provider/*</span>
+    <div class="d">统一 <code>Probe → Capabilities → Start/Wait/Kill</code>，可选实现 <code>SessionHost · FileBridge · EgressHost</code>。<b>能力靠断言，不靠假设。</b></div></div>
+  <div class="down">▼</div>
+  <div class="layer a-engine"><span class="who">外部引擎</span><b>Engines</b>
+    <div class="d">BoxLite（hypervisor micro-VM，VM 内用 libcontainer 跑 OCI 容器，宿主侧 bwrap+seccomp+landlock+jailer）·
+      gVisor runsc · podman/docker · E2B · in-memory stub。</div></div>
+</div>
+</section>
+
+<!-- ═══════════════ 4 ═══════════════ -->
+<section id="s4">
+<h2>4 · 对象模型（先看清「谁是谁」，再看 API）</h2>
+<div class="note">
+<code>Application</code> ──1:1──▶ <code>*Sandbox</code>（配置 + 池，进程内共享，<b>并发安全</b>）<br>
+&nbsp;&nbsp;&nbsp;&nbsp;├─ N 次 ──▶ <code>Run</code>（一次性；<code>Run()</code> 返回即已清理完毕）<br>
+&nbsp;&nbsp;&nbsp;&nbsp;└─ N 个 ──▶ <code>*Session</code>（有状态；由业务会话 ID 决定复用；<code>Release()</code> 归还、<code>Destroy()</code> 销毁）<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└──1:1──▶ <code>Isolation</code>（一个 box / 一个容器 / 一台远端 microVM）
+</div>
+<p class="lead">关键区分（旧稿没讲）：<b><code>Sandbox</code> 不是沙盒环境，是「开沙盒的能力」</b>；真正的隔离环境是 <code>Run</code> 的一次性环境或 <code>Session</code> 绑定的 box。
+这就是为什么 <code>Open()</code> 很便宜（只做 Probe），而 <code>Session()</code> 很贵（要 Admission + Provisioning + Booting）。</p>
+</section>
+
+<!-- ═══════════════ 5 ═══════════════ -->
+<section id="s5">
+<h2>5 · API 手册（每个方法一张契约卡）</h2>
+<p class="lead">包名 <code>pkg/hno/sandbox</code>；以下即公开 API 全集（v0.2 提案）。每张卡：签名 / 入参 / 返回 / 可能错误 / 调用时机 / 默认值。</p>
+
+<h3>5.1 构造与销毁</h3>
+<div class="card api">
+<h4>func Open(ctx context.Context, opts ...Option) (*Sandbox, error)</h4>
+<div class="meta">调用时机：进程启动或首次用到工具时。<b>只做 Probe，不创建任何隔离资源。</b></div>
+<dl>
+<dt>入参</dt><dd><code>ctx</code> 控制 Probe 超时；<code>opts</code> 见 §5.2。未传 <code>WithMinimumIsolation</code> 时默认<b>接受当前可用的最强隔离</b>并在 <code>Status()</code> 中报告实际级别。</dd>
+<dt>返回</dt><dd><code>*Sandbox</code>（并发安全，进程内单例即可）。</dd>
+<dt>错误</dt><dd><code>*UnavailableError</code>：<code>Tried []Attempt</code>（每个 provider 的失败原因）+ <code>Fixes []string</code>（可直接复制的修复命令）。
+Probe 失败<b>不会</b>返回空对象；调用方拿到的要么是可用句柄，要么是带修复建议的错误。今天 <code>ErrNoProvider</code> 只有一句话，是苦恼源头。</dd>
+<dt>反例</dt><dd><i>不要</i>在每个 tool call 里 <code>Open</code>：Probe 有 IPC 成本。用单例句柄 + <code>Session</code>。</dd>
+</dl>
+</div>
+
+<div class="card api">
+<h4>func (s *Sandbox) Status() Status</h4>
+<div class="meta">非阻塞、无错误。返回选中的 provider、版本、<b>实际 Isolation</b>、能力位、池水位、Profile 摘要。</div>
+<dl><dt>用途</dt><dd>健康检查、<code>/debug/sandbox</code>、日志首行、CI 断言「生产必须是 MicroVM」。</dd></dl>
+</div>
+
+<div class="card api">
+<h4>func (s *Sandbox) Close() error</h4>
+<div class="meta">调用时机：进程退出前。<b>释放池内所有 Session 的底层环境</b>（销毁 box/容器），等待在途 Run 结束（受 <code>WithShutdownGrace</code>，默认 10s，超时则强制 Kill 并在返回的 error 中汇总）。</div>
+<dl><dt>错误</dt><dd><code>*CleanupError</code>：残留资源清单 + 清扫器 ID。<i>幂等</i>，可重复调用。</dd></dl>
+</div>
+
+<h3>5.2 Option（配置面）</h3>
+<table>
+<tr><th class="n">签名</th><th>语义 / 默认值</th></tr>
+<tr><td class="n">WithProfile(Profile)</td><td>从 <code>profile.yaml</code> 载入全部声明；与逐个 Option 冲突时<b>后写覆盖</b>，并产出 <code>EventConfigConflict</code>。默认无。</td></tr>
+<tr><td class="n">WithMinimumIsolation(Isolation)</td><td>硬要求。低于此级别 → <code>*IsolationError</code> 直接失败，<b>不静默降级</b>。默认 <code>IsolationContainer</code>。</td></tr>
+<tr><td class="n">WithLimits(Limits)</td><td><code>Timeout</code>(30s)·<code>Memory</code>(512MiB)·<code>PIDs</code>(128)·<code>Output</code>(1MiB)·<code>CPUs</code>(2)。是<b>天花板</b>：Run 只能要求更低。</td></tr>
+<tr><td class="n">WithEgress(hosts ...string)</td><td>出网白名单，默认<b>空=全禁</b>（沿用今天 <code>network none</code> 的默认拒绝语义）。</td></tr>
+<tr><td class="n">WithSessionTTL(active, idle)</td><td>Session 保活：默认 30m 绝对 / 5m 空闲；到期 → <code>EventSessionExpired</code> + 回收。</td></tr>
+<tr><td class="n">WithPool(size int)</td><td>预热/并发上限，默认 <code>max(4, NumCPU)</code>；配合 Admission。</td></tr>
+<tr><td class="n">WithPolicy / WithObserver / WithSink</td><td>注册介入点，<b>注册顺序=执行顺序</b>；见 §7。</td></tr>
+<tr><td class="n">WithProvider(name string, p Provider)</td><td>平台团队插自定义引擎；同名覆盖并告警。</td></tr>
+<tr><td class="n">WithSecretMode(m SecretMode)</td><td><code>SecretEnv</code>（值进沙盒，默认）/ <code>SecretPlaceholder</code>（BoxLite 宿主侧 MITM 替换，<b>需显式</b>）。</td></tr>
+<tr><td class="n">WithAudit(fn AuditFunc)</td><td>每个 Run 一条 <code>AuditRecord</code>。默认走 <code>slog</code>。执行路径今天完全没有审计，这条是新增硬要求。</td></tr>
+<tr><td class="n">WithShutdownGrace(d)</td><td><code>Close()</code> 等待在途 Run 的时长，默认 10s。</td></tr>
+</table>
+
+<h3>5.3 一次性执行</h3>
+<div class="card api">
+<h4>func (s *Sandbox) Run(ctx context.Context, req Request, ropts ...RunOption) (*Report, error)</h4>
+<div class="meta">调用时机：无状态代码执行。<b>返回时底层环境已销毁</b>（沿用今天 <code>--rm</code> 的一次性语义）。</div>
+<dl>
+<dt>Request 构造</dt><dd><code>Python(code) / Node(code) / Shell(script)</code>，或 <code>Request{Runtime, Argv, Inputs []Input, Workspace *WorkspaceSpec, Outputs []OutputSpec, Egress, Timeout}</code>；<code>Files{path→bytes}</code> 仅作 ≤1 MiB 小文件内联快捷方式保留（见 §13.4）。payload 走 stdin，不进 argv（保留今天的做法）。
+<div class="flag bad"><b>v0.3 修订</b>：v0.2 的 <code>Files map[string][]byte</code> 是设计缺陷 —— 它只能把小文件读进内存，<b>装不下一个项目目录，也拿不出执行产物</b>。改成 <code>Inputs</code>（来源式，流式）+ <code>Workspace</code>（目录级，见 §14）+ <code>Outputs</code>（产物声明，见 §13），三者都走 tar/流通道，不经内存 map。</div></dd>
+<dt>RunOption</dt><dd><code>WithTimeout</code>·<code>WithWorkspace(dir)</code>·<code>WithEnv(kv...)</code>·<code>WithSink</code>（仅本次）·<code>WithRunID</code>。全部只能<b>收紧</b> Sandbox 级设置。</dd>
+<dt>返回</dt><dd><code>Report{ExitCode, Stdout, Stderr, Truncated, TimedOut, Duration, Isolation, Provider, RunID, <b>Artifacts ArtifactSet</b>, <b>Phases []PhaseReport</b>, <b>RunRef</b>}</code>。<i>永远非 nil</i>（除非 panic），即使被否决也带回填的 <code>Isolation/RunID</code>。</dd>
+<dt>错误</dt><dd><code>*DeniedError</code>（Policy 否决，含哪个 Policy、原因）·<code>*IsolationError</code>（级别不达标）·<code>*QuotaError</code>（额度满，含 <code>Limit/Active</code>）·<code>*UnavailableError</code>·<code>context.Cause</code>·<code>*HookFaultError</code>。</dd>
+<dt>⚠️ 迁移点</dt><dd>今天 <code>toolkit.go:106-115</code> 把 provider 错误塞进结果 map 并 <code>return ..., nil</code> —— 模型、监控、Policy 三方都看不见失败。<b>本 API 必须返回真 error</b>，toolkit 层再做「错误也进 map，但 error 非 nil」的双写。</dd>
+</dl>
+</div>
+
+<h3>5.4 有状态会话（BoxLite 的价值全在这里）</h3>
+<div class="card api">
+<h4>func (s *Sandbox) Session(ctx context.Context, id string, sopts ...SessionOption) (*Session, error)</h4>
+<div class="meta">调用时机：多轮 agent 工具调用、需要「轮 1 装依赖 → 轮 2 用」。<code>id</code> 用<b>业务会话 ID</b>（同一 id 幂等复用同一环境）。</div>
+<dl>
+<dt>行为</dt><dd>存在且活着 → 直接绑定（不发 <code>Provisioning</code>）；不存在 → Admission → Provisioning → Booting。<b>这是唯一会付 1–2s box 启动成本的调用。</b></dd>
+<dt>错误</dt><dd><code>*QuotaError</code>（并发 box 满）·<code>*IsolationError</code>·<code>*ProvisionError</code>（镜像拉取/磁盘创建失败，带 <code>Fixes</code>：<code>hno sandbox doctor</code>）·<code>*StaleSessionError</code>（id 存在但底层环境已丢，见下）。</dd>
+</dl>
+</div>
+<div class="card api">
+<h4>func (x *Session) Exec(ctx context.Context, req Request, ropts ...RunOption) (*Report, error)</h4>
+<div class="meta">复用已启动的环境执行一段代码。语义与 <code>Run</code> 一致，<b>但不销毁环境、不重置磁盘</b>。</div>
+<dl><dt>额外错误</dt><dd><code>*StateError</code>：当前 Session 不在 <code>Ready</code>/<code>Busy</code> 状态（见 §6.2 可用性矩阵）。</dd></dl>
+</div>
+<div class="card api">
+<h4>func (x *Session) Files() FileService &nbsp;&nbsp;<span class="mut">// 文件接口，与执行环境同一个根</span></h4>
+<div class="meta">方法集：<code>Write(ctx,path,data)</code>·<code>Read(ctx,path)</code>·<code>List(ctx,path)</code>·<code>CopyOut(ctx,path) (io.Reader)</code>·<code>Stat(ctx,path)</code></div>
+<dl>
+<dt>约束</dt><dd>路径受 <code>file.Sandbox</code> 同套约束（<code>os.Root</code> 语义 + 大小上限），<b>越界一律 <code>*PathError</code>，不猜</b>。这解决今天「执行沙盒与文件沙盒是两套世界、E2B workspace 直接 not implemented（<code>e2b.go:101</code>）」的问题。</dd>
+<dt>Provider 不支持时</dt><dd>返回 <code>*CapabilityError{Missing: CapFileBridge}</code>，明确说「该引擎不支持」，而不是静默走宿主磁盘。</dd>
+</dl>
+</div>
+<div class="card api">
+<h4>func (x *Session) Release(ctx context.Context) error &nbsp;|&nbsp; Destroy(ctx) error</h4>
+<div class="meta"><b>Release</b>＝停止占用、保留磁盘、允许同 id 再绑定（默认由 TTL/idle 自动做）；<b>Destroy</b>＝立即销毁环境。开发者一般都不用手调：交给 TTL。</div>
+</div>
+<div class="card api">
+<h4>func (x *Session) State() SessionState</h4>
+<div class="meta">只读快照：<code>State</code> + <code>Age</code> + <code>IdleFor</code> + <code>Isolation</code> + <code>Execs</code> 计数。给 UI 和指标，不驱动逻辑。</div>
+</div>
+
+<h3>5.5 诊断（替代旧稿的 doctor 概念，API 形态）</h3>
+<div class="card api">
+<h4>func Diagnose(ctx context.Context) (*DiagReport, error)</h4>
+<div class="meta">调用时机：CI 起步、部署前、用户报障。<b>不创建任何隔离资源</b>，纯检查。</div>
+<dl>
+<dt>检查项</dt><dd><code>/dev/kvm</code> 存在与可写 · HVF 可用（macOS）· bundled bwrap/seccomp 可用 · 镜像是否已缓存 · sidecar/REST 端点可达 · guest 与 SDK 版本匹配 · 磁盘水位 · 出网代理连通。</dd>
+<dt>返回</dt><dd><code>DiagReport{Checks []Check, Reached Isolation, Fixes []string}</code>；<code>Check{Env string; Want, Got string; OK bool; Fix string}</code> —— <b>每条失败都带一行可执行命令</b>，不是错误码。</dd>
+<dt>CLI</dt><dd><code>hno sandbox doctor [--require-isolation microvm]</code>：非零退出码给 CI 用。</dd>
+</dl>
+</div>
+
+<h3>5.6 Provider 侧接口（平台团队才看）</h3>
+<table>
+<tr><th class="n">签名</th><th>契约</th></tr>
+<tr><td class="n">Probe(ctx) (Info, error)</td><td>必须<b>不</b>创建资源、不产生费用；<code>Info{Name,Version,Isolation,Capabilities}</code>。失败原因要可展示给用户。</td></tr>
+<tr><td class="n">Capabilities() CapabilitySet</td><td>位标记：<code>CapSession · CapFileBridge · CapEgress · CapStream · CapPTY</code>。Core 按断言决定能用哪些 API，<b>不支持就 <code>*CapabilityError</code>，绝不模拟</b>。</td></tr>
+<tr><td class="n">Start(ctx, Spec) (RunRef, error) / Wait(ctx, RunRef, sink) (Report, error) / Kill(ctx, RunRef)</td><td>三段式；<code>Wait</code> 必须响应 ctx 取消并保证资源回收。</td></tr>
+<tr><td class="n">optional SessionHost / FileBridge / EgressHost</td><td>Go 接口断言实现。旧稿的 <code>SessionSandbox/FileTransfer/EgressPolicy</code> 统一收敛成这三个名字。</td></tr>
+</table>
+<p class="note">兼容：现有 <code>pkg/hno/tools/run</code> 的 <code>Executor</code>（只有 <code>Run</code>+<code>Close</code>）<b>保持冻结</b>，由 <code>provider/legacy</code> 适配成 <code>IsolationContainer</code> 或 <code>MicroVMHosted</code>。旧调用不改一行，新 API 独立包 —— 所以是 v3.1.0。</p>
+</section>
+
+<!-- ═══════════════ 6 ═══════════════ -->
+<section id="s6">
+<h2>6 · 生命周期（旧稿缺的两样：状态机 + 可用性矩阵）</h2>
+
+<h3>6.1 一次 <code>Run()</code> 的过程</h3>
+<div class="state">
+<span class="st">Requested</span><span class="sep">→</span>
+<span class="st hot">PolicyChecked</span><span class="sep">→</span>
+<span class="st hot">Admitted</span><span class="sep">→</span>
+<span class="st">Provisioned</span><span class="sep">→</span>
+<span class="st">Running</span><span class="sep">→</span>
+<span class="st wait">Finished / TimedOut / Denied / Faulted</span><span class="sep">→</span>
+<span class="st cold">Cleaned</span>
+</div>
+<table>
+<tr><th class="n">状态</th><th>发生什么</th><th>介入点被调</th><th>可观测事件</th><th>失败去向</th></tr>
+<tr><td class="n">Requested</td><td>Request 与 Sandbox 设置合并（取更严者）；生成 RunID</td><td class="mut">—</td><td class="n">EventRunStarted</td><td>参数非法 → <code>*RequestError</code></td></tr>
+<tr><td class="n">PolicyChecked</td><td>Policy 链顺序执行，逐个可改写 Request 或否决</td><td class="n">Policy.Decide ×N</td><td class="n">EventPolicyDenied</td><td>否决 → <code>*DeniedError</code>，<b>不创建任何资源</b></td></tr>
+<tr><td class="n">Admitted</td><td>并发闸 / 内存水位 / 租户配额 / 计费预算</td><td class="mut">—</td><td class="n">EventQuotaBlocked</td><td>满 → <code>*QuotaError</code>（排队或立刻失败，由 Profile 决定）</td></tr>
+<tr><td class="n">Provisioned</td><td>Provider 选定、镜像按 digest 解析、环境创建（一次性环境在这里付冷启）</td><td class="n">Observer</td><td class="n">EventIsolationChanged</td><td>不可用 → <code>*UnavailableError</code> + Fixes</td></tr>
+<tr><td class="n">Running</td><td>payload 经 stdin 注入；输出分块流回；超时守护挂上</td><td class="n">Sink.Emit ×N</td><td class="n">EventOutputChunk</td><td>超预算 → 截断 + <code>Report.Truncated</code></td></tr>
+<tr><td class="n">Finished*</td><td>退出码/超时/截断规范化；<code>Report</code> 定稿</td><td class="n">Observer</td><td class="n">EventRunFinished</td><td>—</td></tr>
+<tr><td class="n">Cleaned</td><td>环境销毁、额度归还、<b>审计落一条</b>（无论成功失败否决都落）</td><td class="n">Audit</td><td class="n">EventRunCleaned</td><td>残留 → <code>*CleanupError</code> + 清扫器</td></tr>
+</table>
+
+<h3>6.2 <code>Session</code> 状态机与可用性矩阵</h3>
+<div class="state">
+<span class="st">Empty</span><span class="sep">→</span><span class="st wait">Admitting</span><span class="sep">→</span><span class="st wait">Provisioning</span><span class="sep">→</span><span class="st wait">Booting</span><span class="sep">→</span>
+<span class="st hot">Ready</span><span class="sep">⇄</span><span class="st hot">Busy</span><span class="sep">→</span><span class="st">Idle</span><span class="sep">→</span>
+<span class="st cold">Expired / Failed</span><span class="sep">→</span><span class="st cold">Draining</span><span class="sep">→</span><span class="st cold">Gone</span>
+</div>
+<table>
+<tr><th class="n">API</th><th>Empty</th><th>Admitting</th><th>Provisioning / Booting</th><th>Ready</th><th>Busy</th><th>Idle</th><th>Expired / Failed / Gone</th></tr>
+<tr><td class="n">Exec</td><td class="bad">StateError</td><td class="warn">阻塞至 Ready（受 ctx 取消）</td><td class="warn">同左</td><td class="ok">✓</td><td class="ok">✓（并发串行化，见注）</td><td class="ok">✓（唤醒回 Ready）</td><td class="bad">StaleSessionError</td></tr>
+<tr><td class="n">Files().*</td><td class="bad">StateError</td><td class="bad">StateError</td><td class="bad">StateError</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td><td class="bad">StaleSessionError</td></tr>
+<tr><td class="n">State()</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td></tr>
+<tr><td class="n">Release()</td><td class="ok">✓ no-op</td><td class="ok">✓ 取消</td><td class="ok">✓ 取消</td><td class="ok">✓</td><td class="warn">等在途 Exec（受 grace）</td><td class="ok">✓</td><td class="ok">✓ no-op</td></tr>
+<tr><td class="n">Destroy()</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓</td><td class="ok">✓（Kill 后销毁）</td><td class="ok">✓</td><td class="ok">✓ no-op</td></tr>
+</table>
+<p class="lead"><b>注（并发语义，旧稿完全没定义）：</b>同一 <code>Session</code> 上并发 <code>Exec</code> 默认<b>串行排队</b>（<code>SessionOption WithConcurrency(n)</code> 显式放开，上限受 Admission）。
+理由：agent 在同一 box 里并行 <code>pip install</code> 与 <code>python run</code> 会互相污染状态；默认必须保守。
+<b>Idle</b>＝保活但未占用宿主；<b>Expired</b>＝TTL 到期，磁盘可能仍保留（取决于 Profile 的 <code>keep_on_expire</code>）；
+<b>Gone</b>＝底层环境已销毁，此时同 id 再 <code>Session()</code> 视为<b>新建</b>并发 <code>EventSessionRecreated</code>（不静默假装状态还在）。</p>
+
+<h3>6.3 钩子自身的执行契约（不定义清楚就会出大事）</h3>
+<table>
+<tr><th class="n">规则</th><th>取值</th><th>为什么</th></tr>
+<tr><td>panic 隔离</td><td class="ok">每个介入点独立 <code>recover</code> → <code>*HookFaultError</code></td><td>今天 <code>hooks.go:69</code> 没有隔离，一个钩子 panic 带崩整次 run</td></tr>
+<tr><td>超时</td><td>Policy 2s（可配）· Observer 100ms · Sink 50ms</td><td>钩子挂死不得拖住执行；Observer/Sink 超时=丢弃该条，Policy 超时=按 <code>OnPolicyTimeout</code> 处理（默认 <b>拒绝</b>）</td></tr>
+<tr><td>顺序</td><td>注册顺序；<code>WithPolicy</code> 无隐式优先级</td><td>可复现性 > 便利</td></tr>
+<tr><td>改写方向</td><td class="ok">只能收紧</td><td><code>Limits</code>/<code>Egress</code>/<code>Isolation</code> 放宽一律 <code>*HookFaultError</code>（防成绕过口）</td></tr>
+<tr><td>Sink 阻塞</td><td>有界队列（默认 256）满 → 丢最旧并计数 <code>EventSinkOverflow</code></td><td>前端慢消费不能反压执行；溢出必须可见</td></tr>
+<tr><td>Observer 内禁止</td><td class="bad">不得再调 <code>Run/Exec</code></td><td>否则递归；Core 用运行栈标记拒绝</td></tr>
+</table>
+</section>
+
+<!-- ═══════════════ 7 ═══════════════ -->
+<section id="s7">
+<h2>7 · 三个介入点（这是「回调」的答案，但不是一个而是三个）</h2>
+<p class="lead">旧稿把 11 个回调名平铺，等于让你记 11 件事。改成：<b>需要否决就实现 Policy，需要状态就订阅 Observer，需要输出就订阅 Sink。</b>
+一个 <code>Observer</code> 方法 + <code>EventKind</code> 枚举覆盖全部状态通知。</p>
+<table>
+<tr><th class="n">接口</th><th class="n">方法</th><th>能改什么</th><th>错误后果</th><th>典型用户</th></tr>
+<tr><td class="n">Policy</td><td class="n">Decide(ctx, *RunContext) (Decision, error)</td><td>改写 Request（收紧）、否决、要求人工授权</td><td class="bad">error/Deny ⇒ 拒绝执行（fail closed）</td><td>安全、合规、成本</td></tr>
+<tr><td class="n">Observer</td><td class="n">Observe(ctx, Event)</td><td class="mut">什么都不能改</td><td class="mid">记录并继续</td><td>指标、告警、审计、红队样本回流</td></tr>
+<tr><td class="n">Sink</td><td class="n">Emit(ctx, OutputChunk)</td><td class="mut">什么都不能改</td><td class="mid">丢弃该块 + 溢出计数</td><td>前端流式、日志、token 预算</td></tr>
+</table>
+<div class="grid g3">
+<div class="card"><h4>Decision 形状</h4>
+<pre><i>// 三态，没有「未决定」</i>
+Decision{Action: ActAllow}            <s>放行</s>
+Decision{Action: ActDeny, Reason: …}  <u>否决</u>
+Decision{Action: ActRequireApproval,
+          Approver: humanPolicy}       <i>挂起，等授权</i></pre>
+<p class="mut">与现有 <code>pkg/hno/guardrails.Guardrail</code> 互通：<code>guardrails.AsPolicy(g)</code> 直接接进链，<b>不新增第二套审批方言</b>。</p></div>
+<div class="card"><h4>RunContext 提供什么</h4>
+<pre>RunContext{
+  RunID, SessionID string
+  Caller  CallerInfo  <i>// agent/tenant/user</i>
+  Request *Request    <i>// 可改写（收紧）</i>
+  Want    Isolation
+  Provider string
+  Budget  Budget      <i>// 时间/输出/费用</i>
+  Attrs   map[string]any <i>// 链上互传</i>
+}</pre></div>
+<div class="card"><h4>Event 形状（Observer 只看这个）</h4>
+<pre>Event{Kind, At, RunID, SessionID,
+      Isolation, Provider, Exit,
+      Duration, Detail}</pre>
+<p class="mut"><code>EventKind</code> 全集：<code>RunStarted · PolicyDenied · QuotaBlocked · IsolationChanged ·
+ProvisionStarted · BootFinished · OutputChunk · RunFinished · RunTimedOut ·
+SessionExpired · SessionRecreated · ConfigConflict · SinkOverflow · Diagnostic</code></p></div>
+</div>
+<h3>6.4 三种运行形态（v0.2 只有第一种，这是你说的「没打通」）</h3>
+<table>
+<tr><th class="n">形态</th><th>API</th><th>输入</th><th>输出</th><th>用途</th></tr>
+<tr><td class="n">一次性</td><td class="n">Run(req)</td><td>Code + <code>Files{path→bytes}</code></td><td>Report（stdout/stderr + Artifacts）</td><td>单段脚本、小工具</td></tr>
+<tr><td class="n">项目级</td><td class="n">Session + <code>Project</code></td><td>整个目录树 / git ref / 上游产物</td><td><code>ArtifactSet</code>（按路径声明收集）</td><td><b>多文件、跑完整流程</b> → §13</td></tr>
+<tr><td class="n">流程内</td><td class="n"><code>sandboxgraph.NewNode()</code>（→ §14）</td><td>graph state 字段 / 上游节点产物</td><td>写回 state + 产物落 Store</td><td><b>嵌入别的流程</b> → §14</td></tr>
+</table>
+
+<h3>6.5 数据流（输入进来、产物出去）</h3>
+<div class="state">
+<span class="st">来源: 本地目录 / git ref / 上游产物 / URL(egress 审批)</span><span class="sep">→</span>
+<span class="st hot">Workspace（Project 挂载/物化）</span><span class="sep">→</span>
+<span class="st">Phase 序列（Setup→Build→Test→Package）</span><span class="sep">→</span>
+<span class="st hot">ArtifactSet（按声明收集）</span><span class="sep">→</span>
+<span class="st wait">下游：state 字段 / Store / 宿主目录 / 下一个 Sandbox</span>
+</div>
+<p class="lead">关键：<b>产物是声明出来的，不是猜出来的</b>。<code>Project.Artifacts = []ArtifactSpec{Path, Kind, Required, MaxBytes}</code>；
+Core 只收集被声明的路径，未声明一律丢弃并计数（防「产物炸弹」把宿主磁盘打满）。<code>Required</code> 缺失 ⇒ <code>*ArtifactMissingError</code>，不返回半成品。</p>
+
+
+<div class="flag">设计边界：<b>Observer 与 Sink 是数据，不是控制流。</b>需要「拦截/改写/授权」的地方一律走 Policy —— 否则半年后回调链会变成没人敢动的第二套业务逻辑。</div>
+</section>
+
+<!-- ═══════════════ 8 ═══════════════ -->
+<section id="s8">
+<h2>8 · 怎么用（照抄级别的可运行形状）</h2>
+<pre><b>import</b> (
+    <i>"github.com/rexleimo/agno-go/pkg/hno/sandbox"</i>
+    <i>"github.com/rexleimo/agno-go/pkg/hno/sandbox/provider/boxlite"</i>
+)
+
+<i>// ── ① 最小：给 agent 一个 run_code 工具（无状态）</i>
+sb, err := sandbox.<b>Open</b>(ctx,
+    sandbox.<b>WithLimits</b>(sandbox.Limits{Timeout: 30 * time.Second, Memory: 512 &lt;&lt; 20}),
+)
+<b>if</b> err != <b>nil</b> { <i>// *UnavailableError：Tried + Fixes，直接打给用户</i> }
+defer sb.<b>Close</b>()
+
+rep, err := sb.<b>Run</b>(ctx, sandbox.<b>Python</b>(<i>"print(sum(range(1000))"</i>)))
+<b>if</b> err != <b>nil</b> { <i>// 真 error，不再塞进 map</i> }
+log.<b>Print</b>(rep.ExitCode, rep.Stdout, rep.Isolation)  <i>// microvm / container / ...</i>
+
+<i>// ── ② 多轮：轮 1 装依赖，轮 2 直接 import（BoxLite 的全部价值）</i>
+sess, err := sb.<b>Session</b>(ctx, bizSessionID)          <i>// 同 id 幂等复用同一 box</i>
+<b>if</b> err != <b>nil</b> { <i>// *QuotaError / *ProvisionError（附 doctor 命令）</i> }
+defer sess.<b>Release</b>(ctx)                              <i>// TTL 兜底，忘也不漏</i>
+
+pandoc, _ := sess.<b>Exec</b>(ctx, sandbox.<b>Shell</b>(<i>"pip install pandas"</i>))
+rep2, err := sess.<b>Exec</b>(ctx, sandbox.<b>Python</b>(<i>"import pandas as pd; print(pd.__version__)"</i>))
+
+sess.<b>Files</b>().<b>Write</b>(ctx, <i>"data/in.csv"</i>, csvBytes)     <i>// 与执行同一个根</i>
+r, _ := sess.<b>Files</b>().<b>Read</b>(ctx, <i>"data/out.csv"</i>)
+
+<i>// ── ③ 生产：强制独立内核 + 出网白名单 + 审计 + 前端流式</i>
+sb, err := sandbox.<b>Open</b>(ctx,
+    sandbox.<b>WithProfileFile</b>(<i>"deploy/sandbox/profile.yaml"</i>),
+    sandbox.<b>WithMinimumIsolation</b>(sandbox.<b>IsolationMicroVM</b>),   <i>// 没 KVM 就失败，不降级</i>
+    sandbox.<b>WithEgress</b>(<i>"pypi.org"</i>, <i>"files.pythonhosted.org"</i>),
+    sandbox.<b>WithProvider</b>(<i>"boxlite"</i>, boxlite.<b>Sidecar</b>(boxlite.Config{
+        Endpoint: <i>"http://127.0.0.1:8100"</i>, PinnedVersion: <i>"0.11.0"</i>, Digest: <i>"sha256:…"</i>})),
+    sandbox.<b>WithPolicy</b>(egressApprover),      <i>// 可否决 / 可收紧</i>
+    sandbox.<b>WithObserver</b>(metricsAndAlerts),  <i>// Event* → 指标</i>
+    sandbox.<b>WithSink</b>(streamToClient),        <i>// OutputChunk → SSE</i>
+    sandbox.<b>WithAudit</b>(auditLog),
+)</pre>
+<table>
+<tr><th>你想做的事</th><th>用哪个 API</th><th>不该做</th></tr>
+<tr><td>CI 里不装任何虚拟化</td><td class="n"><code>WithProvider("stub", stub.New())</code>（实现全部接口，含 SessionHost）</td><td class="bad">不要 mock <code>Executor</code> 来测 Session 行为</td></tr>
+<tr><td>本地开发机（macOS）跑通</td><td class="n">默认 <code>Open</code> + <code>Diagnose</code>（HVF 可用即 MicroVM）</td><td class="bad">不要写 <code>WithMinimumIsolation(IsolationNone)</code></td></tr>
+<tr><td>知道实际隔离级别</td><td class="n"><code>Status()</code> / <code>Report.Isolation</code> / <code>EventIsolationChanged</code></td><td class="bad">不要信任配置里写了什么</td></tr>
+<tr><td>按租户限制成本/并发</td><td class="n"><code>WithPool</code> + Admission + Profile + <code>CallerInfo</code></td><td class="bad">不要在业务里手写 semaphore</td></tr>
+<tr><td>接一个新引擎</td><td class="n">实现 <code>Provider</code>（+ 可选 <code>SessionHost/FileBridge/EgressHost</code>）</td><td class="bad">不要改 Core 状态机</td></tr>
+</table>
+</section>
+
+<!-- ═══════════════ 9 ═══════════════ -->
+<section id="s9">
+<h2>9 · 装机与封装（把「不会装、不知道怎么配」降到一次命令）</h2>
+<div class="grid g2">
+<div class="card"><h4>Provider 装配三选一（Profile 里声明，业务代码不变）</h4>
+<table>
+<tr><th class="n">mode</th><th>含义</th><th>取舍</th></tr>
+<tr><td class="n">remote</td><td>连已存在的 BoxLite REST（<code>boxlite serve</code>）</td><td class="ok">纯 Go、无 CGO、可多机共享、CI 友好 <b>← 生产默认</b></td></tr>
+<tr><td class="n">sidecar</td><td>Core 按 <code>PinnedVersion+Digest</code> 自动装配到 <code>~/.hno/sandbox/&lt;ver&gt;/</code> 并拉起</td><td class="ok">本地零手工，离线需预置包</td></tr>
+<tr><td class="n">inproc</td><td>官方 Go SDK（CGO）</td><td class="bad">会卡住 <code>golang:1.24.11-alpine → alpine:3.22</code>；仅性能敏感场景显式开启</td></tr>
+</table>
+<p class="mut">这条是 P0 spike 必须先出结论的地方：CGO + Rust 依赖链进不进我们的镜像。</p></div>
+<div class="card"><h4>降低苦恼的具体机制</h4>
+<ul>
+<li><b>失败即指导</b>：所有构造类错误都实现 <code>Remediation() []string</code>（可复制命令）。今天 <code>ErrNoProvider</code> 是一句话，装机苦恼的直接来源。</li>
+<li><b>一条 <code>hno sandbox doctor</code></b>：把 §5.5 的检查项打成人话；<code>--fix</code> 给出装配命令。</li>
+<li><b>Profile 文件化</b>：<code>deploy/sandbox/profile.yaml</code> 声明 tier/镜像/限额/出网/TTL；业务里不出现 provider 名 → 换引擎不改代码。</li>
+<li><b>stub 全家桶</b>：<code>sandbox/stub</code> 实现 SessionHost+FileBridge+EgressHost，语义与真引擎一致（包括拒绝路径），CI 零依赖。</li>
+<li><b>契约测试同一套</b>：每个 provider 跑同一份 <code>contract_test</code>（沿用 <code>make contract-test</code> 习惯），开发者不用猜「这个引擎支不支持 Files」。</li>
+<li><b>版本兼容矩阵</b>：<code>Diagnose</code> 与 <code>Status</code> 报 guest/SDK/Provider 三者版本，不匹配就拒绝启动而不是行为漂移。</li>
+</ul></div>
+</div>
+</section>
+
+<!-- ═══════════════ 10 ═══════════════ -->
+<section id="s10">
+<h2>10 · 安全矩阵（抬指数的具体条目）</h2>
+<table>
+<tr><th>维度</th><th>今天（本仓库证据）</th><th>改造后</th><th>由谁担保</th></tr>
+<tr><td>隔离边界</td><td class="mid">podman/docker 共享宿主内核</td><td class="ok"><code>IsolationMicroVM</code>（独立内核）+ <code>SyscallFiltered</code> 档</td><td class="n">WithMinimumIsolation</td></tr>
+<tr><td>出网</td><td class="bad">只有 NetworkNone，白名单不存在（<code>executor.go:219</code>）</td><td class="ok">默认空=全禁 + 显式 allowlist → <code>allow_net</code>/代理</td><td class="n">Policy + EgressHost</td></tr>
+<tr><td>失败可见性</td><td class="bad">错误塞进 map、返回 nil（<code>toolkit.go:106-115</code>）</td><td class="ok">类型化 error 全集 + 双写兼容</td><td class="n">API 契约</td></tr>
+<tr><td>审计</td><td class="bad">执行路径<b>零</b>审计（audit 只在 <code>file.Sandbox</code>）</td><td class="ok">Cleaned 状态无条件落一条 AuditRecord</td><td class="n">WithAudit</td></tr>
+<tr><td>文件↔执行</td><td class="bad">两套世界，E2B workspace <code>not implemented</code>（<code>e2b.go:101</code>）</td><td class="ok">同根 + <code>Files()</code> + <code>*CapabilityError</code> 明示不支持</td><td class="n">FileBridge</td></tr>
+<tr><td>secrets</td><td class="mid">env allowlist，值仍进沙盒</td><td class="ok"><code>SecretPlaceholder</code>（宿主 MITM 替换，consent 才开）</td><td class="n">WithSecretMode</td></tr>
+<tr><td>供应链</td><td class="mid">镜像 tag 固定，provider 无版本契约</td><td class="ok">镜像 digest pin + provider <code>Version+Digest</code> + 兼容矩阵</td><td class="n">装配层</td></tr>
+<tr><td>DoS / 多租</td><td class="bad">无并发闸、无配额</td><td class="ok">Admission + <code>max_boxes</code> + 水位 + 预算</td><td class="n">Core</td></tr>
+<tr><td>介入点自身</td><td class="bad">现有 hook 无 panic/超时隔离（<code>hooks.go:69</code>）</td><td class="ok">§6.3 六条硬规则</td><td class="n">Core</td></tr>
+<tr><td>不变原则</td><td class="ok">策略参数不可被调用方放宽</td><td class="ok">Policy 只能收紧，放宽一律 <code>*HookFaultError</code></td><td class="n">类型系统 + 测试</td></tr>
+<tr><td>一次性 vs 有状态</td><td class="bad">两个互不相干的沙盒：<code>run/executor.go:103</code> 只有 <code>Run</code>/<code>Close</code>；文件另走 <code>file.Sandbox</code></td><td class="ok">一个 <code>Core</code> + Provider；<code>Run</code>（一次性）与 <code>Session</code>（有状态）共享策略/审计/错误语义（§6.3）</td></tr>
+<tr><td>现有 <code>run</code> Toolkit 怎么活</td><td class="bad">直接改会砸 <code>run.CodeRunner</code>/<code>CommandRunner</code> 调用方</td><td class="ok"><b>兼容适配层</b> <code>run/adapter.go</code>：旧 <code>Executor</code> 签名冻结（D-10），内部转调新 core；<code>toolkit.go:106-115</code> 改双写；<b>迁移排在 B4</b>（契约与 core 稳定后才动调用方）</td></tr>
+<tr><td>API 分层（对外别露三层）</td><td class="warn">今天已 <code>hno.NewLocalExecutor</code> + <code>WithSandboxRoot</code> + <code>NewSandboxedFileSystemTool</code> 三处并存</td><td class="ok">对外<b>一个入口</b> <code>hno.NewSandbox(ctx, WithProfile(...))</code>；advanced 构造放子包、不进快速上手；选型写进 guide</td></tr>
+</table>
+<div class="flag bad"><b>必须你点头的一条</b>：BoxLite 的 secret 替换是<b>宿主侧 TLS 中间人</b>（每 box 一个 10 年 CA，私钥留宿主）。
+安全叙事很好，但等于我们自己当中转；要开就得进产品声明 + 密钥治理，所以我把它做成默认关、显式 <code>WithSecretMode</code>。</div>
+</section>
+
+<!-- ═══════════════ 11 ═══════════════ -->
+<section id="s11">
+<h2>11 · 性能契约（数字是目标，P0 实测后定档）</h2>
+<table>
+<tr><th>动作</th><th>目标</th><th>手段</th><th>不达标的后果</th></tr>
+<tr><td><code>Open</code>（Probe）</td><td>&lt; 20ms</td><td>不建资源、结果缓存</td><td>被误用成热路径 → 拆 API</td></tr>
+<tr><td>首次 <code>Session</code></td><td>≤ 3s</td><td>池预热 + 镜像预拉 + base 盘共享</td><td>P0 实测打脸则调目标或换引擎</td></tr>
+<tr><td>后续 <code>Exec</code></td><td>P95 增量 ≤ 300ms</td><td>复用 box（vsock RPC + guest 内 zygote）</td><td>说明我们误用了（每次新建）</td></tr>
+<tr><td>常驻</td><td>可预算</td><td>每 box 128–512 MiB 硬税 → <code>max_boxes</code> + idle 回收</td><td>Admission 拒绝，不打爆宿主</td></tr>
+<tr><td>密集小调用</td><td>不付 VM 税</td><td>路由到 <code>SyscallFiltered</code>（runsc，毫秒级、不需 KVM）</td><td>—</td></tr>
+</table>
+<div class="flag">P0 spike 必测（同机同负载，一次跑齐）：box boot P50/P95 · 单 exec P50/P95 · RSS/box ·
+virtiofs 带宽 vs bind mount · QCOW2 写放大 · CGO+Rust 对 alpine 构建的可行性 · 无 /dev/kvm 时的行为。</div>
+</section>
+
+<!-- ═══════════════ 12 ═══════════════ -->
+<section id="s12">
+<h2>12 · 分期与待决</h2>
+
+<h3>12.2 交付批次（依 D-18「先最小可用」）</h3>
+<table>
+<tr><th class="n">批次</th><th>内容</th><th>完成门（真实证据，不是「代码写完」）</th></tr>
+<tr><td class="n">B1 契约</td><td>P0 实测门 + P1 类型/错误/能力位 + <code>stub</code> Provider</td><td><code>go test -race ./pkg/hno/sandbox/...</code> 全绿；<code>Probe→Resolve→Validate→Run</code> 贯通；§11 数字成表</td></tr>
+<tr><td class="n">B2 最小可用</td><td>P2 Session+Admission（<b>含原 P8a 清扫/孤儿回收</b>，依 D-19）+ P3 Files 与执行合一 + §13 工作区/产物 + §16 失败分类与 Rebuild + §17 Replayable Spec</td><td>真实项目跑通：<code>FromDir</code> 进 → <code>RunProject</code> → 取回 <code>ArtifactSet</code>；注入 <code>ClassLost</code> 后 <code>Rebuild</code> 恢复且依赖仍在</td></tr>
+<tr><td class="n">B3 引擎</td><td>P4 BoxLite remote（生产档 <code>MicroVM</code>）+ E2B host 档（<code>MicroVMHosted</code>）；runsc 转<b>测试档</b></td><td><code>Close</code> 后无孤儿 VM；BoxLite 与 E2B 各过一轮真实往返（非 stub）</td></tr>
+<tr><td class="n">B4 嵌入与收尾</td><td><code>sandboxgraph.NewNode</code> + HITL/Checkpointer/Store 深整合 + P5 DX（recipes/CLI/guide/benchmark 门禁）</td><td>graph 内跑通「挂起 → 审批 → <code>Resume</code> 回到同一个 box」；guide 数字与 <code>Diagnose</code> 文案一致</td></tr>
+</table>
+<p class="lead">B2 完成即对外可用，B3/B4 不阻塞第一版。每批都必须过 <code>make test</code> + <code>make vet</code> + <code>make lint</code>，
+并带 §15/§16 的故障注入用例：<code>ClassLost</code>、产物超限、池打穿、快照泄漏、幂等键冲突。</p>
+
+<div class="grid g3">
+<div class="card"><h4>P0 实测门</h4><p>BoxLite remote/sidecar + runsc 各最小贯通；产出 §11 数字与 CGO 结论。<b>不过则不接 BoxLite。</b></p></div>
+<div class="card"><h4>P1 API 契约落地</h4><p><code>pkg/hno/sandbox</code>：类型 + Option + Policy/Observer/Sink + §6.3 六条 + 类型化错误 + <code>stub</code>。零真引擎。</p></div>
+<div class="card"><h4>P2 Session + Admission</h4><p>状态机、池、TTL/idle/清扫、租户配额。<b>收益最大的一片。</b></p></div>
+<div class="card"><h4>P3 Files 与执行合一</h4><p><code>FileService</code> + <code>file.Sandbox</code> 同根同审计；干掉 <code>e2b.go:101</code>。</p></div>
+<div class="card"><h4>P4 Providers</h4><p><code>boxlite</code>（remote/sidecar）、<code>runsc</code>、出网白名单、runtime 模板扩展。</p></div>
+<div class="card"><h4>P5 DX 收尾</h4><p><code>Diagnose</code>/CLI、recipes、guide 重写、benchmark 入门禁、changelog（v3.1.0）。</p></div>
+<div class="card"><h4>P6 项目级工作区（v0.3 新增）</h4><p><code>Project/Phase/ArtifactSpec</code> + <code>FromDir/FromArchive/FromGit/FromArtifacts</code> + 三档挂载模式；含体积护栏与 <code>*CapabilityError</code> 路径。</p></div>
+<div class="card"><h4>P7 流程嵌入 + 异常语义（v0.3 新增）</h4><p><code>sandboxgraph.NewNode</code> 接 graph 节点策略与 HITL；<b>必须与 P2 同批交付</b> §15 的恢复/并发/脱离重连/幂等语义。</p></div>
+</div>
+<h3>12.1 决议台账（单一事实源；v0.7 重建 —— 旧表是 v0.2 的，编号与结论已失效）</h3>
+<table>
+<tr><th class="n">ID</th><th>条目</th><th>结论 / 我的默认</th><th class="n">状态</th></tr>
+<tr><td>D-01</td><td>命名去掉 1/2/3 数字歧义，隔离度改 <code>Isolation*</code> 枚举</td><td>6 个具名层 + 枚举；文档不再出现裸数字层名</td><td class="ok">已定</td></tr>
+<tr><td>D-02</td><td>介入点形态</td><td>三类语义：<code>Policy</code>(可否) / <code>Observer</code>(发生了什么) / <code>Sink</code>(说了什么)；各一个方法 + <code>EventKind</code> 枚举，不搞 <code>OnBoot</code> 式方法爆炸</td><td class="ok">已定</td></tr>
+<tr><td>D-03</td><td>默认交付形态</td><td><b>remote sidecar + REST</b>，保住 <code>CGO_ENABLED=0</code>；<code>go install</code> 只装 CLI+SDK</td><td class="ok">已定</td></tr>
+<tr><td>D-04</td><td>是否保留远程托管</td><td>保留：<code>IsolationMicroVMHosted</code> + E2B 逃生舱，本地/远程双支持</td><td class="ok">已定</td></tr>
+<tr><td>D-05</td><td>能力探测与错误可修性</td><td>启动跑一次 <code>Probe</code>（TTL 60s），错误全类型化 + <code>Remediation()</code>；能力位而非版本判断</td><td class="ok">已定</td></tr>
+<tr><td>D-06</td><td>同 Session 并发 <code>Exec</code></td><td>默认 <b>serial</b>，并行需显式声明或 <code>CloneAs</code></td><td class="ok">已定（serial）</td></tr>
+<tr><td>D-07</td><td>无 KVM / 引擎不可用时</td><td><b>FailFast</b>；降级需 Profile 显式 <code>FallbackTier</code> + 强制事件（<b>推导成立</b>：无 KVM 属「环境不满足所声明隔离度」，与 D-13 provider 不可用同一原则）</td><td class="ok">已定（推导成立）</td></tr>
+<tr><td>D-08</td><td>BoxLite MITM 密钥替换</td><td>仅 hosted 档默认开；本地档默认断网（收窄密钥暴露面）</td><td class="ok">已定（仅 hosted 开）</td></tr>
+<tr><td>D-09</td><td>会话 TTL</td><td>默认 <code>30m idle</code> / <code>5m 一次性</code>；按你们真实会话分布调</td><td class="ok">已定（30m/5m）</td></tr>
+<tr><td>D-10</td><td>现有 <code>run.Executor</code> 契约</td><td><b>冻结</b> <code>Run</code>/<code>Close</code> 签名，v4 再谈 <code>Session</code> 上浮</td><td class="ok">已定（冻结）</td></tr>
+<tr><td>D-11</td><td>默认 <code>RetryMode</code></td><td><b><code>RebuildFromSpec</code></b>（<code>EffectPure</code> 才降 <code>Blind</code>；<code>RollbackToPhase</code> 需显式快照）</td><td class="ok">已定</td></tr>
+<tr><td>D-12</td><td>默认挂载模式</td><td><b><code>CopySnapshot</code></b>；<code>MountShare</code> 需显式（不默认让沙盒写宿主目录）</td><td class="ok">已定（CopySnapshot）</td></tr>
+<tr><td>D-13</td><td>provider 不可用是否降级</td><td><b>FailFast</b>；开降级却不注册 Observer ⇒ <code>Diagnose()</code> 判配置错误（防静默降级）</td><td class="ok">已定</td></tr>
+<tr><td>D-14</td><td>Phase 边界自动快照</td><td><b>默认关</b>，<code>AutoCheckpoint:true</code> 显式开；手工快照需保留策略 <code>snapshots{keep,ttl,purge}</code></td><td class="ok">已定</td></tr>
+<tr><td>D-15</td><td><code>lockdown</code> 默认档</td><td><b>开发 <code>detect</code> / 生产 <code>enforce</code></b>；<code>off</code> 非生产默认；detect 不是安全边界</td><td class="ok">已定</td></tr>
+<tr><td>D-16</td><td>模型撞 enforce 的反馈</td><td><b>不白拦</b>：<code>NextAction=use_install_api</code> + 等价写法 Hint，被拦命令记入 <code>DriftReport</code></td><td class="ok">已定</td></tr>
+<tr><td>D-17</td><td>产物超限额</td><td>按 <code>Required</code> 区分：必需者失败，非必需者截断交付并标 <code>Truncated</code></td><td class="ok">已定（按 Required）</td></tr>
+<tr><td>D-18</td><td><b>分期切法</b></td><td><b>已定：先最小可用。</b>第一批只落「声明式工作区 + 产物收集 + 失败分类/Rebuild + Session」；<code>sandboxgraph</code> 嵌入、HITL/Checkpointer 深整合、runsc/PTY/跨引擎快照等引擎扩展第二批。<b>P0 实测门不许跳</b>（拿不到 §11 数字就不接 BoxLite）</td><td class="ok">已定</td></tr>
+<tr><td>D-19</td><td>P8 合并与隔离档数</td><td>P8a 是否并进 P2；生产是否只要 MicroVM、runsc 仅留作测试档</td><td class="ok">已定（P8a→P2）</td></tr>
+</table>
+<div class="flag ok"><b>19 条全部已定（v1.0 定稿）。</b>留痕一条过程错误：§12 决议表在 v0.2 之后一度未真正更新（批量编辑被中断却误报已同步），v0.7 起重建为本台账 —— <b>引用决议只引 D-xx，不引用「第几节那张表」。这条规则本身就是这次错误的产物。</b></div>
+</section>
+
+<!-- ═══════════════ 13 ═══════════════ -->
+<section id="s13">
+<h2>13 · 项目级工作区：整个目录进去，整套产物出来</h2>
+<p class="lead">你指出的缺口成立：v0.2 只有单文件 <code>Files().Write/Read</code>，跑不起真实项目（多文件 + 依赖 + 构建 + 测试 + 取产物）。本节补齐。</p>
+
+<h3>13.1 Project 输入：四种来源，一种形状</h3>
+<table>
+<tr><th class="n">API</th><th>语义</th><th>典型用法</th></tr>
+<tr><td class="n">FromDir(hostDir, ignore...)</td><td>宿主目录物化进工作区，带 ignore 模式（<code>node_modules</code>/<code>.git</code>/<code>*.lock</code>）</td><td>用户本地项目、agent 上一轮产出</td></tr>
+<tr><td class="n">FromArchive(bytes|reader)</td><td>tar / tar.gz / zip 解压进工作区</td><td><b>HTTP 上传、模型给的代码包</b>（无需宿主目录）</td></tr>
+<tr><td class="n">FromGit(url, ref, subdirs)</td><td>clone + 检出到工作区，凭据由 Policy 注入（<b>不进沙盒</b>）</td><td>真实仓库、PR 头</td></tr>
+<tr><td class="n">FromArtifacts(set, "build/")</td><td>上游产物落到指定路径</td><td><b>流水线接续</b>：A 的 dist 是 B 的输入</td></tr>
+<tr><td class="n">FromImage（provider 原生）</td><td>项目已在镜像层里，不额外物化</td><td>固定依赖的重型环境</td></tr>
+</table>
+
+<h3>13.2 挂载模式：快照还是共享（这是复杂场景的分水岭）</h3>
+<table>
+<tr><th class="n">模式</th><th>行为</th><th>性能</th><th>安全 / 语义</th></tr>
+<tr><td class="n">MountShare（默认小项目）</td><td>宿主目录实时可见（BoxLite virtiofs / 容器 bind）</td><td class="ok">零拷贝，改动即时可见</td><td class="bad">宿主目录会被沙盒内进程直接改</td></tr>
+<tr><td class="n">CopySnapshot（<b>推荐默认</b>）</td><td>物化进隔离盘，结束取回声明产物</td><td class="warn">受 <code>MaxBytes</code> 约束</td><td class="ok">宿主零污染，可复现；QCOW2 CoW 让它不太贵</td></tr>
+<tr><td class="n">Hybrid</td><td>输入走 snapshot；<code>/shared</code> 走挂载</td><td class="ok">混合</td><td>大只读数据集 + 可写工作树</td></tr>
+</table>
+<div class="flag bad"><b>默认必须改成 <code>CopySnapshot</code></b>。给 agent 一个能直接写宿主目录的默认值不是便利，是事故；需要挂载的用户显式声明，并走 Policy 审批。</div>
+
+<h3>13.3 多步骤流程：Phase（把「完整流程」建模成一步）</h3>
+<pre>proj := sandbox.<b>Project</b>{
+    From:      sandbox.<b>FromDir</b>(<i>"./repo"</i>, sandbox.<b>Ignore</b>(<i>"**/node_modules"</i>, <i>".git"</i>)),
+    Mode:      sandbox.<b>CopySnapshot</b>,
+    Runtime:   <i>"node:20"</i>,
+    Phases: []sandbox.Phase{
+        {Name: <i>"setup"</i>,  Run: sandbox.<b>Shell</b>(<i>"npm ci --prefer-offline"</i>), Required: <b>true</b>},
+        {Name: <i>"build"</i>,  Run: sandbox.<b>Shell</b>(<i>"npm run build"</i>),        Required: <b>true</b>},
+        {Name: <i>"test"</i>,   Run: sandbox.<b>Shell</b>(<i>"npm test -- --ci"</i>),     <i>// 允许失败，交下游判断</i>}
+        {Name: <i>"lint"</i>,   Run: sandbox.<b>Shell</b>(<i>"npm run lint"</i>), FailOpen: <b>true</b>},
+    },
+    Artifacts: []sandbox.ArtifactSpec{
+        {Path: <i>"dist"</i>,        Kind: <b>Dir</b>,  Required: <b>true</b>, MaxBytes: 64 &lt;&lt; 20},
+        {Path: <i>"reports/*.json"</i>, Kind: <b>Glob</b>, Required: <b>false</b>},
+        {Path: <i>"coverage"</i>,    Kind: <b>Dir</b>, MaxBytes: 8 &lt;&lt; 20},
+    },
+}
+res, err := sb.<b>RunProject</b>(ctx, proj)   <i>// 单一调用，内部一个工作区依次跑各 Phase</i></pre>
+<table>
+<tr><th class="n">语义</th><th>定义</th></tr>
+<tr><td class="n">同一工作区</td><td>所有 Phase 共享文件系统与环境变量累积（装一次依赖，后面都可用）—— 这正是有状态 Session 的价值</td></tr>
+<tr><td class="n">Phase 报告</td><td><code>PhaseReport{Name, Exit, Duration, Truncated, Started}</code>；整体 <code>ProjectResult{Phases, Artifacts, FailedPhase}</code></td></tr>
+<tr><td class="n">Required=false</td><td>失败继续跑下一个 Phase（lint/test 常见），<code>FailedPhase</code> 如实记录</td></tr>
+<tr><td class="n">FailOpen</td><td>该 Phase 非零退出视为可接受，不算 <code>err</code></td></tr>
+<tr><td class="n">中断/续跑</td><td><code>res.Resume()</code> 从 <code>FailedPhase</code> 起、复用同一工作区（不重跑 setup）；或 <code>FromPhase("test")</code></td></tr>
+<tr><td class="n">产物访问</td><td><code>res.Artifacts.Get("dist")</code> → <code>.Bytes()/.TarTo(hostDir)/.Reader()/[]ArtifactEntry</code>；未声明路径不可见</td></tr>
+</table>
+
+<h3>13.4 与文件 API 的分工（避免两套重复能力）</h3>
+<table>
+<tr><th class="n">API</th><th>用途</th><th>规模</th></tr>
+<tr><td class="n">Session.Exec(req)</td><td>跑代码；<code>req.Files</code> 内联小文件（≤ 1 MiB/个，总量 ≤ 8 MiB）</td><td>小、快、单文件</td></tr>
+<tr><td class="n">Session.Files().*</td><td>点状读写：<code>Read/Write/List/Stat</code>（带 <code>offset/limit</code> 流式）</td><td>中等；<code>maxBytes</code> 约束</td></tr>
+<tr><td class="n">RunProject / FromDir / FromArchive</td><td><b>整棵树进出</b>，tar 流式，不受内联上限</td><td>大、目录、可复现</td></tr>
+</table>
+<p class="lead">三条硬规则：(a) 内联 <code>req.Files</code> 超限 → <code>*TooLargeError</code> 并提示改用 Project；
+(b) <code>Files()</code> 与 Project 工作区<b>同一个根</b>，路径语义一致（沿用 <code>os.Root</code> 约束，越界一律 <code>*PathError</code>）；
+(c) 大目录<b>不允许</b>经 <code>map[string][]byte</code> 传递 —— 只能流式。</p>
+</section>
+
+<!-- ═══════════════ 14 ═══════════════ -->
+<section id="s14">
+<h2>14 · 嵌入别人的流程（不是别人来嵌我）</h2>
+<p class="lead">你说对了：真实用法是「上游给我数据 → 沙盒算 → 下游拿结果继续处理」。三条嵌入路径，全部复用框架已有机制，<b>不发明新的沙箱编排语言</b>。</p>
+
+<h3>14.1 入口三件套</h3>
+<table>
+<tr><th class="n">路径</th><th>怎么进</th><th>怎么出</th></tr>
+<tr><td class="n">数据进沙盒</td><td><code>Request{Code, Files, Inputs []Input{Path, Source}}</code>；Source 可为宿主字节、宿主文件、URL（<b>需 egress 审批</b>）、<b>上游 Artifact</b></td><td>物化到工作区固定路径，argv 不接触数据</td></tr>
+<tr><td class="n">结果回业务</td><td>文本走 <code>Report.Stdout</code>；<b>类型化数据走声明式产出</b>（<code>Outputs []OutputSpec{Name, Path}</code>）→ <code>res.Bind(&amp;typed)</code>（JSON/CSV/Arrow）</td><td class="n">Report / ArtifactSet</td></tr>
+<tr><td class="n">流程中挂起</td><td><code>Policy</code> 判定需人工审 → 发 <code>ApprovalRequired</code> 事件并中断</td><td>复用 <code>graph.RequestInterrupt → *Suspension</code>（<code>hitl.go:47</code>）</td></tr>
+</table>
+
+<h3>14.2 做成 graph 节点（推荐的正式嵌入方式）</h3>
+<pre><i>// pkg/hno/sandbox/sandboxgraph</i>
+n := sandboxgraph.<b>NewNode</b>(<i>"enrich"</i>, sb, spec)
+    .<b>In</b>(<i>"dataset"</i>, <b>FromState</b>(<i>"rows"</i>))        <i>// state 字段 → 沙盒内 /data/dataset.parquet</i>
+    .<b>In</b>(<i>"model"</i>,  <b>FromArtifact</b>(<i>"train/params.json"</i>))
+    .<b>Out</b>(<i>"report"</i>, <b>ToState</b>(<i>"enrich_report"</i>))   <b>.Out</b>(<i>"chart"</i>, <b>ToStore</b>(<i>"reports/{runID}/chart.png"</i>))
+    .<b>OnFail</b>(<b>FailToIssue</b>(<i>"sandbox.enrich"</i>))
+g.<b>AddNode</b>(n, graph.<b>WithRetry</b>(…), graph.<b>WithTimeout</b>(…), graph.<b>WithCache</b>(…))  <i>// 复用 policy.go 节点策略</i></pre>
+<div class="note"><b>为什么这样能打通：</b>节点策略（<code>policy.go:78</code>）、断点续跑（<code>Suspension</code> / <code>Graph.Resume</code>）、
+持久化（<code>Checkpointer</code>，<code>durability.go:43</code>）、事件流（<code>NodeEvent</code>）、Store（<code>store.Store</code>）<b>全是框架已有的</b>。
+沙盒只需要把自己的 <code>RunContext</code> 映射成 node 输入输出，而不是再造一套编排。</div>
+
+<h3>14.3 产物生命周期与下游消费</h3>
+<table>
+<tr><th class="n">能力</th><th>签名 / 语义</th></tr>
+<tr><td class="n">类型化消费</td><td class="n"><code>(a *Artifact) JSON(&amp;v) / Bytes() / Lines() / Arrow(&amp;rec) / TarTo(hostDir) / Reader()</code></td></tr>
+<tr><td class="n">级联</td><td class="n"><code>FromArtifact(prevArtifact)</code> → 下游 Project 的输入；<b>不经宿主磁盘</b>（tar 流直连）</td></tr>
+<tr><td class="n">持久化</td><td class="n">自动落 <code>store</code>（key = <code>{sessionID}/{runID}/{name}</code>）；带 <code>Digest sha256</code>、<code>Size</code>、<code>Truncated</code>、<code>ExpiresAt</code></td></tr>
+<tr><td class="n">体积护栏</td><td class="n">每产物 <code>MaxBytes</code>（默认 8 MiB）+ 每 Run 总限额（默认 64 MiB）；超限 → <code>Truncated=true</code> + <code>EventArtifactOverflow</code></td></tr>
+<tr><td class="n">生命周期</td><td class="n">产物随 Session TTL；<code>Release</code> 后转入 <code>store</code>（按策略保留），<b>不静默删</b>，也不永久泄漏</td></tr>
+</table>
+
+<h3>14.4 Sandbox 步骤与 agent 决策交错（最真实的复杂用法）</h3>
+<div class="note">
+<code>graph 节点</code> 跑批 → 结果进 state → <code>agent</code> 看结果决定下一步 → <code>RequestInterrupt</code> 让人确认危险动作 →
+<code>Resume</code> 后<b>同一 Session</b> 继续跑 Phase（靠 <code>Session.Snapshot()</code> 落盘保证恢复时文件系统还在）→
+<code>Observer</code> 一路把 <code>Event</code> 转成 <code>NodeEvent</code> 与指标。<br>
+<b>核心约束：</b>Session ID 由业务会话 ID 决定（§5.4），所以「恢复一个挂起的工作流」= 「拿回同一个 box」，
+而不是重新开一个环境再猜状态。
+</div>
+</section>
+
+<!-- ═══════════════ 15 ═══════════════ -->
+<section id="s15">
+<h2>15 · 异常与复杂场景覆盖（你要求「更异常」的部分）</h2>
+<table>
+<tr><th>场景</th><th class="n">API / 机制</th><th>保证行为</th></tr>
+<tr><td>沙盒内起服务不退出（dev server、pytest-watch）</td><td class="n"><code>Run{Background:true, ReadyProbe}</code></td><td>不挂死；<code>Probe{URL,Port,Pattern,Deadline}</code> 通过或超时 → <code>*ReadinessError</code></td></tr>
+<tr><td>需要访问沙盒内端口</td><td class="n"><code>Session.Port(port) (ForwardedPort)</code></td><td>转发句柄可 <code>Close</code>；无此能力 ⇒ <code>*CapabilityError</code>（BoxLite tunnel/端口转发可做）</td></tr>
+<tr><td>交互式 REPL / Jupyter 内核（变量跨轮保留）</td><td class="n"><code>Session.Kernel("python") (send/recv)</code></td><td>PTY 复用，<code>CapPTY</code>；每格超时只杀该格，内核存活</td></tr>
+<tr><td>长任务想脱离重连</td><td class="n"><code>RunRef</code> + <code>Sandbox.Reattach(ref)</code></td><td>断开不丢；重连补发未消费输出（环形缓冲 + 序号，缺号显式告警）</td></tr>
+<tr><td>宿主重启 / 崩溃后</td><td class="n">lease 表 + 清扫器（§5.4 过期路径）</td><td>孤儿 box 被发现 → 快照保留或销毁（策略二选一），<b>不永久泄漏 VM</b></td></tr>
+<tr><td>VM 死在半路（OOM / 引擎崩）</td><td class="n"><code>EventSessionLost</code> + <code>SessionState.Lost</code></td><td>等待中的 Exec 立刻拿到 <code>*LostError</code>，不挂住；在途产物按 <code>store</code> 已落部分可用</td></tr>
+<tr><td>同一 Session 并发写同一工作区</td><td class="n"><code>SessionOption{LockMode: Shared|Exclusive}</code></td><td>默认 Exec 串行；<code>Shared</code> 只读并发；写冲突 ⇒ <code>*StateConflictError</code></td></tr>
+<tr><td>并行 fan-out 多版本（多 agent 试不同方案）</td><td class="n"><code>Session.CloneAs("variant-a")</code></td><td>QCOW2 CoW 克隆，<b>不复制盘</b>（近零成本分叉）；合并只走显式 <code>Artifacts</code></td></tr>
+<tr><td>失败重试但不重复副作用</td><td class="n"><code>Request.IdempotencyKey</code> + <code>EffectClass</code></td><td>幂等键相同 → 直接返回上次结果；<b>非幂等动作不自动重试</b></td></tr>
+<tr><td>输出爆炸 / 二进制输出</td><td class="n">Sink 有界队列（§6.3）+ 产物上限</td><td>截断且可见（<code>Truncated</code> + <code>EventSinkOverflow</code>）；二进制走产物，不进 stdout</td></tr>
+<tr><td>中途出网被拒 / 审批不过</td><td class="n"><code>Policy</code> 在执行内生效</td><td><code>*DeniedError{Stage:"egress"}</code> + 退出码 + 被拦目的；不假装成功</td></tr>
+<tr><td>宿主磁盘/内存不够</td><td class="n">Admission 预检（水位）</td><td><code>*HostResourceError{Need,Have}</code>，<b>排队或失败，绝不打爆宿主</b></td></tr>
+<tr><td>版本漂移（guest/SDK/引擎）</td><td class="n"><code>Diagnose</code> + 兼容矩阵</td><td>不匹配 ⇒ 拒绝启动 + 命令式修复建议</td></tr>
+<tr><td>大项目冷启太慢</td><td class="n"><code>FromImage</code> / base 盘共享 + 镜像预拉</td><td>池预热；<code>EventCacheHit/Miss</code> 可观测命中率</td></tr>
+<tr><td>要跨引擎带走状态</td><td class="n"><b>不提供</b></td><td>只支持同引擎快照（<code>.boxlite</code> 导出）；<b>明确说不支持</b>，避免「换个机器还能续」的错觉</td></tr>
+</table>
+<div class="flag ok">这些不是「以后再说」的边界情况 —— 有状态 Session 一旦上线，上面每一条都会在第一周发生。
+所以 §12 的分期里，<b>P2（Session）与 P4（项目/流程）必须同时交付恢复与并发语义</b>，不能先上池子再补事故处理。</div>
+
+<h3>15.1 v0.3 API 增量（只列新增，旧契约不变）</h3>
+<table>
+<tr><th class="n">新增</th><th>用途</th></tr>
+<tr><td class="n">RunOption: <code>WorkingDir · WithFiles · AsUser · Background · ReadyProbe · IdempotencyKey</code></td><td>一次执行的项目化参数</td></tr>
+<tr><td class="n">Session: <code>Kernel · Port · Snapshot · CloneAs · CopyFrom · CopyTo · Ls · State</code></td><td>有状态环境的全部交互面</td></tr>
+<tr><td class="n">Project / Phase / ArtifactSpec / ArtifactSet</td><td>整树进出与产物声明</td></tr>
+<tr><td class="n">包 <code>sandboxgraph</code>：<code>NewNode().In().Out().OnFail()</code></td><td>嵌进流程的唯一方式</td></tr>
+<tr><td class="n">包 <code>sandbox/stub</code>：全接口实现（含 Project/Kernel/Port）</td><td>CI 不装引擎也能测复杂路径</td></tr>
+<tr><td class="n">Provider 能力位：<code>CapPTY · CapPortForward · CapClone · CapSnapshot · CapBackgroundExec</code></td><td>不支持就 <code>*CapabilityError</code>，绝不模拟</td></tr>
+</table>
+
+<h3>15.2 两条语义已定（见 §12.1 台账 D-12 / D-17）</h3>
+<table>
+<tr><th class="n">ID</th><th>条目</th><th>结论</th></tr>
+<tr><td class="n">D-12</td><td>工作区默认挂载模式</td><td class="ok"><b>已定 <code>CopySnapshot</code></b>。<code>MountShare</code>（沙盒可写宿主目录）必须显式声明且过 <code>Policy</code>；不给「默认能写宿主」留任何捷径</td></tr>
+<tr><td class="n">D-17</td><td>产物超限额处置</td><td class="ok"><b>已定按 <code>Required</code> 区分</b>：<code>Required</code> 超限或缺失 ⇒ <code>*ArtifactMissingError</code> / <code>*ArtifactTooLargeError</code>，<b>绝不返回半成品</b>；非 Required ⇒ 截断交付并标 <code>Truncated=true</code>；未声明路径 ⇒ 丢弃 + 计数告警</td></tr>
+</table>
+</section>
+
+
+<!-- ═══════════════ 16 ═══════════════ -->
+<section id="s16">
+<h2>16 · 失败分类与重试预算（异常处理的正解不是「多试几次」）</h2>
+<p class="lead">原则：<b>先分类，再决定谁重试、重试什么、拿什么状态重试。</b>不分类的重试＝掩盖 bug + 重复副作用 + 烧钱。</p>
+
+<h3>16.1 七类失败（FailureClass）与默认处置</h3>
+<table>
+<tr><th class="n">Class</th><th>判定依据</th><th class="n">自动重试</th><th class="n">由谁重试</th><th>处置</th></tr>
+<tr><td class="n">ClassUserCode</td><td>退出码非 0，且无资源/infra 证据（Traceback、assert、<code>command not found</code>）</td><td class="bad">绝不</td><td class="n">agent 模型</td><td><b>回环给模型自我修正</b>：<code>Failure.NextAction=model_fix</code> + stderr 摘要。自动重跑同样代码只会拿到同样结果</td></tr>
+<tr><td class="n">ClassDenied</td><td>Policy 否决 / 审批未过</td><td class="bad">绝不</td><td class="n">人</td><td>返回被拒规则 + 需补的授权项（<code>NeedApproval</code>）。同 Request 重试必然同样被拒</td></tr>
+<tr><td class="n">ClassPermanent</td><td>能力不支持、版本漂移、镜像 digest 不存在、Profile 非法</td><td class="bad">绝不</td><td class="n">—</td><td>立刻短路 + 命令式修复建议（<code>Remediation()</code>）</td></tr>
+<tr><td class="n">ClassTransient</td><td>引擎 RPC 抖动、连接重置、REST 5xx、镜像拉取网络失败、boot 竞态</td><td class="ok">是（退避+jitter）</td><td class="n">Core</td><td>只重试<b>无副作用</b>步骤（probe / pull / copy / status poll）。默认 2 次</td></tr>
+<tr><td class="n">ClassResource</td><td>quota 满、宿主水位、池空、磁盘不足</td><td class="warn">排队重试（独立预算）</td><td class="n">Admission</td><td>不是快速重试，是 backpressure：<code>WaitForSlot</code> + 上限；超了失败并告警</td></tr>
+<tr><td class="n">ClassTimeout</td><td><code>TimedOut</code>：Kill 或 detach 超时</td><td class="warn">条件重试</td><td class="n">调用方</td><td><b>语义未知</b>：可能已跑完一半。只有 <code>EffectPure</code> 才自动重试；否则要 <code>RollbackToPhase</code></td></tr>
+<tr><td class="n">ClassLost</td><td>VM 死/引擎崩/宿主重启（<code>*LostError</code>）</td><td class="warn">重建后重试</td><td class="n">Core + 调用方</td><td><code>OnLost{FailFast | RebuildFromSpec | RestoreSnapshot}</code>。<b>只有输入声明化（§13.1 五种 Source）才能安全 Rebuild</b></td></tr>
+</table>
+<div class="flag ok">类型化后直接喂给<b>框架已有的</b> <code>graph.RetryConfig.ShouldRetry func(error) bool</code>（<code>graph/policy.go:22-29</code>，full-jitter 已落地）：<b>沙盒不自建第二套退避引擎。</b></div>
+
+<h3>16.2 重试职责分层（避免 2×3=6 次指数放大）</h3>
+<table>
+<tr><th class="n">层</th><th>重试对象</th><th>默认预算</th><th>禁止</th></tr>
+<tr><td class="n">Core（沙盒）</td><td>引擎控制面步骤：probe、镜像解析、盘创建、vsock 连接、status poll、产物传输</td><td><code>Attempts=2</code>，backoff 100ms×2 + 20% jitter，总墙钟 ≤ 3s</td><td class="bad">不得重试用户代码</td></tr>
+<tr><td class="n">Graph 节点策略</td><td>整个 Stage / Phase（含已 boot 的 Session 内 Exec）</td><td><code>RetryConfig{MaxAttempts:3, PerAttempt:true}</code>，由业务声明</td><td class="bad">不得与 Core 预算相乘：Core 耗尽后向上传 <code>*TransientError</code>，节点层若已耗尽则直接失败</td></tr>
+<tr><td class="n">Agent / 模型</td><td>「改代码再试」——这是<b>新一轮工具调用</b>，不是重试</td><td>受 model 循环的 <code>max_iterations</code> 约束</td><td class="bad">不得复用同一 payload 静默重跑</td></tr>
+<tr><td class="n">人工</td><td>审批、补出网白名单、换 tier</td><td>—</td><td class="bad">不得被 unattended 循环代跳</td></tr>
+</table>
+<p class="lead">⚠️ 具体陷阱：<code>TimeoutConfig.PerAttempt</code>（<code>policy.go:45-47</code>）对沙盒是<b>必须</b>的 —— BoxLite 一次 boot 要 1–2s，
+若按「整节点」算超时，第二次 attempt 一定假超时。所以每次 attempt 预算 = <code>boot + exec</code>，并在 Profile 里显式拆 <code>SetupTimeout</code> / <code>ExecTimeout</code>。</p>
+
+<h3>16.3 副作用闸门（EffectClass，v0.3 只提了名词，现在给语义）</h3>
+<table>
+<tr><th class="n">EffectClass</th><th>含义</th><th>允许的重试方式</th></tr>
+<tr><td class="n">EffectPure</td><td>只算不改（读数据、算指标、打印）</td><td class="ok">任意次重试，可跨 VM 重建</td></tr>
+<tr><td class="n">EffectWorkspace</td><td>只改沙盒内文件/已装依赖</td><td class="ok">重试前须 <code>RollbackToPhase</code> 或 Rebuild；否则重复 <code>pip install</code> 会漂移</td></tr>
+<tr><td class="n">EffectExternal</td><td>有外部可见动作：写回宿主、推 git、发 HTTP、提交 PR、写库</td><td class="bad">不自动重试</td><td>只允许 <code>AtMostOnce</code> + 幂等键去重</td></tr>
+</table>
+<pre><i>// 幂等 journal：判「这个 key 是否已经真的执行过」，重启后仍然有效</i>
+req := sandbox.Request{Runtime:<i>"python"</i>, Code: pushPy,
+    IdempotencyKey: <i>"pr-8421-publish"</i>, Effect: sandbox.<b>EffectExternal</b>, Deliver: sandbox.<b>AtMostOnce</b>}
+rep, err := sb.Run(ctx, req)
+<i>// journal 命中且状态=Done ⇒ 直接返回上次结果（Republished=true），不重跑</i>
+<i>// journal 命中但状态=Uncertain（提交后断连）⇒ *UncertainOutcomeError，禁止自动重试</i></pre>
+<table>
+<tr><th class="n">机制</th><th>契约</th></tr>
+<tr><td class="n">Deliver 语义</td><td><code>AtMostOnce</code>（不确定就失败）· <code>AtLeastOnce</code>（可重放，接收方需去重）· <code>ExactlyOnce</code>（best-effort：journal + 幂等键）</td></tr>
+<tr><td class="n">Journal 落哪</td><td><code>{key → runID, state, payloadHash, resultRef, updatedAt}</code> 进 <code>store.Store</code> / <code>Checkpointer</code>；<b>payloadHash 不符 ⇒ <code>*IdempotencyConflictError</code></b>，不覆盖</td></tr>
+<tr><td class="n">UncertainOutcome</td><td>提交后断连必须先用 <code>RunRef</code> 查终态（能力位 <code>CapQueryStatus</code>）；引擎查不到 ⇒ 标 <code>Uncertain</code> 并<b>禁止自动重试</b></td></tr>
+</table>
+
+<h3>16.4 状态感知的重试：Snapshot / Rollback（复杂场景的真正答案）</h3>
+<pre>sess, _ := sb.<b>Session</b>(ctx, bizID)
+sess.<b>Phase</b>(<i>"setup"</i>, sandbox.Shell(<i>"npm ci"</i>))                  <i>// 依赖就绪</i>
+cp, _   := sess.<b>Checkpoint</b>(ctx, <i>"post-setup"</i>)                 <i>// QCOW2 CoW：不复制盘</i>
+if _, err := sess.<b>Exec</b>(ctx, sandbox.Shell(<i>"make test"</i>)); err != nil {
+    if sandbox.<b>ClassOf</b>(err) == sandbox.ClassTimeout ||
+       sandbox.<b>ClassOf</b>(err) == sandbox.ClassLost {
+        sess.<b>Restore</b>(ctx, cp)                    <i>// 回滚到 Phase 边界再试，不重跑 setup</i>
+        sess.<b>Exec</b>(ctx, sandbox.Shell(<i>"make test -- -x"</i>))
+    }
+}</pre>
+<table>
+<tr><th class="n">RetryMode</th><th>行为</th><th>前提</th><th>成本</th></tr>
+<tr><td class="n">Blind</td><td>原样重跑</td><td class="bad">只允许 <code>EffectPure</code></td><td class="ok">最低</td></tr>
+<tr><td class="n">RebuildFromSpec</td><td>销毁环境 → 按声明式输入重新物化 → 重跑</td><td>输入必须是 <code>FromDir/FromArchive/FromGit/FromArtifacts</code>（可重放）</td><td class="warn">付一次 boot（1–2s）</td></tr>
+<tr><td class="n">RollbackToPhase</td><td>回到上一个 <code>Checkpoint</code> 再跑该 Phase</td><td>Phase 边界已打快照</td><td class="ok">CoW 快照，便宜</td></tr>
+<tr><td class="n">ForwardsOnly</td><td>不重跑，只续跑后续 Phase / 只重新收集产物</td><td>失败在收集阶段</td><td class="ok">零算力</td></tr>
+</table>
+<div class="note">为什么这条最值钱：<b>「有状态沙盒 + 有副作用的重试」是矛盾的</b>，除非你能把状态退回某个已知点。
+CoW 快照让「退回后重试」成本接近零，于是 <code>EffectWorkspace</code> 也能安全自动重试 —— 否则只能退化成「不重试，报错给模型」。</div>
+
+<h3>16.5 熔断、防风暴与降级（复用框架已有的 CircuitBreaker）</h3>
+<table>
+<tr><th class="n">机制</th><th>参数（Profile 声明）</th><th>行为</th></tr>
+<tr><td class="n">Provider 熔断</td><td class="n"><code>FailureThreshold=5 / Window=30s / Cooldown=60s</code>，按 <code>ClassTransient|Lost</code> 计数</td><td>open 期间<b>直接失败且不烧 attempt</b>（沿用 <code>runner/resilience.go:29</code> 与 <code>observability.ErrOpen</code> 的既有语义）；半开只放 1 个探测</td></tr>
+<tr><td class="n">Storm 防护</td><td class="n">同 <code>IdempotencyKey</code> 并发仅 1 在途；同 Session 滑动窗口 ≤ N 次尝试；全局总 ceiling</td><td>超 ⇒ <code>*RetryBudgetError</code>，立刻失败（重试风暴在 agent fan-out 下是必然事故）</td></tr>
+<tr><td class="n">Tier 降级</td><td class="n"><code>OnProviderUnavailable: FailFast | FallbackTier(SyscallFiltered)</code></td><td class="bad">生产默认 <code>FailFast</code>；降级必须发 <code>EventIsolationChanged</code> + 被 <code>OnTierChange</code> 类策略拦截</td></tr>
+<tr><td class="n">Kill 阶梯</td><td class="n"><code>SIGTERM → grace → SIGKILL → 整组校验</code></td><td>组内仍存活 ⇒ 停止接受新 Exec（宁可拒服不叠加 VM）</td></tr>
+<tr><td class="n">输出抢救</td><td class="n">Kill 后有界 drain（默认 200ms）</td><td>能拿到 stderr 尾段就拿到，供模型修正；拿不到标 <code>Truncated</code></td></tr>
+<tr><td class="n">探测缓存</td><td class="n"><code>Probe TTL=60s</code></td><td>装机类失败不要在每次 tool call 重新探测全链（放大延迟）</td></tr>
+</table>
+
+<h3>16.6 给调用方/模型的东西，比重试更有用（新增 <code>Failure</code>）</h3>
+<pre>type Failure struct {
+    Class       FailureClass <i>// UserCode|Denied|Permanent|Transient|Resource|Timeout|Lost</i>
+    Retryable   bool
+    NextAction  Action       <i>// model_fix | await_backoff | request_egress_approval |</i>
+                              <i>// reinstall | restore_checkpoint | ask_human | give_up</i>
+    Hint        string       <i>// 给用户看的一句话</i>
+    Fixes       []string     <i>// 可复制命令（Remediation）</i>
+    BlockedHosts []string    <i>// 被拦的出网目的，直接可填进 allowlist</i>
+    Attempt     int
+    Budget      BudgetState  <i>// 剩余尝试 / 剩余墙钟 / breaker 状态</i>
+}</pre>
+<table>
+<tr><th class="n">层</th><th>拿 Failure 做什么</th></tr>
+<tr><td class="n">toolkit</td><td><b>双写</b>：<code>error</code> 非 nil（真失败）+ map 里放 <code>failure</code> 摘要。<b>彻底改掉今天 <code>toolkit.go:106-115</code> 把错误塞进 map 返回 <code>nil</code> 的做法</b> —— 模型分不清「沙盒坏了」和「我代码写错了」，就会拿同样 payload 一直重试</td></tr>
+<tr><td class="n">graph</td><td><code>ShouldRetry</code> 读 <code>Class</code>；节点 <code>NodeEvent</code> 转发 <code>EventRetryAttempt / EventRetryGaveUp</code></td></tr>
+<tr><td class="n">监控</td><td>按 Class 分桶计数（<b>只有 Transient/Lost 计入熔断</b>；UserCode 率高是模型/提示词问题，不该去 reboot VM）</td></tr>
+</table>
+
+<h3>16.7 速查：遇到什么 → 怎么配</h3>
+<table>
+<tr><th>情况</th><th>配置</th></tr>
+<tr><td>模型代码经常报错</td><td>不要加重试。设 <code>NextAction=model_fix</code>，把 stderr 摘要回环，调提示词/示例</td></tr>
+<tr><td>镜像拉取偶发失败</td><td><code>Core.Attempts=2</code> + backoff；<code>ClassTransient</code>；预拉 + 池预热</td></tr>
+<tr><td>测试阶段偶发挂死</td><td><code>Phase</code> 级 <code>Checkpoint</code> + <code>RollbackToPhase</code>；<code>SetupTimeout/ExecTimeout</code> 拆分</td></tr>
+<tr><td>发布/推送类动作</td><td><code>EffectExternal</code> + <code>AtMostOnce</code> + <code>IdempotencyKey</code>；永不自动重试</td></tr>
+<tr><td>E2B/远端 provider 挂了</td><td>breaker open 直接失败；<code>FailFast</code>；告警带 <code>BlockedHosts/Fixes</code></td></tr>
+<tr><td>CI 里没有 KVM</td><td>永久失败（<code>ClassPermanent</code>）+ <code>Diagnose().Fixes</code>，不降级为纯 Go stub 跑通生产路径</td></tr>
+</table>
+
+<h3>16.8 评审决议（v0.5：三条已定，含连带约束）</h3>
+<table>
+<tr><th>#</th><th>问题</th><th>我的默认</th></tr>
+<tr><td>9</td><td>默认 <code>RetryMode</code></td><td class="ok"><b>已定 <code>RebuildFromSpec</code></b>：无前置条件、语义由声明式输入唯一决定。<code>EffectPure</code> 才降到 <code>Blind</code>；<code>RollbackToPhase</code> 因 #11 默认关快照而<b>不可作默认</b>，只能显式启用</td></tr>
+<tr><td>10</td><td>provider 不可用时是否 tier 降级</td><td class="ok"><b>已定 <code>FailFast</code></b>。降级须 Profile 显式开 <code>FallbackTier</code> 且强制发 <code>EventIsolationChanged</code>；<b>开了降级却没注册 Observer ⇒ <code>Diagnose()</code> 报配置错误</b>（否则等于偷偷降级）</td></tr>
+<tr><td>11</td><td>Phase 边界是否自动打快照</td><td class="ok"><b>已定默认关</b>，<code>SessionOption{AutoCheckpoint:true}</code> 显式开（省清理复杂度）。<b>连带</b>：快照生命周期要单独设计（见下）</td></tr>
+</table>
+
+<h3>16.9 决议带来的两条新义务</h3>
+<table>
+<tr><th class="n">义务</th><th>为什么</th><th>落点</th></tr>
+<tr><td class="n">Rebuild 必须能<b>重放 setup</b></td><td>默认 <code>RebuildFromSpec</code> 会丢掉临时装的东西（<code>pip install pandas</code> 不在 spec 里就没了）。所以<b>声明式输入是硬前提</b>，不是风格建议</td><td class="n">P1 契约 + §13.1 五种 Source；<code>Session.Install(...)</code> 记入 spec 而非只改盘</td></tr>
+<tr><td class="n">快照保留策略</td><td>#11 关自动快照后，手工 <code>Checkpoint()</code> 变成用户显式行为 → 必须定义保留与清理，否则宿主磁盘泄漏</td><td class="n">Profile <code>snapshots{keep:N, ttl:1h, on_session_destroy:purge}</code>；<code>Diagnose</code> 报孤儿快照数</td></tr>
+</table>
+</section>
+
+
+<!-- ═══════════════ 17 ═══════════════ -->
+<section id="s17">
+<h2>17 · Replayable Spec：让 RebuildFromSpec 真的能重建</h2>
+<p class="lead">决议 #9 定了默认 <code>RebuildFromSpec</code>，于是<b>环境不再是「盘上累积的历史」，而是「一份声明的渲染结果」</b>。
+本节把这条硬前提落成接口。包：<code>pkg/hno/sandbox</code>（steps 类型）+ <code>sandbox/replay</code>（重放与缓存）。</p>
+
+<h3>17.1 改环境只能走这些入口（走了才记，没走就不该存在）</h3>
+<table>
+<tr><th class="n">API</th><th>语义</th><th class="n">写入 spec 的 Step</th></tr>
+<tr><td class="n">sess.Install(ctx, Pip("pandas==2.2.*"))</td><td>在当前环境执行<b>并</b>记录；重放时按序重跑</td><td class="n">Step{Kind:install, Tool:pip, Args, Digest}</td></tr>
+<tr><td class="n">sess.Install(ctx, Apt("build-essential") / NpmCi() / GoModDownload())</td><td>同上，工具化而不是裸 shell</td><td class="n">Step{Kind:install, Tool:apt|npm|go, …}</td></tr>
+<tr><td class="n">sess.Files().Write / PutDir / FromArchive</td><td>工作区内容 ⇒ <code>Inputs</code>（带 digest）</td><td class="n">Step{Kind:materialize, Source}</td></tr>
+<tr><td class="n">sess.SetEnv(ctx, k, v)</td><td>环境变量 ⇒ 渲染时注入</td><td class="n">SessionSpec.Env</td></tr>
+<tr><td class="n">sess.Setup(ctx, Shell("..."))</td><td>逃生舱：任意脚本，<b>也记入 spec</b>（可重放但不可读）</td><td class="n">Step{Kind:script, Body, Digest}</td></tr>
+<tr><td class="n">sess.Exec(ctx, Shell("pip install foo"))</td><td class="warn">执行失败/越界<b>不会被记录</b>：它只算一次运行，不算改环境 → 见 §17.3</td><td class="n">—</td></tr>
+</table>
+
+<h3>17.2 重放不是重跑：Step 级缓存（这是 Rebuild 变便宜的原因）</h3>
+<pre>stepKey = sha256(baseImageDigest | Tool | Args | envFingerprint)      <i>// 与 spec 顺序无关的稳定键</i>
+if cached, ok := replayCache.Get(ctx, stepKey); ok && !specDirty { /* 跳过 */ }</pre>
+<table>
+<tr><th class="n">要点</th><th>契约</th></tr>
+<tr><td class="n">缓存后端</td><td>复用<b>框架已有</b>的 <code>graph.CacheStore</code>（<code>policy.go:31-42</code>：<code>GetAny/SetAny(ttl)</code>）⇒ 接 <code>store.Store</code> 即可，<b>不新造缓存层</b></td></tr>
+<tr><td class="n">命中粒度</td><td>单 Step，不是整 Session。<code>npm ci</code> 命中就省 3 分钟，改一个源文件不会让 setup 失效</td></tr>
+<tr><td class="n">失效</td><td><code>baseImageDigest</code> 变 / 该 Step 的 <code>Args·Digest</code> 变 / TTL 到期 / <code>sess.Invalidate(stepKey)</code> 手工</td></tr>
+<tr><td class="n">不命中时</td><td>按序重放并写回缓存；单 Step 失败 ⇒ <code>*StepReplayError{Step, Cause}</code>，<b>已成功的前缀不回滚</b>（下次继续用缓存）</td></tr>
+</table>
+<pre>rep, err := sb.Run(ctx, req)               <i>// ClassLost：环境没了</i>
+if sandbox.<b>ClassOf</b>(err) == sandbox.ClassLost {
+    rb, err := sess.<b>Rebuild</b>(ctx)             <i>// 渲染 spec → 新环境</i>
+    <i>// rb = RebuildReport{Replayed []StepResult, Cached int, Dropped []string, Duration}</i>
+    <i>// rb.Cached == 4, len(rb.Replayed) == 0 ⇒ 0.4s 恢复原环境</i>
+    if rb.HasDrift() { <i>/* 明确告诉模型：环境已重建，这些是偶然装的不回来了 */</i> }
+    rep, err = sess.Exec(ctx, req)
+}</pre>
+
+<h3>17.3 偶然状态的两种处理：Lockdown（禁）与 Drift（测）</h3>
+<table>
+<tr><th class="n">模式</th><th>做法</th><th>可靠性 / 代价</th></tr>
+<tr><td class="n"><code>lockdown: enforce</code><br><span class="mut">（生产 / 需要可靠 Rebuild）</span></td><td>Exec 内直接装包会失败 —— 实现手段是<b>断源</b>而不是 ptrace：包管理器域名不在 <code>allow_net</code>，或 <code>Policy</code> 拦 <code>pip|npm install</code> 类 argv；要装东西<b>只能</b>走 <code>Install()</code></td><td class="ok">最强：spec 即完整真相<br><span class="warn">代价：模型偶尔会撞到，需在 <code>Failure.Hint</code> 里教它改用 Install</span></td></tr>
+<tr><td class="n"><code>lockdown: detect</code><br><span class="mut">（默认，开发体验优先）</span></td><td>渲染完成后抽样指纹（<code>site-packages</code> 顶层清单、<code>node_modules</code> 顶层、<code>dpkg status</code> hash），Exec 后比对 → <code>Session.Drift() (DriftReport, error)</code></td><td class="warn">能发现「环境已偏离 spec，Rebuild 后行为可能不同」，<b>不保证抓全</b>（改系统配置、写 <code>/etc</code> 都可能漏）</td></tr>
+<tr><td class="n"><code>lockdown: off</code></td><td>不检不拦</td><td class="bad">等于放弃 #9 的前提；<code>Diagnose()</code> 应报「Rebuild 语义不可靠」</td></tr>
+</table>
+<div class="flag">诚实标注：detect 是<b>尽力而为</b>的告警，不是保证。要「重建后一定等价」就只有一个办法 —— <code>enforce</code>。别把 detect 写成安全边界。</div>
+
+<h3>17.4 盘上的偶然文件：Rebuild 前把它们「提升」成声明</h3>
+<table>
+<tr><th class="n">RebuildPolicy</th><th>行为</th><th>默认</th></tr>
+<tr><td class="n">CollectThenRebuild</td><td>检测到未收集的工作区变更 → tar 出 delta → 作为 <code>Step{Kind:materialize, Source:FromArchive(deltaRef)}</code> <b>追加进 spec</b>，再重建。偶然状态被提升成声明状态</td><td class="ok"><b>默认</b></td></tr>
+<tr><td class="n">Abort</td><td>有未收集变更就不重建，返回 <code>*DirtyWorkspaceError</code> 交调用方决定</td><td>CI/审计档</td></tr>
+<tr><td class="n">Discard</td><td>直接扔，只渲染 spec</td><td>只在 <code>EffectPure</code> 且工作区可丢时</td></tr>
+</table>
+<p class="lead">规则一句话：<b>Rebuild 只保证「spec 渲染出的环境」，不保证「盘上偶然出现的东西还在」</b>；
+所以 <code>CollectThenRebuild</code> 是默认 —— 它把「丢了」变成「永久记住」，代价是一次 tar 与一次 store 写入。
+发 <code>EventRebuildWillDropFiles</code>（含文件清单与总字节）让调用方看得见。</p>
+
+<h3>17.5 决议落点（全部已定，见 §12.1 台账 D-11/D-14/D-15/D-16）</h3>
+<table>
+<tr><th class="n">条目</th><th>状态</th></tr>
+<tr><td class="n">#9 默认 RetryMode</td><td class="ok">定：<code>RebuildFromSpec</code>；<code>EffectPure</code> 才降 <code>Blind</code>；<code>RollbackToPhase</code> 需显式快照</td></tr>
+<tr><td class="n">义务 1（环境可重放）</td><td class="ok">本节解决：显式 <code>Install/Setup/Files</code> 记入 spec + Step 级缓存复用 <code>graph.CacheStore</code></td></tr>
+<tr><td class="n">义务 2（快照保留）</td><td class="ok">Profile <code>snapshots{keep,ttl,on_session_destroy:purge}</code> + <code>Diagnose</code> 报孤儿快照</td></tr>
+<tr><td class="n">D-15 <code>lockdown</code> 默认档</td><td class="ok"><b>已定</b>：开发档 <code>detect</code>、生产档 <code>enforce</code>（按 Profile 选）；<code>off</code> 不作生产默认</td></tr>
+<tr><td class="n">D-16 撞 enforce 的反馈</td><td class="ok"><b>已定</b>：不白拦 —— <code>Failure.NextAction=use_install_api</code> + 等价写法 Hint（<code>Install(Pip("pandas==2.2.*"))</code>），被拦命令记入 <code>DriftReport</code>。理由：让模型把「被策略拦」误读成「沙盒坏了」会引发无限重投</td></tr>
+</table>
+</section>
+
+</main>
+<footer>
+本仓库证据：<code>pkg/hno/tools/run/executor.go:103-106</code>（Executor 只有 Run+Close）·
+<code>executor.go:139,219</code>（ErrNoProvider / 只支持 NetworkNone）·
+<code>toolkit.go:106-115</code>（错误塞进 map 返回 nil）· <code>e2b.go:96-148,101</code> ·
+<code>pkg/hno/tools/file/sandbox.go:23-106</code>（AuditEntry / os.Root 约束）·
+<code>pkg/hno/hooks/hooks.go:13-96</code>（Hook / HookFunc / ExecuteHook 无 panic 隔离）·
+<code>pkg/hno/graph/policy.go:50-60</code>（NodeEvent 观察者先例）· <code>pkg/hno/guardrails/base.go:9-45</code> ·
+<code>deploy/sandbox/agent-runner/Dockerfile</code> · <code>Dockerfile</code>(alpine 构建) ·
+<code>docs/design/sandbox-litebox-evaluation-and-provider-plan.md</code>。
+外部：<code>boxlite-ai/boxlite@main</code>（docs/concepts · docs/faq · src/{guest,shim,vmm,hypervisor,boxlite/jailer}）。
+</footer>
+</body>
+</html>
