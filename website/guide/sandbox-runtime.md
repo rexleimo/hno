@@ -252,6 +252,8 @@ go build -o hno ./cmd/hno
 ./hno sandbox run -- go version           # one command, payload status passed through
 ./hno sandbox run --timeout 30s --shell "deploy"
 ./hno sandbox run --attr binary=container --image golang:1.26 -- sh -c "exit 5"
+./hno sandbox boundary                      # is the isolation a measurement or a name? (starts boxes)
+./hno sandbox boundary --boxes 3 --expect private-kernel --json
 ```
 
 | Verb | Runtime call | Exit status |
@@ -259,6 +261,7 @@ go build -o hno ./cmd/hno
 | `doctor` | `Sandbox.Diagnose` | `0` all checks passed, `1` a check failed |
 | `prune` | `Sandbox.Reclaimer` | `0`; refuses to delete without `--yes` |
 | `run` | `Sandbox.Run` / `Session.Exec` | the program's own code, `124` timed out, `70` environment unusable, `2` bad command line |
+| `boundary` | `Sandbox.MeasureKernelBoundary` | `0` measured and matches `--expect`, `1` verdict is `unknown` or differs, `70` could not measure, `2` bad flag |
 
 The three `run` outcomes are deliberately not merged. A program that exited 5 is not a
 sandbox that failed, and a sandbox that could not start has no opinion about the program:
@@ -274,6 +277,66 @@ stops the command instead of quietly running below the floor you asked for.
 
 Prune is read-only by default because a reclaim tool that guesses is worse than one that asks,
 and what the engine declined to delete is printed rather than hidden inside a zero count.
+
+## Isolation is measured, not named
+
+The ladder above says what a provider **claims**. One call says what the engine
+actually does, and the difference matters: on the host this runtime was built on,
+`docker` is not Docker Desktop but a compatibility shim over the Apple
+containerisation engine (`docker info` reports `Apple Containerization`), and every box
+it starts gets its own kernel. Four boxes produced four different
+`/proc/sys/kernel/random/boot_id` values and four different `/proc/uptime` readings.
+Assigning a tier from the provider's name would have called that engine container
+isolation while it was handing out VMs — and the same binary on a Linux host with a
+shared-kernel daemon would then have been telling the truth, which is why no name-based
+mapping can be correct in general.
+
+```go
+report, err := sb.MeasureKernelBoundary(ctx, sandbox.DefaultBoundaryBoxes)
+if err != nil {
+    var budget *sandbox.BoundaryBudgetError
+    var unsupported *sandbox.BoundaryUnsupportedError
+    switch {
+    case errors.As(err, &budget):
+        fmt.Println(budget.Remediation()) // box count refused before anything booted
+    case errors.As(err, &unsupported):
+        fmt.Println(unsupported.Remediation())
+    default:
+        log.Fatal(err)
+    }
+}
+fmt.Println(report.Verdict, report.Boxes, report.Distinct(), report.GuestKernel)
+for _, line := range report.Evidence {
+    fmt.Println(line)
+}
+```
+
+Four verdicts, and they are not interchangeable: `private-kernel`, `shared-kernel`,
+`unknown`, and `unmeasured`. Only the first supports a micro-VM floor; `unknown` means
+the engine gave readings that cannot support a conclusion, and it exits nonzero from the
+CLI rather than looking healthy. The readings travel with the verdict — one guest boot id
+per box, each box's seconds-since-kernel-boot, and the guest kernel against the host's —
+because a conclusion you cannot check is a claim.
+
+Two cost rules, learned from the mistakes this package already made:
+
+- Nothing is provisioned to discover the question cannot be answered. A provider without
+  `sandbox.KernelBoundaryQueryable` gets a typed error naming the interface (same
+  house rule as D-36's image question), and an invalid box count is refused before any
+  boot.
+- The measurement boots real boxes, so it is a deliberate call: `sandbox.MaxBoundaryBoxes`
+  caps one measurement at `sandbox.DefaultBoundaryBoxes` or a few more. It is
+  **never** part of `Diagnose`. Once you have measured, though, `Diagnose` reports the
+  cached verdict against the floor this handle was given, so an over-claim surfaces in
+  the health report instead of staying a secret of the person who ran the measurement.
+
+The core also refuses a verdict its own evidence does not support: a provider that
+reports `private-kernel` while handing back two identical boot ids is corrected to
+`shared-kernel` with the reason in `Fixes`. The readings decide, not the assertion.
+
+This batch reports the measurement; the micro-VM **floor** is still admitted on the
+provider's claim. Making admission use the measurement is a deliberate widening of a
+gate, so it is a decision rather than a side effect — see `hno sandbox boundary` below.
 
 ## Recipes
 

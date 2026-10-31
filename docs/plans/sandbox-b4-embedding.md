@@ -340,3 +340,21 @@ slug 规则由构建产物建表（TestGuideSlugMatchesTheRenderer，7 例），
 被实测推翻的两条自定假设：① 以为全角标点都折成连字符——顿号 U+3001 无兼容分解，原样保留；
 ② 上一轮写的「ASCII 冒号删除」规则对中文页标题并不成立，改为复刻渲染器（先折叠兼容字符）。
 验证：-race 四包绿；真实引擎 10 PASS / 0 FAIL / 残留 0；覆盖 73.3% / 78.6% / 62.2% 不变。
+
+## B5a 完成记录（D-38 A1：档位实测）
+
+用户指出「本机有 docker 容器，能否用它测」→ 实测答案比预期强：本机 docker 是 Apple
+containerisation 的 shim，4 盒 4 个不同 boot_id（且 guest=Linux 6.18.35 / host=Darwin arm64）
+⇒ 每盒一个内核。既有 `Provider.Isolation()` 写死 `IsolationContainer` 在此低报，反方向（引擎
+自称 VM 而实际共享内核）准入则无从发现。故档位改由测量决定。
+
+A1（本批，只报告）落地：KernelBoundaryQueryable + docker 实现 + 核心纠正过度声称 +
+Diagnose 缓存报告 + `hno sandbox boundary` 动词 + 真实引擎门 private-kernel。
+自查发现「测量与 micro-VM 下限矛盾」分支在诚实夹具下**永不可达**（Open 先挡），改用
+「声称 VM 档但实测共享内核」的夹具把分支走进去。
+自测抓出 2 处自己的缺陷：defer 改值拷贝丢泄漏信息（改具名返回值）；断言打错对象
+（Error() 不渲染 Fixes，改断言 UnavailableError.Remediation()）。
+另补齐 D-37 未堵完的多语言洞：围栏语法门 / 方法调用门 / 裸名门此前只读英文页。
+
+A2（准入门生效）**未授权未做**：本机 `WithMinimumIsolation(microvm)` 现在失败，A2 后会成功，
+属闸门有意放宽，等决策。留白：Docker Desktop 共享 VM 的说法在本机未实测，实现不含任何按名字的结论。

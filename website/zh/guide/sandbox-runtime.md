@@ -241,6 +241,8 @@ go build -o hno ./cmd/hno
 ./hno sandbox run -- go version           # one command, payload status passed through
 ./hno sandbox run --timeout 30s --shell "deploy"
 ./hno sandbox run --attr binary=container --image golang:1.26 -- sh -c "exit 5"
+./hno sandbox boundary                      # 隔离度是实测还是名字？（会真的起盒）
+./hno sandbox boundary --boxes 3 --expect private-kernel --json
 ```
 
 | 动词 | 运行时调用 | 退出码 |
@@ -248,6 +250,7 @@ go build -o hno ./cmd/hno
 | `doctor` | `Sandbox.Diagnose` | `0` 全部检查通过，`1` 有检查失败 |
 | `prune` | `Sandbox.Reclaimer` | `0`；不加 `--yes` 拒绝删除 |
 | `run` | `Sandbox.Run` / `Session.Exec` | 程序自己的退出码，`124` 超时，`70` 环境不可用，`2` 命令行写错 |
+| `boundary` | `Sandbox.MeasureKernelBoundary` | `0` 测得且与 `--expect` 相符，`1` 结论为 `unknown` 或不符，`70` 无法测量，`2` 参数写错 |
 
 `run` 的三种结果刻意不做合并。一个退出码为 5 的程序不等于一个失败的沙盒；而一个没能启动的沙盒
 对你的程序没有任何判断：`70` 意味着**你的命令状态未知**，所以外层脚本不能把它读成「跑了但失败」。
@@ -261,6 +264,57 @@ go build -o hno ./cmd/hno
 
 prune 默认只读，因为一个靠猜的回收工具比一个会问的更糟；而引擎拒绝删除的那些会被打印出来，
 不会藏在零计数里。
+
+## 隔离度是实测出来的，不是按名字给的
+
+上面这套阶梯说的是 provider **声称** 什么；还有一个调用说引擎**实际**做什么，而这个差别是
+要紧的：在这套运行时被开发出来的那台主机上，`docker` 并不是 Docker Desktop，而是套在 Apple
+containerisation 引擎上的兼容 shim（`docker info` 报 `Apple Containerization`），而且它起的
+每一个盒都用自己的内核。四个盒给出四个不同的
+`/proc/sys/kernel/random/boot_id` 与四个不同的 `/proc/uptime` 读数。
+按 provider 名字分配档位，就会把一台正在发 VM 的引擎叫作「容器隔离」——而同一个二进制装在一台
+共享内核的 Linux 宿主上说的却是实话，这正是为什么任何「按名字映射」都不可能普遍正确。
+
+```go
+report, err := sb.MeasureKernelBoundary(ctx, sandbox.DefaultBoundaryBoxes)
+if err != nil {
+    var budget *sandbox.BoundaryBudgetError
+    var unsupported *sandbox.BoundaryUnsupportedError
+    switch {
+    case errors.As(err, &budget):
+        fmt.Println(budget.Remediation()) // box count refused before anything booted
+    case errors.As(err, &unsupported):
+        fmt.Println(unsupported.Remediation())
+    default:
+        log.Fatal(err)
+    }
+}
+fmt.Println(report.Verdict, report.Boxes, report.Distinct(), report.GuestKernel)
+for _, line := range report.Evidence {
+    fmt.Println(line)
+}
+```
+
+四种结论，彼此不可混用：`private-kernel`、`shared-kernel`、`unknown`、`unmeasured`。
+只有第一种支持 micro-VM 下限；`unknown` 表示引擎给出的读数不足以支撑任何结论，而它从命令行
+返回**非零**，不会伪装成健康。读数与结论一起返回——每盒一个 guest boot id、每盒自内核启动以来的
+秒数、以及 guest 内核与宿主内核的对照——因为一个你无法核查的结论只是句宣称。
+
+两条成本规则，都来自这个包自己已经犯过的错：
+
+- 为了发现「这个问题答不了」而不起任何盒。没有 `sandbox.KernelBoundaryQueryable` 的
+  provider 会拿到点名该接口的类型化错误（与 D-36 的镜像问题同一家规），非法的盒数在任何启动之前就被拒绝。
+- 这个测量会真的起盒，所以它必须是一次**有意的**调用：`sandbox.MaxBoundaryBoxes`
+  把单次测量限制在 `sandbox.DefaultBoundaryBoxes` 或略多。它**绝不**属于 `Diagnose`。
+  但一旦你测过，`Diagnose` 就会把缓存的结论拿去对照本句柄给的下限，于是过度声称会浮现在
+  健康报告里，而不是留在跑过测量的那个人手里。
+
+核心还会拒绝「自己的证据不支持」的结论：provider 报 `private-kernel` 却交回两个相同的 boot id
+时，会被纠正为 `shared-kernel` 并把原因写进 `Fixes`。**由读数决定，不由宣称决定。**
+
+本批次落地的是「报告测量结果」；micro-VM **下限**目前仍按 provider 的声称准入。让准入改用
+测量结果，是一道闸门的**有意放宽**，所以它是你的决策，而不是顺手产生的副作用——见下面的
+`hno sandbox boundary`。
 
 ## 配方
 
