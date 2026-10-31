@@ -145,3 +145,14 @@ explicitIntent: implement
 `Options` 可覆盖句柄限额 ⇒ 改为从 `sb.Status().Limits` 读回（同 D-20/D-25 的同类缺陷）。
 
 B4d（`toolkit.go:106-115` 双写迁移）**未做**：需授权。
+
+## D-31 完成记录（实测）
+
+修复 B4b 遗留的第 1 项上游缺陷。拒绝不再嵌在 `sb.cfg.Sessions != nil` 内：无 store 句柄取未知 id 也返回
+`*StaleSessionError`，不注册会话、不开环境。`RunProject` 显式传 `WithCreateIfMissing(true)`。
+`sandboxgraph` 的 `Diagnose` 计数 workaround 删除，`ErrNoSession` / `ErrNoApproval` 改由事实驱动。
+
+5 条新合同测试（含「不创建环境」用 provider 引用直接探测）；反证：旧实现返回带 `gen:...` 血缘的活会话。
+`-race` 四包全过；真实门 9 PASS / 0 FAIL、残留 0；覆盖 `sandbox` 73.2%、`sandbox/graph` 80.3%。
+
+第 2 项（`pkg/hno/graph.checkShape` 校验缺失可选属性）**仍未修**：跨包、影响所有 schema 校验使用方。

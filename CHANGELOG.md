@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 🔒 Security / Fixed (D-31：`WithCreateIfMissing(false)` 不再静默失效)
+- **核心**：`Sandbox.Session(ctx, id)` 在句柄**没有 session store** 时，此前无视 `WithCreateIfMissing(false)`：未知 id 会开出一台空环境并作为「正在恢复的那个会话」返回。跨进程恢复因此以为自己在续作，实际拿到空盒子，还会把缺失状态归因于自己的代码。现在无论有没有 store 都返回 `*StaleSessionError`，且不注册会话、不开机；`Cause` 按「有无 store」分别说明能证明的原因（无 store 时诚实说「无法核实该 id 是一次恢复」）。
+- `RunProject` 显式传 `WithCreateIfMissing(true)`：它本来就运行在自己创建的会话上，靠隐式宽容行为等于把创建意图藏起来。
+- **`sandboxgraph` 删除一个 workaround**：`Ask.Answer` 原先先用 `Diagnose` 的审批计数做前置排除，只因核心当时不肯拒绝。核心修好后该守卫一并删除——同一件事不留第二个权威。错误分类随之回到事实驱动：句柄无法核实 id ⇒ `ErrNoSession`（由核心给出并被测试直接断言）；会话活着但审批已消耗 ⇒ `ErrNoApproval`。
+- 爆炸半径实测：非测试调用点仅 2 个（其中一个正是需要拒绝的 `graph/ask.go`），包内 50 处测试早已显式传该选项；需补选项的既有测试 4 处（`readiness_falsifier_test.go`）。
+
+### 🧪 Tests (D-31)
+- 新增 5 条合同测试：无 store 拒绝且**不注册会话、不创建环境**（持 provider 引用直接探测）、显式创建仍可用且已知 id 可重新取得、`WithSessionReplay(true)` 隐含恢复意图、有 store 时 Cause 文案点名缺失记录、`RunProject` 自建会话并可重新取得。反证：旧实现下第一条拿到的是带 `gen:...` 血缘的活会话。`sandbox` 73.0% → 73.2%、`sandbox/graph` 78.9% → 80.3%。
+
 ### ✨ Added (B4c 遗留 Executor 兼容适配器)
 - 新文件 `pkg/hno/tools/run/adapter.go`：`NewSandboxExecutor` 用 `pkg/hno/sandbox` 实现冻结的遗留 `Executor` 合同（`Run(ctx, Spec) (Result, error)` + `Close()`）。纯新增，不改 `executor.go/podman.go/e2b.go/local.go/toolkit.go`，也不要求任何调用方迁移。
 - 语义落差一律类型化拒绝而不是静默重解释：`Spec.Workspace`（遗留为宿主读写 bind mount，新模型为快照进出）报 `ErrSandboxUnsupported` 并点名 `RunProject`/`WithWorkspace`；`Spec.MemoryLimit/PidLimit` 与句柄限额不一致报 `ErrSandboxLimitMismatch` 并说明配置点（per-run 内存/PID 上限在新 API 里不可表达）；`podman`/`e2b` 后端明确拒绝而不是偷换 provider。
