@@ -707,3 +707,39 @@ EnvSpec 变更而受影响，故必须重跑）。新增 13 个测试，其中 2
 写着「核心会把剩下的放进 ReplayFrom，所以本 provider 不自创重试策略」——该注释为假，
 代码路径不可达。核心重放已是唯一所有者且 provider 无关，故这段死代码与假注释应随
 D-20 一并清理（避免下一个谎报者据此声称实现了重放）。
+
+### 17.10 D-20 决议与实现：步骤缓存只在「继承状态」时才可跳过
+
+**决议**：选 B。从零渲染的盒子一律重放；缓存只对真正继承前态的重建生效。
+
+**实现**（`pkg/hno/sandbox`）：
+
+1. `boxProvenance{lineage, upto, source}` 由 `newEnvironment` **返回**。造盒子的函数是唯一知道自己怎么造出来的地方，所以它是唯一有资格声明继承关系的来源。
+2. 判据（`stepCached`）：`step.Sequence <= prov.upto` **且** 条目键为 `lineage + "|" + step.Key()`。
+   - 由基础镜像渲染：`upto = -1` ⇒ 任何条目都无法授权跳过 ⇒ 一律重放。
+   - `CloneAs`：子继承父 `lineage`，`upto = len(parent.Spec.Steps)-1` ⇒ 可跳过（真继承）。
+   - `Restore`：取 `Checkpoint` 时记录的 `snapshotMark{lineage, upto}`；**无记录则退回 `upto = -1`**（未知水位绝不能授权跳过）。
+3. `Step.Key()` 仍是纯内容摘要，但内容摘要不再是键的全部 —— 这是泄漏的根源所在。
+4. 取消 `normalize()` 自动安装进程内存 `StepCache`。默认句柄不再携带一个能跨容器抑制工作的缓存；这与同一函数拒绝进程内存 `Journal` 的理由一致。
+
+**实测的三条反向证伪**（每条都在被破坏时变红，证明机制是活的而非装饰）：
+
+| 破坏 | 结果 |
+|---|---|
+| 去掉 `lineage` 作用域（恢复纯内容键） | `a foreign lineage skipped a step it never satisfied` |
+| 去掉 `upto` 水位判据 | `a step beyond the watermark was skipped` |
+| 恢复「按 env 反查 session」旧实现 | `the replay pipeline stored nothing`（缓存恒空，测试仍全绿 —— 静默空转） |
+
+**过程中发现的同类缺陷（均已修）**：
+
+- `replayStep` 只检查 `err`，不看退出码。provider 按运行契约把失败 payload 报成 `Report{ExitCode≠0}, err=nil`，于是**安装失败的步骤被记为已满足并写进缓存**。
+- `Session.Install` / `Session.Setup` 同族且更严重：`Setup` 跑一条 exit 7 的命令 **返回 nil 并把步骤记成可重放状态** —— 调用方以为装好了，而之后每次重建都会忠实重跑一条已知失败的命令。新增 `runStateful`：状态型调用必须以退出码为证据，失败则**不记录该步骤**并返回带分类的错误。
+- 测试替身 `Env.clone()` 复制文件却漏掉 `installed`/`history`，使「克隆继承状态」这条前提在替身里为假。
+- 本轮自身引入的回归：`benignShellScript` 把以 `#` 开头的行当注释放行，而替身协议指令正是 `#!fail` ⇒ 失败命令报成功。已有测试钉住。
+- `rebuild` 在重放前把 `sess.env` 置 nil、重放后才赋值，因此**按 env 反查 session 得到 lineage 恒为空**：结果看起来正确（全部重放），理由完全错误，缓存永久空转。改为由创建者显式返回 provenance。
+
+**跨进程新缺陷（D-20 并发压力暴露，已修）**：两个真实门进程并发时，进程 B 刚 `create`（尚未 `start`）的容器被进程 A 的 `Prune()` 删除。原判据把「不在本进程内存表里 + 未运行」当作残留，正是此前已被否决的推断（所有权不能从单个进程的内存表推断），当时只补了 running 情形。现在 `SweepDetail` 增加 `HeldElsewhere`：owner label 的 host 为本机且 pid 存活 ⇒ 即使停止也**拒绝回收**；`Refused()` 与 `SkippedPrune()` 如实报告。新增真门断言，撤掉判据即变红。
+
+**清理**：删除 `EnvSpec.ReplayFrom`/`CachedSteps` 与 docker `Environment.replay()`。核心从不填充 `ReplayFrom`，而该 provider 循环只处理 `StepInstall`、会**静默丢弃** setup/materialise 步骤；注释声称核心会传入剩余步骤，是假话。核心经由 `Environment.Exec` 是步骤重放的唯一所有者。
+
+**验证**：`go test -race ./pkg/hno/sandbox/...` 绿；核心覆盖率 69.8% → **70.8%**，provider 57.5% → **57.9%**；真引擎门单进程 6/6；两个并发进程各 **6/6 PASS、0 SKIP、0 FAIL**，`hno.sandbox.managed` 残留 **0**。

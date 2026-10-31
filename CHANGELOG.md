@@ -164,6 +164,69 @@ bit is a provider's assertion about itself, and nothing enforced it.
   matching branch, and a catch-all case there silently stops the double interpreting
   payloads).
 
+### 🐛 Fixed (D-20: a cached step is not evidence about a container it never ran in)
+
+- **A step-cache hit could skip work in a box that inherited nothing.**
+  `Step.Key()` hashed step content only — no session, image, or environment
+  generation — and `normalize()` auto-installed a process-memory step cache by
+  default, so `RebuildFromSpec`, which renders a brand-new container from the
+  base image, reported `cached=1 replayed=0` with an empty box. Measured both
+  within one session and across two sessions: session B's install was silenced
+  by session A's cache entry. Resolved as decision **B**: a hit may skip a step
+  only when the environment being built carries the state that step produced.
+  `newEnvironment` now returns a `boxProvenance` (state lineage plus an
+  inheritance watermark) because the function that creates a box is the only
+  authority on what it inherited; the watermark admits a clone of a session and
+  a restore to a checkpoint that already covered the step, and a box rendered
+  from the base image inherits nothing, so it replays everything. A restore
+  with no recorded checkpoint mark takes the safe direction rather than
+  guessing. The default handle no longer installs a step cache — the same
+  reasoning `normalize()` already applies to a process-memory journal.
+  `RebuildReport.StateSource` now says what the new environment inherited,
+  because `Cached` without it is unexplainable.
+- **`RebuildFromSpec` was also silently dropping every workspace step.** The
+  provider replay loop it used handled only installs and ignored setup,
+  materialise, environment, and workspace-delta steps. `EnvSpec.ReplayFrom` and
+  `CachedSteps` were unreachable — the core never populated them — so they and
+  the provider-side loop are removed: the core replaying through
+  `Environment.Exec` is the single owner of step replay.
+- **A step that exited nonzero was recorded as satisfied.** Providers report a
+  failing payload as a populated `Report` with a nil error, which is the run
+  contract; `replayStep` checked only the error, so a failed install was
+  stamped done and written into the cache. The exit code is now the evidence.
+- **A failing `Install` or `Setup` reported success and persisted the failure as
+  replayable state.** `Setup` of a command exiting 7 returned nil and recorded
+  the step, so the caller proceeded and every later rebuild re-ran a command
+  known to fail. State-bearing calls now require a zero exit, do not record the
+  step when it fails, and return a classified error.
+- **Prune could delete another live process's stopped container.** With two
+  real-engine runs in flight, one process's container was removed between
+  `create` and `start` by the other's prune: "not held by this process and not
+  running" was read as crash residue, the same inference already rejected for
+  running containers. `SweepDetail` gains `HeldElsewhere` — a stopped container
+  whose owner pid is alive on this host is refused, reported through `Refused()`
+  and `Provider.SkippedPrune()` — so ownership is decided from engine state plus
+  the owner label rather than from one process's memory.
+
+### 🧪 Tests (D-20)
+
+- `TestRebuildFromBaseImageReplaysEveryStep`,
+  `TestCloneCarriesStateAndRebuildDoesNot`,
+  `TestStepCacheCannotSilentlySkipAgain`, and
+  `TestFailingInstallIsNotRecordedAsState` pin the decision;
+  `TestStepCacheHonoursTheLineageRule` pins the rule directly, and
+  `TestReplayPipelineRecordsSatisfiedSteps` proves the pipeline reaches it —
+  the earlier version passed every behavioural test while recording nothing,
+  which is why a rule needs an observability assertion of its own. Each half
+  was checked against a deliberately broken implementation and fails.
+- `TestOwnerAliveRejectsWhatItCannotVerify` covers the ownership predicate
+  across live, dead, foreign-host, and malformed labels; the real gate asserts
+  a stopped container owned by a live process survives a prune.
+- Test-double fidelity: a clone now carries installed packages and history like
+  a real engine does, the in-memory provider tracks its live instances so a test
+  can make a loss real, and a shell directive is no longer mistaken for a
+  comment.
+
 ### ⚠️ Known issues
 - **D-20: a step-cache hit is treated as evidence about a container that never ran the
   step.** `StepCache` is on by default with a process-memory journal, `Step.Key()` hashes

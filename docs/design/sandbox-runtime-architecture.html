@@ -546,6 +546,7 @@ virtiofs 带宽 vs bind mount · QCOW2 写放大 · CGO+Rust 对 alpine 构建�
 <tr><td>D-16</td><td>模型撞 enforce 的反馈</td><td><b>不白拦</b>：<code>NextAction=use_install_api</code> + 等价写法 Hint，被拦命令记入 <code>DriftReport</code></td><td class="ok">已定</td></tr>
 <tr><td>D-17</td><td>产物超限额</td><td>按 <code>Required</code> 区分：必需者失败，非必需者截断交付并标 <code>Truncated</code></td><td class="ok">已定（按 Required）</td></tr>
 <tr><td>D-18</td><td><b>分期切法</b></td><td><b>已定：先最小可用。</b>第一批只落「声明式工作区 + 产物收集 + 失败分类/Rebuild + Session」；<code>sandboxgraph</code> 嵌入、HITL/Checkpointer 深整合、runsc/PTY/跨引擎快照等引擎扩展第二批。<b>P0 实测门不许跳</b>（拿不到 §11 数字就不接 BoxLite）</td><td class="ok">已定</td></tr>
+<tr><td>D-20</td><td>步骤缓存能否跳过<b>零继承</b>的盒子：缓存键只含步骤内容，导致同一进程内（含跨 session）的重建被一个与该容器无关的命中跳过安装</td><td>实测 cached=1 replayed=0、新容器为空；同 <code>normalize()</code> 另一分支已因同类理由拒绝进程内 Journal</td><td class="ok">已定（B：一律重放，缓存仅对继承状态的重建生效）</td></tr>
 <tr><td>D-19</td><td>P8 合并与隔离档数</td><td>P8a 是否并进 P2；生产是否只要 MicroVM、runsc 仅留作测试档</td><td class="ok">已定（P8a→P2）</td></tr>
 </table>
 <div class="flag ok"><b>19 条全部已定（v1.0 定稿）。</b>留痕一条过程错误：§12 决议表在 v0.2 之后一度未真正更新（批量编辑被中断却误报已同步），v0.7 起重建为本台账 —— <b>引用决议只引 D-xx，不引用「第几节那张表」。这条规则本身就是这次错误的产物。</b></div>
