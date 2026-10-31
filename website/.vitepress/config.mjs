@@ -68,6 +68,7 @@ export default defineConfig({
                 { text: 'Tools', link: '/guide/tools' },
                 { text: 'Sandboxed File I/O', link: '/guide/sandboxed-file-io' },
                 { text: 'Code Execution Sandbox', link: '/guide/code-execution-sandbox' },
+                { text: 'Sandbox Runtime', link: '/guide/sandbox-runtime' },
                 { text: 'Memory', link: '/guide/memory' },
                 { text: 'Session State', link: '/guide/session-state' },
                 { text: 'Session Service', link: '/guide/session-service' },

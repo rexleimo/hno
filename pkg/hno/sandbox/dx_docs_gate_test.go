@@ -1,0 +1,323 @@
+package sandbox
+
+import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+// The documentation half of the DX gate (design §P5: guide numbers must match what the runtime
+// reports). A doc page that drifts is worse than no page: the reader has no reason to distrust
+// it, so the drift becomes an operating assumption.
+//
+// Two things are checked against the code rather than against anyone's memory:
+//
+//  1. every default in the guide's Limits/Timeouts tables equals the resolved value, formatted
+//     the way the code itself renders it (Timeouts.Provision is 2m0s, not "120s");
+//  2. every qualified API name in the guide resolves to an exported symbol of the package it
+//     claims it belongs to, including names used only inside prose or code fences.
+
+const guideRel = "../../../website/guide/sandbox-runtime.md"
+
+func guidePath(t *testing.T) string {
+	t.Helper()
+	p, err := filepath.Abs(guideRel)
+	if err != nil {
+		t.Fatalf("resolve guide path: %v", err)
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Skipf("guide page not present at %s: %v", p, err)
+	}
+	return p
+}
+
+func readGuide(t *testing.T) []string {
+	t.Helper()
+	b, err := os.ReadFile(guidePath(t))
+	if err != nil {
+		t.Fatalf("read guide: %v", err)
+	}
+	return strings.Split(string(b), "\n")
+}
+
+// docValue formats a default the way the guide writes it. Keeping the formatter here and the
+// strings there means one of them fails when the other drifts.
+func docValue(v any) string {
+	switch t := v.(type) {
+	case time.Duration:
+		return t.String()
+	case int64:
+		switch {
+		case t == 0:
+			return "0"
+		case t%(1<<30) == 0 && t >= 1<<30:
+			return fmt.Sprintf("%d GiB", t/(1<<30))
+		case t%(1<<20) == 0:
+			return fmt.Sprintf("%d MiB", t/(1<<20))
+		default:
+			return strconv.FormatInt(t, 10)
+		}
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+func TestGuideNumbersMatchResolvedDefaults(t *testing.T) {
+	lines := readGuide(t)
+	rows := map[string]string{}
+	for _, ln := range lines {
+		if !strings.HasPrefix(ln, "| ") {
+			continue
+		}
+		cells := strings.Split(strings.Trim(ln, "|"), "|")
+		if len(cells) < 2 {
+			continue
+		}
+		key := strings.Trim(strings.TrimSpace(cells[0]), "`")
+		rows[key] = strings.TrimSpace(cells[1])
+	}
+
+	check := func(structName string, sample any) {
+		v := reflect.ValueOf(sample)
+		tp := v.Type()
+		for i := 0; i < tp.NumField(); i++ {
+			field := tp.Field(i)
+			want := docValue(v.Field(i).Interface())
+			got, ok := rows[field.Name]
+			if !ok {
+				t.Errorf("%s: guide does not document %s.%s at all", structName, structName, field.Name)
+				continue
+			}
+			// The guide may add a qualifier after the value ("0 means the engine decides").
+			if !strings.HasPrefix(got, want) {
+				t.Errorf("%s: guide says %s.%s = %q, the code says %q", structName, structName, field.Name, got, want)
+			}
+		}
+	}
+	check("Limits", DefaultLimits())
+	check("Timeouts", DefaultTimeouts())
+}
+
+// pkgSurface is the exported surface of one package, for names the guide references.
+type pkgSurface struct {
+	names   map[string]bool
+	members map[string]map[string]bool
+}
+
+func surfaceOf(t *testing.T, dir string) pkgSurface {
+	t.Helper()
+	s := pkgSurface{names: map[string]bool{}, members: map[string]map[string]bool{}}
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", dir, err)
+	}
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, decl := range file.Decls {
+				switch d := decl.(type) {
+				case *ast.FuncDecl:
+					if !strings.HasSuffix(d.Name.Name, "_test") && exportedNameRe.MatchString(d.Name.Name) {
+						if d.Recv == nil {
+							s.names[d.Name.Name] = true
+						} else if rn := recvName(d.Recv.List[0].Type); rn != "" && exportedNameRe.MatchString(rn) {
+							if s.members[rn] == nil {
+								s.members[rn] = map[string]bool{}
+							}
+							s.members[rn][d.Name.Name] = true
+						}
+					}
+				case *ast.GenDecl:
+					for _, spec := range d.Specs {
+						switch sp := spec.(type) {
+						case *ast.TypeSpec:
+							if exportedNameRe.MatchString(sp.Name.Name) {
+								s.names[sp.Name.Name] = true
+								if st, ok := sp.Type.(*ast.StructType); ok {
+									if s.members[sp.Name.Name] == nil {
+										s.members[sp.Name.Name] = map[string]bool{}
+									}
+									for _, f := range st.Fields.List {
+										for _, n := range f.Names {
+											if exportedNameRe.MatchString(n.Name) {
+												s.members[sp.Name.Name][n.Name] = true
+											}
+										}
+									}
+								}
+							}
+						case *ast.ValueSpec:
+							for _, n := range sp.Names {
+								if exportedNameRe.MatchString(n.Name) {
+									s.names[n.Name] = true
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return s
+}
+
+// Guide package aliases: which import path each short name in the page stands for.
+var guideAliases = map[string]string{
+	"sandbox":   ".",
+	"run":       "../tools/run",
+	"sgraph":    "./graph",
+	"docker":    "./provider/docker",
+	"coregraph": "../graph",
+}
+
+var qualifiedRe = regexp.MustCompile(`\b(sandbox|run|sgraph|docker|coregraph)\.([A-Z][A-Za-z0-9]*)`)
+
+func TestGuideAPINamesResolve(t *testing.T) {
+	surfaces := map[string]pkgSurface{}
+	for alias, rel := range guideAliases {
+		dir, err := filepath.Abs(rel)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", alias, err)
+		}
+		if _, err := os.Stat(dir); err != nil {
+			t.Skipf("no %s package at %s", alias, dir)
+		}
+		surfaces[alias] = surfaceOf(t, dir)
+	}
+
+	seen := map[string]bool{}
+	for i, ln := range readGuide(t) {
+		for _, m := range qualifiedRe.FindAllStringSubmatch(ln, -1) {
+			alias, name := m[1], m[2]
+			key := alias + "." + name
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			s := surfaces[alias]
+			if s.names[name] {
+				continue
+			}
+			// A qualified name may be a member of a type used in the same line
+			// ("ApprovalPendingError" then ".Remediation"), or a field of a struct.
+			found := false
+			for typ, mem := range s.members {
+				if mem[name] {
+					found = true
+					break
+				}
+				_ = typ
+			}
+			if found {
+				continue
+			}
+			t.Errorf("guide line %d references %s, which is not exported by the %s package", i+1, key, alias)
+		}
+	}
+	if len(seen) < 25 {
+		t.Errorf("guide audits only %d qualified names; a rewrite that drops API references would silently empty this gate", len(seen))
+	}
+}
+
+// Bare identifier families. This package names options, actions, capabilities, isolation
+// levels, and sentinels with fixed prefixes, so a word in the guide wearing one of those
+// prefixes is a claim about the API even when the package qualifier is left off -- which is
+// exactly how "Action: ActDeny" would otherwise slip past the qualified-name check.
+var bareFamilyRe = regexp.MustCompile(`\b(?:With|Act|Isolation|Cap|Overflow|Mount|Profile|Err|Class)[A-Z][A-Za-z0-9]*`)
+
+func TestGuideBareAPINamesResolve(t *testing.T) {
+	// The universe is the documented family, not one directory: prose about graph nodes
+	// legitimately names sandbox/graph options, and a too-narrow universe reports real API
+	// as invented -- which trains readers to ignore the gate.
+	core := surfaceOf(t, mustAbs(t, "."))
+	runPkg := surfaceOf(t, mustAbs(t, "../tools/run"))
+	graphPkg := surfaceOf(t, mustAbs(t, "./graph"))
+	var buf strings.Builder
+	depth := 0
+	for _, ln := range readGuide(t) {
+		if strings.HasPrefix(strings.TrimSpace(ln), "```") {
+			depth++
+			continue
+		}
+		if depth%2 == 1 {
+			continue // inside a fence: the syntax gate owns those, names may be locals
+		}
+		buf.WriteString(ln)
+		buf.WriteByte('\n')
+	}
+	seen := map[string]bool{}
+	for _, name := range bareFamilyRe.FindAllString(buf.String(), -1) {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		if core.names[name] || runPkg.names[name] || graphPkg.names[name] {
+			continue
+		}
+		t.Errorf("guide prose uses %q, which looks like an API name from a fixed prefix family but is exported by neither pkg/hno/sandbox, pkg/hno/tools/run, nor pkg/hno/sandbox/graph", name)
+	}
+}
+
+func mustAbs(t *testing.T, rel string) string {
+	t.Helper()
+	p, err := filepath.Abs(rel)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", rel, err)
+	}
+	return p
+}
+
+// TestGuideCodeFencesParse keeps the copy-paste path honest: a fenced example that is not
+// valid Go is not an example.
+func TestGuideCodeFencesParse(t *testing.T) {
+	lines := readGuide(t)
+	var (
+		fence []string
+		in    bool
+		start int
+		n     int
+	)
+	for i, ln := range lines {
+		trimmed := strings.TrimSpace(ln)
+		if strings.HasPrefix(trimmed, "```") {
+			if !in {
+				if !strings.Contains(trimmed, "go") {
+					in = false
+					continue
+				}
+				in = true
+				start = i + 1
+				fence = nil
+				continue
+			}
+			in = false
+			n++
+			src := strings.Join(fence, "\n")
+			fset := token.NewFileSet()
+			if _, err := parser.ParseFile(fset, "fence.go", "package p\nfunc _() {\n"+src+"\n}\n", parser.SkipObjectResolution); err != nil {
+				// Try as declarations, since some fences are top-level blocks.
+				if _, err2 := parser.ParseFile(fset, "fence.go", "package p\n"+src, parser.SkipObjectResolution); err2 != nil {
+					t.Errorf("guide fence starting at line %d is not valid Go: %v", start, err)
+				}
+			}
+			continue
+		}
+		if in {
+			fence = append(fence, ln)
+		}
+	}
+	if n < 8 {
+		t.Errorf("guide has only %d Go fences; this gate has nothing to say about a page that stopped showing code", n)
+	}
+}
