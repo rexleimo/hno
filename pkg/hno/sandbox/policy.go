@@ -71,6 +71,12 @@ type RunContext struct {
 	Budget    Budget
 	Limits    Limits
 	Attrs     map[string]any
+	// lineage names the environment this run was about to execute in. An approval
+	// records it, because permission granted for one box must not be spent on another.
+	lineage string
+	// session is the owner whose grants can discharge an obligation, kept private so a
+	// policy cannot reach through it.
+	session *Session
 	// Sinks are the per-run output bindings, merged with the handle-level ones
 	// at fan-out. They live here because a Sink is an extension point: policy
 	// must be able to see who is receiving output, and a per-run sink that never

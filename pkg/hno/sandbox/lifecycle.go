@@ -67,6 +67,13 @@ func (sb *Sandbox) rebuild(ctx context.Context, sess *Session) (*RebuildReport, 
 	sess.env = env
 	sess.state = StateReady
 	sess.lastSeen = time.Now()
+	// The provenance the creator returned has to land on the session, not just steer the
+	// replay above. adoptWorkspace minted a placeholder lineage for a box this handle had
+	// not traced; leaving it in place meant a rebuilt session kept reporting a lineage it
+	// never had, which is the D-20 drift in another spot: the watermark that stops a step
+	// cache skipping work the new box never ran, and any promise that binds to a specific
+	// environment, were both reading the placeholder.
+	sess.lineage, sess.inherited, sess.stateSource = prov.lineage, prov.upto, prov.source
 	sess.mu.Unlock()
 	rep.Duration = time.Since(started)
 	sb.emit(ctx, Event{Kind: EventRebuilt, SessionID: sess.id, Detail: map[string]any{"replayed": len(rep.Replayed), "cached": rep.Cached, "dropped": rep.Dropped}})
@@ -456,6 +463,19 @@ func (sb *Sandbox) Diagnose(ctx context.Context) (*DiagReport, error) {
 			OK:   true,
 			Fix:  "only Pattern probes can be answered here; a Port or URL probe returns UnsupportedProbeError",
 		})
+	}
+	// A suspended approval is work that is not running and resources that are not free.
+	// It is reported here because a caller staring at a stalled workflow needs to be able
+	// to tell "the engine is slow" from "somebody has not answered yet".
+	if n := sb.approvals.outstanding(); n > 0 {
+		report.Checks = append(report.Checks, Check{
+			Env:  "approvals",
+			Want: "none pending",
+			Got:  fmt.Sprintf("%d suspended request(s)", n),
+			OK:   false,
+			Fix:  "list them with Session.Awaiting() and answer with Approve/Deny, or widen WithTimeouts(Timeouts{ApprovalHold: ...})",
+		})
+		report.Fixes = append(report.Fixes, fmt.Sprintf("%d approval(s) are holding work with nobody to answer them", n))
 	}
 	if err := probeBounded(ctx, sb.provider, sb.cfg.Timeouts.Connect); err != nil {
 		report.Checks = append(report.Checks, Check{Env: "probe", Want: "ok", Got: err.Error(), OK: false, Fix: firstFix(err)})

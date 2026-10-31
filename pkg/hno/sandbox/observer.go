@@ -39,6 +39,14 @@ const (
 	EventRetryAttempt
 	EventRetryGaveUp
 	EventSessionExpired
+	// EventApprovalRequested is a run suspended for a human answer.
+	EventApprovalRequested
+	// EventApprovalGranted is a yes; the work has not run yet, only been permitted.
+	EventApprovalGranted
+	// EventApprovalRefused is a no.
+	EventApprovalRefused
+	// EventApprovalExpired is a hold window that ran out unanswered.
+	EventApprovalExpired
 	EventQuotaBlocked
 	EventHookFault
 )

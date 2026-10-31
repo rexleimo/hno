@@ -540,6 +540,13 @@ type ApprovalPendingError struct {
 	ApprovalID string
 	Reason     string
 	Requested  string
+	// SessionID is where the request is parked, so a caller holding only the error can
+	// find the session that can answer it.
+	SessionID string
+	// Hold is the window the answer must arrive inside, and ExpiresAt its deadline.
+	// Zero Hold means the request does not expire.
+	Hold      time.Duration
+	ExpiresAt time.Time
 }
 
 func (e *ApprovalPendingError) Error() string {
@@ -548,6 +555,137 @@ func (e *ApprovalPendingError) Error() string {
 
 // Class marks approval waits as denied-but-resumable.
 func (e *ApprovalPendingError) Class() FailureClass { return ClassDenied }
+
+// Remediation names the calls that unblock the run. An error that says "pending" without
+// saying who can pending it is a status line, not an error.
+func (e *ApprovalPendingError) Remediation() []string {
+	fix := []string{
+		fmt.Sprintf("session %q: Approve(ctx, %q, approver) then Resume(ctx, %q)", e.SessionID, e.ApprovalID, e.ApprovalID),
+		fmt.Sprintf("or refuse it: session %q: Deny(ctx, %q, reason)", e.SessionID, e.ApprovalID),
+	}
+	if e.Hold > 0 {
+		fix = append(fix, fmt.Sprintf("the answer must arrive within %s, after which the request is void and must be re-asked", e.Hold))
+	}
+	return fix
+}
+
+// UnknownApprovalError is an approval id that is not in the register.
+type UnknownApprovalError struct {
+	ID        string
+	SessionID string
+}
+
+func (e *UnknownApprovalError) Error() string {
+	return fmt.Sprintf("sandbox: session %q has no approval %q", e.SessionID, e.ID)
+}
+
+// Class is permanent: a wrong id stays wrong on retry.
+func (e *UnknownApprovalError) Class() FailureClass { return ClassPermanent }
+
+// Remediation tells the caller how to find the real ids.
+func (e *UnknownApprovalError) Remediation() []string {
+	return []string{fmt.Sprintf("list the outstanding ids with session %q: Awaiting()", e.SessionID)}
+}
+
+// ApprovalAnsweredError is a second answer to the same request.
+type ApprovalAnsweredError struct {
+	ID    string
+	State ApprovalState
+}
+
+func (e *ApprovalAnsweredError) Error() string {
+	return fmt.Sprintf("sandbox: approval %q is already %s", e.ID, e.State)
+}
+
+// Class is permanent: the decision is recorded and re-answering cannot change it.
+func (e *ApprovalAnsweredError) Class() FailureClass { return ClassPermanent }
+
+// ApprovalExpiredError is an answer that arrived after the hold window.
+type ApprovalExpiredError struct {
+	ID        string
+	SessionID string
+	Hold      time.Duration
+}
+
+func (e *ApprovalExpiredError) Error() string {
+	return fmt.Sprintf("sandbox: approval %q expired after its %s hold window", e.ID, e.Hold)
+}
+
+// Class is denied: the suspension lapsed, which is not an infrastructure fault.
+func (e *ApprovalExpiredError) Class() FailureClass { return ClassDenied }
+
+// Remediation explains what an expired hold means for the work.
+func (e *ApprovalExpiredError) Remediation() []string {
+	return []string{
+		fmt.Sprintf("re-run the request on session %q to ask again", e.SessionID),
+		"WithTimeouts(Timeouts{ApprovalHold: ...}) sets the window; Approval.Expires overrides it per request",
+	}
+}
+
+// ApprovalRefusedError is the answer "no".
+type ApprovalRefusedError struct {
+	ID        string
+	SessionID string
+	Reason    string
+}
+
+func (e *ApprovalRefusedError) Error() string {
+	if e.Reason == "" {
+		return fmt.Sprintf("sandbox: approval %q was refused", e.ID)
+	}
+	return fmt.Sprintf("sandbox: approval %q was refused: %s", e.ID, e.Reason)
+}
+
+// Class is denied: the human said no, which retry cannot change.
+func (e *ApprovalRefusedError) Class() FailureClass { return ClassDenied }
+
+// ApprovalEnvironmentChangedError refuses to spend an approval on a different box.
+//
+// It exists because a session will happily rebuild a lost environment from its recorded
+// spec, and running human-approved work inside a container that did not exist when the
+// answer was given is the substitution the approval existed to prevent.
+type ApprovalEnvironmentChangedError struct {
+	ID        string
+	SessionID string
+	Wanted    string
+	Got       string
+}
+
+func (e *ApprovalEnvironmentChangedError) Error() string {
+	return fmt.Sprintf("sandbox: approval %q was granted for environment %s but this session now holds %s; the approval was not spent", e.ID, e.Wanted, e.Got)
+}
+
+// Class is lost: the environment the decision referred to is gone.
+func (e *ApprovalEnvironmentChangedError) Class() FailureClass { return ClassLost }
+
+// Remediation names what has to happen for the work to run.
+func (e *ApprovalEnvironmentChangedError) Remediation() []string {
+	return []string{
+		"re-run the request so the approval is asked about the environment that exists now",
+		fmt.Sprintf("check what happened with session %q: Status(), and Awaiting() for outstanding approvals", e.SessionID),
+	}
+}
+
+// ApprovalNotDischargedError is a grant that did not take effect.
+//
+// A resubmitted approved request that suspends again under the same id would otherwise be
+// returned as a second pending wait, which lets a caller answer the same approval forever.
+type ApprovalNotDischargedError struct {
+	ID        string
+	SessionID string
+}
+
+func (e *ApprovalNotDischargedError) Error() string {
+	return fmt.Sprintf("sandbox: approval %q was granted but the run suspended under it again", e.ID)
+}
+
+// Class is permanent: this is a defect in the approval wiring, not a state to wait out.
+func (e *ApprovalNotDischargedError) Class() FailureClass { return ClassPermanent }
+
+// Remediation says plainly that this is a bug, not a caller error.
+func (e *ApprovalNotDischargedError) Remediation() []string {
+	return []string{"this is a defect in the sandbox approval path: a granted id must discharge its own suspension"}
+}
 
 // HookFaultError is a broken extension, not a payload failure. It is never
 // swallowed and never retried: a panicking policy is a bug in the application.

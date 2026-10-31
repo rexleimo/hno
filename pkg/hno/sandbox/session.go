@@ -40,6 +40,10 @@ type Session struct {
 	// stateSource names how this environment got the state it has, for reports.
 	stateSource string
 
+	// approved holds the ids this session has a live grant for, which is how the
+	// pipeline discharges an obligation instead of suspending the same request again.
+	approved []string
+
 	runs      int
 	queued    int
 	lastSeen  time.Time
@@ -661,6 +665,7 @@ func (s *Session) reserve(ctx context.Context, queue bool) error {
 	if s.expiredAtLocked(time.Now()) {
 		state := s.state
 		s.mu.Unlock()
+		s.sb.expireApprovals(time.Now())
 		_ = s.expire(ctx, s.CauseOfExpiry())
 		return expiredStateError(s.id, state)
 	}
@@ -669,8 +674,21 @@ func (s *Session) reserve(ctx context.Context, queue bool) error {
 		s.mu.Unlock()
 		return &StateError{SessionID: s.id, State: s.state, Action: "exec"}
 	case s.state == StateLost, s.state == StateSuspended:
+		// Resumable() promises that a run may re-provision the environment from the
+		// recorded spec, and ensureEnvironment implements exactly that. Refusing here
+		// anyway made the promise undeliverable: the rebuild branch had no caller at all,
+		// so a session that lost its box could never run again on a handle configured with
+		// the default RebuildFromSpec. Admit the run only when the rebuild can actually
+		// happen; otherwise the refusal stays, and says why.
+		if s.sb.canRebuild() {
+			break
+		}
 		s.mu.Unlock()
-		return &StaleSessionError{SessionID: s.id, Provider: s.provider}
+		return &StaleSessionError{
+			SessionID: s.id, Provider: s.provider,
+			Cause: fmt.Errorf("auto-rebuild needs RetryMode %s and capability %s; current mode is %q",
+				RebuildFromSpec, CapRebuild, s.sb.cfg.RetryMode),
+		}
 	case s.state.Terminal():
 		s.mu.Unlock()
 		return &StateError{SessionID: s.id, State: s.state, Action: "exec"}

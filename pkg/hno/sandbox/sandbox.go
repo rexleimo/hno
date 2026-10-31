@@ -26,6 +26,10 @@ type Sandbox struct {
 
 	mu       sync.RWMutex
 	sessions map[string]*Session
+	// approvals is the register of suspended requests awaiting a human answer. It lives
+	// on the handle because a one-shot run can be suspended too, and whoever holds the id
+	// has to be able to answer it. Guarded by mu.
+	approvals *approvalBook
 	// snapMarks records how far each snapshot's spec had been satisfied.
 	snapMarks map[string]snapshotMark
 	createdAt time.Time
@@ -73,6 +77,7 @@ func Open(ctx context.Context, opts ...Option) (*Sandbox, error) {
 		return nil, fmt.Errorf("sandbox: resolve profile: %w", err)
 	}
 	sb := &Sandbox{
+		approvals: newApprovalBook(),
 		cfg:       cfg,
 		sessions:  map[string]*Session{},
 		createdAt: time.Now().UTC(),

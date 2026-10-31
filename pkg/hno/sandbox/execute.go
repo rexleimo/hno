@@ -201,6 +201,14 @@ func (sb *Sandbox) buildRunContext(sess *Session, req Request, ro resolvedRunOpt
 	}
 	if sess != nil {
 		rc.SessionID = sess.id
+		rc.session = sess
+		// The approval a policy may demand here is about this environment, so the run
+		// context carries which one that was. Captured by value, not looked up later:
+		// a session can rebuild underneath a pending answer, and an approval that asked
+		// "what is the lineage now?" at resume time would then bless the new box.
+		sess.mu.Lock()
+		rc.lineage = sess.lineage
+		sess.mu.Unlock()
 	}
 	return rc
 }
@@ -316,7 +324,13 @@ func (sb *Sandbox) runPolicies(ctx context.Context, rc *RunContext) (*Request, e
 			if approval.ID == "" {
 				approval.ID = rc.RunID
 			}
-			return nil, &ApprovalPendingError{ApprovalID: approval.ID, Reason: dec.Reason, Requested: describeRequest(rc.Request)}
+			if rc.grantedElsewhere(approval.ID) {
+				// A grant this session already holds discharges its own obligation. Without
+				// this the resubmitted run would suspend again under the id that was just
+				// answered, and a caller could approve forever.
+				continue
+			}
+			return nil, sb.demandApproval(rc, &dec, approval)
 		case ActAllow:
 			if dec.Tighten != nil {
 				updated := rc.Request.clone()
@@ -434,7 +448,7 @@ func (sb *Sandbox) environmentFor(ctx context.Context, sess *Session, rc *RunCon
 			}
 		}
 		return env, nil
-	case state.Resumable() && sb.cfg.RetryMode == RebuildFromSpec && sb.caps.Has(CapRebuild):
+	case state.Resumable() && sb.canRebuild():
 		if _, err := sb.rebuild(ctx, sess); err != nil {
 			return nil, err
 		}
@@ -759,4 +773,14 @@ func stagedSummary(req *Request) []string {
 		out = append(out, "<workspace>")
 	}
 	return out
+}
+
+// canRebuild reports whether this handle may re-provision a lost environment on its own.
+//
+// One owner for a question asked in two places: reserve() uses it to decide whether to admit
+// work against a lost session, and ensureEnvironment uses the same conditions to do the
+// rebuild. Keeping them in one predicate is what stops the two from disagreeing, which is
+// how the rebuild branch ended up with no reachable caller.
+func (sb *Sandbox) canRebuild() bool {
+	return sb.cfg.RetryMode == RebuildFromSpec && sb.caps.Has(CapRebuild)
 }
