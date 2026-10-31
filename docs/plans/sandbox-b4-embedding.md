@@ -220,3 +220,54 @@ Provision 应渲染为 2m0s。反证 6 项各命中一次。
    若真建 CLI，门禁应扩到校验子命令存在。
 2. `website/` 无 node_modules，未跑 `npm run docs:build`（需联网安装）。
 3. 中文 guide 页未翻译，故未加 zh 链接。
+
+## B4f 工作项 — `hno sandbox` CLI（本轮执行，已获授权）
+
+```yaml
+type: planned
+targets:
+  - cmd/hno/main.go                 (new)  # 薄入口
+  - cmd/hno/sandbox.go              (new)  # doctor / prune / run
+  - cmd/hno/*_test.go               (new)  # 离线：sandboxtest 提供注入
+  - pkg/hno/sandbox/dx_gate_test.go (既有) # CLI 存在后，门禁改校验子命令而非禁 CLI
+  - pkg/hno/sandbox/lifecycle.go    (既有) # 文案可恢复指 CLI（现在为真）
+  - pkg/hno/sandbox/sandbox.go      (既有) # 同上
+  - pkg/hno/sandbox/lockdown.go     (既有) # 同上
+allowedWrites:
+  - cmd/hno/**                      # 仅新建
+  - pkg/hno/sandbox/dx_gate_test.go
+  - pkg/hno/sandbox/lifecycle.go    # 仅改可执行文案字符串
+  - pkg/hno/sandbox/sandbox.go      # 仅改可执行文案字符串
+  - pkg/hno/sandbox/lockdown.go     # 仅改可执行文案字符串
+failureClass: contract
+```
+
+可行性已实测（不是假设）：sandbox-only 二进制在本机可链接可执行（3.0 MB）；
+`cmd/efprobe` 的 TAPI 失败是其 cgo/`-lresolv` 依赖特有，与本 CLI 无关。
+
+安全设计（先定，后写）：
+- `prune` 默认**只列不删**（`Sweep`），删除必须显式 `--yes`（`Prune`），并打印 `SkippedPrune()`
+  的拒绝项；本会话内我不会执行删除分支，只测「不带 --yes 绝不删」。
+- `run` 的退出码分两类：payload 非 0 → 透传该码；环境故障 → 独立退出码，二者不得混淆（D-33 同源）。
+- `doctor` 在 `!diag.OK()` 时非 0 退出，便于 CI 当门禁用。
+
+D-34 的收尾承诺：CLI 存在后，门禁必须校验文案里 `hno sandbox <verb>` 的 verb 真存在，
+而不是简单解禁 —— 否则只是把一类假阳性换成一类假阴性。
+
+## B4f 完成记录（实测）
+
+交付：`cmd/hno`（doctor/prune/run，薄壳 + 退出码三分）；dx 文案门禁改为**解析 CLI verb 常量**校验
+（D-34 承诺的收尾）；guide 新增 shell 章节；Isolation 词汇往返 + 帮助文本词汇测试。
+
+本轮由 CLI 暴露的自身缺陷（都已修并反证）：
+1. `--isolation` 帮助文本写了 `micro-vm`，解析器只认 `microvm` ⇒ 词汇由测试钉住。
+2. verb 集合读取把「源文件读不到」静默当成「CLI 不存在」⇒ 三态分离 + t.Fatalf。
+3. 超时被我的初版分类成环境故障（ExitCode=-1）⇒ 独立 124，且 ≠ 70 有测试。
+4. flag→option 断言最初比较构造期记忆值 ⇒ 改读回 `sb.Status()`。
+
+真实引擎：doctor exit 0（8 项）/坏二进制 exit 70 / `go version` 真输出 / exit 5 透传 / prune 只读零删除。
+覆盖 cmd/hno 77.2%，核心 73.2% 不变，`-race` 绿，真实门 26.0s 残留 0。
+
+**D-36 待授权**：doctor 对缺失镜像给假绿灯（exit 0 "all 8 checks passed"），同镜像 run 是 exit 70；
+`ImagePresent` 能力已实现已测但生产路径唯一调用者是集成测试。需一次 Diagnose image 检查，
+代价是检查集合与 CI 绿灯语义变化，故只记录。

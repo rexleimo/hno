@@ -7,8 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ Added (B4f：`hno sandbox` CLI)
+- 新命令 `cmd/hno`：runtime 自报的东西以前只有写 Go 才听得到，而修复文案长期指向一个不存在的命令。三个动词，每个对一个导出调用，零新增策略：
+  - `hno sandbox doctor` → `Sandbox.Diagnose`，人读逐项 want/got/fix，`--json` 出机读报告；有检查失败则非 0 退出，可直接当 CI 门禁。
+  - `hno sandbox prune` → `Sandbox.Reclaimer`，**默认只列不删**，删除必须 `--yes`；引擎拒绝动的对象照实打印（`SkippedPrune`），不把「拒绝」藏进 0 计数。
+  - `hno sandbox run` → `Sandbox.Run` / `Session.Exec`。
+- 退出码把三件事分开（这是 CLI 的全部意义）：payload 自身状态**原样透传**；`124` = 跑了但超预算（`timeout(1)` 约定）；`70` = 环境不可用且明说「程序状态未知」；`2` = 命令行本身错。与 D-33 的 `run_code` 分类同源。
+- `--attr k=v` 直通引擎配置通道（`sandbox.WithAttrs`），于是 `--attr binary=container` 可以指向真实引擎、`--attr runtime=runsc` 可以问 gVisor。`--isolation` 只接受 `Isolation.String()` 渲染的那几个名字。
+- `website/guide/sandbox-runtime.md` 新增「From a shell」章节（命令表 + 退出码语义）。
+
+### 🔒 Tests (B4f)
+- D-34 的收尾：文案门禁不再简单禁止 CLI 形状，而是解析 `cmd/hno/sandbox.go` 里的 verb 常量集合来校验 —— 改动词会自动改门禁，不复制第二份清单。三种状态各自反证：假 verb 被拒并列出真实集合；CLI 目录消失时回到「禁止一切命令形状」；目录在而源文件读不到时 `t.Fatalf` 响亮自杀（初版把「读不到」当成「不存在」，门禁坏掉却表现为所有文案违规）。
+- `cmd/hno` 离线行为测试覆盖 flag→option 映射（拼错的隔离档位被拒且不改判）、请求形状二义性、`--json` 与退出码一致、只读 prune 绝不调用删除分支、超时必须 ≠ 环境故障。`cmd/hno` 覆盖率 77.2%。
+- Isolation 词汇往返被钉住：`String()` 输出必须能被 `ParseIsolation` 解析回来，且 `--isolation` 帮助文本必须列出全部档位、不得出现解析器拒绝的词（我第一版写的 `micro-vm` 就是被这条抓的）。
+- 真实引擎证据（非 double）：`doctor` 8 项全过 exit 0；坏引擎二进制 exit 70 并给出可执行说明；`run -- go version` 返回 `go version go1.26.9 linux/arm64`；`run -- sh -c "exit 5"` 透传 5；`prune` 零删除、残留 0。`-race` 全绿，真实门 26.0s，核心覆盖率 73.2% 不变。
+
+### 🐛 Known gap（记录未改，见台账 D-36）
+- `hno sandbox doctor --image <不存在的镜像>` 报 **“all 8 checks passed” / exit 0**，而同一镜像走 `run` 是 exit 70 并带引擎原文。`Diagnose` 没有镜像项，`Probe` 又刻意不 pull 并吞掉缺镜像；而 `docker.ImagePresent`（两种 dialect 都已实现）唯一的调用者是集成测试。修法是加一项 image 检查，但它会改动检查集合、可能把 CI 里的 doctor 从绿翻红 ⇒ 需要授权，未在本轮范围内。
+
 ### 🐛 Fixed (B4e：可执行文案不再指向不存在的东西)
-- `Diagnose` 的「有孤儿环境」修复建议此前是 `hno sandbox prune --orphans`，`ProvisionError`/`defaultFixes` 里还有 `hno sandbox doctor` —— **本仓库没有这个 CLI**，照做的用户只会去找一条不存在的命令。现改为真实入口：`Sandbox.Reclaimer()` 的 `Sweep(ctx)`（只看不删）与 `Prune(ctx)`（回收），以及 `Sandbox.Diagnose(ctx)`。
+- `Diagnose` 的「有孤儿环境」修复建议此前是 `hno sandbox prune --orphans`，`ProvisionError`/`defaultFixes` 里还有 `hno sandbox doctor` —— **当时本仓库没有这个 CLI**，照做的用户只会去找一条不存在的命令（B4f 已把这个命令补上，见上方 `hno sandbox` 条目；当时先改为真实可走的 Go 入口）。现改为真实入口：`Sandbox.Reclaimer()` 的 `Sweep(ctx)`（只看不删）与 `Prune(ctx)`（回收），以及 `Sandbox.Diagnose(ctx)`。
 - 同一批文案里 `WithMinIsolation(IsolationContainer)` 也是不存在的功能名（真名 `WithMinimumIsolation`），已改正。
 - docker provider 的截断标记 `[hno sandbox: output truncated …]` 长得像命令，改为 `[output truncated at the provider capture ceiling]`，信息不减。
 
