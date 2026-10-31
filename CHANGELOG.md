@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 🐛 Fixed (B4e：可执行文案不再指向不存在的东西)
+- `Diagnose` 的「有孤儿环境」修复建议此前是 `hno sandbox prune --orphans`，`ProvisionError`/`defaultFixes` 里还有 `hno sandbox doctor` —— **本仓库没有这个 CLI**，照做的用户只会去找一条不存在的命令。现改为真实入口：`Sandbox.Reclaimer()` 的 `Sweep(ctx)`（只看不删）与 `Prune(ctx)`（回收），以及 `Sandbox.Diagnose(ctx)`。
+- 同一批文案里 `WithMinIsolation(IsolationContainer)` 也是不存在的功能名（真名 `WithMinimumIsolation`），已改正。
+- docker provider 的截断标记 `[hno sandbox: output truncated …]` 长得像命令，改为 `[output truncated at the provider capture ceiling]`，信息不减。
+
+### ✨ Added (B4e：DX 门禁)
+- `pkg/hno/sandbox/dx_gate_test.go`：解析包自己的导出面，校验所有用户可读的字符串字面量 —— `With*` 必须是真实导出的函数、`Type.Member` 必须解析得到、不得出现 shell 命令形状（没有 CLI 就不许指 CLI）。
+- `pkg/hno/sandbox/dx_docs_gate_test.go`：`website/guide/sandbox-runtime.md` 的 `Limits`/`Timeouts` 表格数字必须等于 `DefaultLimits()`/`DefaultTimeouts()` 的**规范渲染**（`Provision` 是 `2m0s`，不是「120s」）；文中裸标识符（`With`/`Act`/`Isolation`/`Cap`/`Overflow`/`Mount`/`Profile`/`Err`/`Class` 前缀族）必须在 `sandbox ∪ tools/run ∪ sandbox/graph` 中存在；每个 ```go 围栏必须能被 `go/parser` 解析。符号宇宙取三目录并集：过窄的取域会把真实 API 报成假名，那会训练读者忽略门禁。
+- 新 guide 页 `website/guide/sandbox-runtime.md`：30 秒上手、真实默认值表、`Diagnose`、孤儿回收、人审批准、图内审批、项目/文件/产物、从遗留 `Executor` 迁移（含适配器拒绝面）、toolkit 失败可见性，附 recipes。已挂进 VitePress 英文侧栏；中文页未建，故未加中文链接（避免 404）。
+
+### 🧪 Tests (B4e)
+- 门禁本身被反证：把 `WithMinIsolation`、`[hno sandbox: …]`、`1 MiB`、`120s`、`WithRunOutputMax` 与一个缺逗号的代码围栏塞回去，六条断言各自命中并附原文；恢复后全绿。四批文档错误由门禁在我自查之前抓出（`sandbox.Context`、`OverflowFail`、`WithRunOutputMax`、表格数字渲染形式）。
+- 覆盖：`pkg/hno/sandbox` 73.2%（不变）；`-race` 四包全绿；真实引擎门 28.8s 通过、残留 0（改动了 provider 输出标记，故重跑）。
+
 ### ✨ Added / 🐛 Fixed (D-33：`run_code` 的失败终于可被机器看见)
 - `pkg/hno/tools/run/toolkit.go`：环境故障改为**双写**——既保留调用方一直在读的结果 map（新增 `failure` 摘要键），也返回**非 nil 的包装 error**（`errors.Is(err, ErrNoProvider)` 等哨兵仍可判别）。此前失败被折进 map 并返回 `nil`，agent 的 logger、逐调用 outcome、任何监控与 Policy 全都把这当成一次成功的工具调用。
 - 分类规则只用**本层可证的事实**，不把「用户代码失败」误报成「环境坏了」（遗留 executor 对非 0 退出也返回 error，无脑上抛会制造反向混淆）：哨兵 → `TimedOut` → `ExitCode > 0` → 其余判环境故障。依据是 `exitCodeOf` 对非 `*exec.ExitError` 返回 `-1`、e2b 以 `Result{ExitCode: -1}` 表示「未观测到退出码」，因此正的退出码确实意味着代码跑过。

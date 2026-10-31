@@ -205,3 +205,18 @@ failureClass: contract
 后续可选项（需另行授权，不在本轮范围）：
 1. 让 `pkg/hno/agent` 在 handler error 分支也渲染结果 map（目前 map 被丢弃）。
 2. 给 podman 的「输出捕获故障」加哨兵，消除 D-33 那条窄不精确。
+
+## B4e 完成记录（实测）
+
+交付：文案修正（3 处虚构 CLI 引用 + 1 处假选项名 + provider 截断标记）；两道 DX 门禁
+（dx_gate_test.go 文案↔导出面、dx_docs_gate_test.go guide 数字/名字/围栏↔代码）；
+新 guide 页 sandbox-runtime.md 并挂上英文侧栏。
+
+门禁先于我看见的 4 个文档错误：sandbox.Context / OverflowFail / WithRunOutputMax /
+Provision 应渲染为 2m0s。反证 6 项各命中一次。
+
+未做（需另行决定）：
+1. `hno sandbox` CLI —— 文案曾指向它，说明设计里想要；现在文案改指 Go API。
+   若真建 CLI，门禁应扩到校验子命令存在。
+2. `website/` 无 node_modules，未跑 `npm run docs:build`（需联网安装）。
+3. 中文 guide 页未翻译，故未加 zh 链接。
