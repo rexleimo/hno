@@ -56,3 +56,54 @@ recipes / CLI / guide 的示例数字与 `Diagnose` 实际文案一致（设计�
 - 顺带修掉三个 B1/B2 遗留真缺陷：锁序死锁、Resumable 重建分支不可达、懒建/重建丢 provenance。
 - 决策 D-24..D-27 已入台账。
 - 遗留：B4b sandboxgraph 检查点/恢复对接尚未开始；B4c run 兼容适配器未动；B4d 需授权。
+
+## B4b 工作项（本轮执行）
+
+```yaml
+type: planned
+targets:
+  - pkg/hno/sandbox/graph/node.go        (new)
+  - pkg/hno/sandbox/graph/graph.go       (new)
+  - pkg/hno/sandbox/graph/*_test.go      (new)
+allowedWrites:
+  - pkg/hno/sandbox/graph/**             # 仅新建包
+failureClass: contract
+explicitIntent: plan
+```
+
+**复用而非再造**：`pkg/hno/graph` 已有 HITL（`Interrupt/RequestInterrupt/Suspension/
+ResumeRerun/ResumeHandoff`）与 `Checkpointer/Checkpoint{Kind:EntryInterrupt}`。B4b 只做
+`sandbox.ApprovalPendingError ↔ graph.Interrupt` 的双向映射，不改 `pkg/hno/graph` 语义。
+
+完成门（每条先写会失败的测试）：
+1. 审批中断成为图的中断，而不是终态失败。
+2. `graph.Resume({approved:true})` 在**同一台盒**里跑完原请求。
+3. 盒被换掉 ⇒ 继承 B4a 的 `ApprovalEnvironmentChangedError`，不消耗授权。
+4. 原请求恰好执行一次（重入不得双跑）。
+5. `Report`/artifacts 进图状态，供后继节点分支。
+6. 中断条目落 checkpoint：含 session/approval/lineage，够新进程重取会话并作答。
+7. Deny 是可分支的输出，配合 `WithRefusalFails()` 也可变错误。
+
+边界（诚实记录，不夸大）：`pkg/hno/graph` 明示「跨进程重建不属本片」，故 B4b 承诺的是
+**沙箱侧跨进程可重取同一会话/审批**，不是图引擎跨进程续跑。
+
+## B4b 完成记录（实测）
+
+交付：`pkg/hno/sandbox/graph/{graph.go,ask.go}` + 22 条测试，覆盖率 78.9%。
+映射不改 `pkg/hno/graph` 语义：`*sandbox.ApprovalPendingError ↔ coregraph.Interrupt`
+（`Payload` 带 `Ask{Session,Approval,Lineage,Question}`），人类响应经
+`InterruptResponse` 读回并翻成 `Approve/Deny + Resume`。完成门 7 条全部有测试，
+反证 3 条（去钉定 / 不转中断 / 去守卫）均对旧实现失败。
+
+### 本轮发现、**未修**的上游缺陷（超出本工作项 allowedWrites，需授权另开）
+
+1. `pkg/hno/sandbox`：`WithCreateIfMissing(false)` 在无 session store 时是**静默 no-op**。
+   文档（`sandbox.go:295`）承诺「unknown id 返回 `*StaleSessionError`」，实现被
+   `if sb.cfg.Sessions != nil` 守卫，故存储缺失时照常开机。后果：跨进程读旧 checkpoint
+   作答会为没人请求的 session 起一台新盒。绕法（本包内）：先用 `Diagnose` 的审批计数排除，
+   再以 `Awaiting()` 精确定位；`graph_test.go` 用 `t.Log` 显式记录，不静默。
+2. `pkg/hno/graph`：`checkShape` 对**可选** schema 属性也会校验——它遍历 schema properties
+   并用 `respMap[name]`（缺失即 nil）判定，与自身注释「缺失的属性只由 required 管，这里跳过」
+   矛盾。后果：声明 `reason?: string` 会让所有省略该字段的回答被 `ErrInvalidResponse` 拒掉。
+   绕法（本包内）：默认 schema 只声明决策字段，`reason` 仍接受但不声明（改动在
+   `graph.go` 注释中说明）。

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ Added (B4b 图内沙箱节点)
+- 新包 `pkg/hno/sandbox/graph`：把沙箱的人工审批接进控制流图。`Node(name, sess, req, opts...)` 运行一个请求，遇到 `ActRequireApproval` 时把它变成图自己的中断（`Payload` 携带 `Ask{Session,Approval,Lineage,Question}`），人类在图侧的 `Resume` 回答被翻成 `Session.Approve/Deny + Resume`，工作最终落在人被展示的那台环境里。不新增第二套 HITL，也不改 `pkg/hno/graph` 语义。
+- 节点自持稳定运行身份（钉 `Request.ID`）：否则图重入等待节点时每次都是「等价但新的请求」，审批 id 会变，回答指向无人持有的标识。
+- 拒绝是可分支的输出（`Result.Refused`）而非节点故障，`WithRefusalFails()` 供没有拒绝分支的图把它变成错误；命令失败仍按运行合同作为数据上报。
+- 跨进程续答：`FromCheckpoint`/`Outstanding` 从检查点流里找出未答问题，`Ask.Answer` 在另一个进程里重新取回该会话并消耗裁决（不创建会话）；`ErrNoApproval` 与 `ErrNoSession` 分开，各自只说自己能证明的事。
+
+### 🐛 Fixed (B4b)
+- 图侧中断的响应 schema 只声明决策字段：`pkg/hno/graph.checkShape` 会把未提供的可选属性判为类型不符（与其自身注释矛盾），声明可选 `reason` 会拒掉所有省略它的回答；本包不声明，但仍接受该字段。
+
+### 🧪 Tests (B4b)
+- 22 条，新包覆盖率 78.9%。反证三项对旧实现失败：去掉 id 钉定 ⇒ 稳定性与同盒完成两条失败；审批错误直接透出而不转图中断 ⇒ 挂起断言失败；去掉存在性守卫 ⇒ 跨进程两条失败。另有一条 `t.Log` 显式记录核心缺陷（`WithCreateIfMissing(false)` 在无 store 时为静默 no-op），不做静默绕过。
+
 ### ✨ Added (B4a HITL 审批闭环)
 - `sandbox/approval.go`：把「要求人工批准」从一条错误变成一条完整回路。`Session.Awaiting()` 让调用方在不装 Observer 的情况下看到被挂起的请求（工作流要么汇报卡住、要么只会卡住）；`Approve/Deny/Resume` 落人类裁决并按原请求原文重跑，重跑仍走完整策略/钩子/审计路径，权限不靠绕过维持。
 - 审批记录绑定环境：`PendingApproval.BoundToEnvironment()` 明示这次授权是否关于某台具体盒子（策略先于开机跑，新会话首次挂起本就没有盒子可绑）。已授予的批准免除自身义务，否则再提交会无限挂起。
