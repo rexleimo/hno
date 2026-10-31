@@ -173,7 +173,7 @@ const maxCLICapture = 32 << 20
 // truncatedMark is appended when a stream was cut. It lives in the captured text
 // because a provider-level boolean would be lost by every caller that only keeps
 // the string.
-const truncatedMark = "\n[hno sandbox: output truncated at the provider capture ceiling]"
+const truncatedMark = "\n[output truncated at the provider capture ceiling]"
 
 // Run executes the command and returns its outcome.
 func (r execRunner) Run(ctx context.Context, cmd Command) (Outcome, error) {

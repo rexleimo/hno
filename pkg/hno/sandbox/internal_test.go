@@ -226,7 +226,7 @@ func TestRemediationRoundTrip(t *testing.T) {
 	err := &UnavailableError{
 		Tried: []Attempt{{Provider: "boxlite", Reason: "no /dev/kvm", Fixes: []string{"apt install qemu"}}},
 		Want:  IsolationMicroVM,
-		Fixes: []string{"hno sandbox doctor"},
+		Fixes: []string{"run Sandbox.Diagnose(ctx) to compare the provider, isolation floor, and capabilities"},
 	}
 	f := AsFailure(err)
 	if len(f.Fixes) == 0 {

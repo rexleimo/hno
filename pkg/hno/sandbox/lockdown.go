@@ -207,11 +207,14 @@ func isoForNames(attempts []Attempt) Isolation {
 
 // defaultFixes gives the "nothing worked" case something actionable to say.
 func defaultFixes(best Isolation) []string {
-	fixes := []string{"hno sandbox doctor"}
+	// These strings are the only part of a failed selection most callers ever read, so
+	// every name in them has to exist. A test in this package parses the exported surface
+	// and rejects remediation text that points at an option or command nobody shipped.
+	fixes := []string{"run Sandbox.Diagnose(ctx) to see which provider answered, at what isolation, and why each attempt failed"}
 	if best.Rank() < IsolationMicroVM.Rank() {
 		fixes = append(fixes,
 			"install a micro-VM engine (BoxLite needs /dev/kvm on Linux or Hypervisor.framework on macOS)",
-			"or set WithMinIsolation(IsolationContainer) if container isolation is acceptable here",
+			"or set WithMinimumIsolation(IsolationContainer) if container isolation is acceptable here",
 		)
 	}
 	return fixes

@@ -498,7 +498,10 @@ func (sb *Sandbox) newEnvironment(ctx context.Context, id string, spec SessionSp
 		Expose:    append([]PortMap(nil), expose...),
 	})
 	if err != nil {
-		fix := "hno sandbox doctor"
+		// The remedy has to be something the caller can actually do from inside a Go
+		// program: no sandbox CLI ships today, so pointing at one would turn an
+		// actionable hint into a dead end.
+		fix := "run Sandbox.Diagnose(ctx) to compare the provider, isolation floor, and capabilities before retrying"
 		return nil, boxProvenance{}, &ProvisionError{Provider: sb.name, Stage: "create environment", Cause: err, Fix: fix}
 	}
 	sb.emit(ctx, Event{Kind: EventReady, SessionID: id, Provider: sb.name, Isolation: sb.iso})

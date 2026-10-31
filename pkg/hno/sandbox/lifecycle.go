@@ -503,8 +503,8 @@ func (sb *Sandbox) observeHealth(ctx context.Context, report *DiagReport) {
 		case err != nil:
 			report.Checks = append(report.Checks, Check{Env: "leases", Want: "no orphans", Got: err.Error(), OK: false})
 		case len(orphans) > 0:
-			report.Checks = append(report.Checks, Check{Env: "leases", Want: "no orphans", Got: fmt.Sprint(len(orphans)) + " orphaned", OK: false, Fix: "hno sandbox prune --orphans"})
-			report.Fixes = append(report.Fixes, "hno sandbox prune --orphans")
+			report.Checks = append(report.Checks, Check{Env: "leases", Want: "no orphans", Got: fmt.Sprint(len(orphans)) + " orphaned", OK: false, Fix: "reclaim them through the handle: r, ok := sb.Reclaimer(); r.Prune(ctx) deletes what it reports, or r.Sweep(ctx) first to look before deleting"})
+			report.Fixes = append(report.Fixes, "call Sandbox.Reclaimer() and Prune the leaked environments; Sweep reports them without deleting")
 		default:
 			report.Checks = append(report.Checks, Check{Env: "leases", Want: "no orphans", Got: "0", OK: true})
 		}
