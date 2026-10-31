@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ Added (B4h：站点链接门禁 + 一次真实 docs:build)
+- `docs:build` 第一次被真实跑过（`npm ci` 装依赖，127 包 / 5s，构建 22.1s exit 0），并**渲染验证**新页：
+  `website/.vitepress/dist/guide/sandbox-runtime.html` 115 KB、11 个 h2、侧栏项 "Sandbox Runtime" 与
+  prev/next 均已出现、进 sitemap。
+- 反证给出一个必须记录的负结果：**该站在 `config.mjs` 里设了 `ignoreDeadLinks: true`**，所以往 guide 塞一条
+  `/guide/does-not-exist` 死链后构建仍 **68 秒 exit 0**。⇒ 「docs:build 通过」不是关于链接的证据。
+- 新测试 `TestGuideLinksResolve`：把 guide 里的本地链接解析到真实文件（`/guide/x` → `website/guide/x.md`，
+  兼容 `index.md` / `public/` 资源 / 相对链接），并把同页 `#anchor` 与渲染器的 slug 规则对齐
+  （用小写 + 去掉 `:` 与反引号 + 空格转 `-`，与实测产出 `from-a-shell-hno-sandbox` 一致）。
+  门禁会先**自检站点根路径**再下结论：本站第二次踩同一类 `../../` 少一层的错，表现是「所有链接都是死链」——
+  错的路径伪装成发现，比漏报更坏。
+
+### 📋 Finding（只测量、未修，需决策）
+- 全站实测：**26 个页面共 45 条无法解析的链接**（初版扫描器误报 61 条，修正 `/rss.xml` 这类 public 资源后为 45）。
+  集中在 `/examples/*`（如 `workflow-demo`、`chat-agent`、`file-agent`）与 `api/a2a.md` 的相对链接。
+  新页 `sandbox-runtime.md` 为 0。不在本轮范围内改别人的页面；若要治本需把 `ignoreDeadLinks` 翻成 `false`，
+  那是**全局构建行为变更**、会立刻让现网 45 条变成构建失败 ⇒ 需要明确授权。
+
 ### 🐛 Fixed (B4g / D-36：`Diagnose` 不再对镜像给假绿灯)
 - 真实引擎实测的症状：`hno sandbox doctor --image no-such-image-hno:0` 报 **“all 8 checks passed” / exit 0**，而同一镜像走 `run` 是 exit 70 并带引擎原文（registry 401）。`Diagnose` 里没有镜像项，`Probe` 又刻意不 pull 并把「缺镜像」当无关信息吞掉。现在同一命令报 **exit 1**、点名镜像、给出可执行修复，summary 变为 “1 of 9 checks failed”。
 - 新可选接口 `sandbox.ImageQueryable`（`ImageAvailable(ctx, image)`）：provider 经 **dialect** 用自己的词汇表回答（docker 用 `image inspect`，Apple 解析 `image list`——用错形状会把 usage error 误报成「镜像不存在」）。`docker.ImagePresent` 此前能力已实现、已测，但生产路径调用者为 0；现在核心健康报告真正走它。

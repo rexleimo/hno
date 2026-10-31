@@ -315,3 +315,16 @@ CLI 离线钉桩、guide 说明镜像项与「无法验证不算通过」。
 而"无镜像"这一态在解析后的 handle 上不存在——测试已改为钉住「留空不得豁免验证」。
 
 半径实测：非测试调用点 1 处；七包（含 agent）零破坏；覆盖 73.2%→73.3%，docker 59.6%→62.2%。
+
+## B4h 完成记录（真实构建 + 链接门禁）
+
+npm ci（127 包/5s）+ docs:build（22.1s exit 0）+ 渲染证据（页面 115 KB、11 个 h2、侧栏与
+prev/next 出现、进 sitemap）。构建污染检查：跟踪文件零改动（dist 与 node_modules 均被 ignore，
+rss.xml 生成后仍干净）。
+
+负结果（决定了本轮价值）：`ignoreDeadLinks: true` ⇒ 注入死链 `/guide/does-not-exist` 后构建
+仍 68s exit 0。所以「构建通过」不能当链接证据，TestGuideLinksResolve 才是。
+它当场抓出注入的死链，也抓出我 siteRoot 少一层（`../../website` → `pkg/website`），
+修成自检站点根后再无假报。guide 已恢复原状，链接门禁 0 违规。
+
+全站测量：26 页 / 45 条无法解析（修正扫描器误报后）。翻 `ignoreDeadLinks=false` 属全局变更，未做。

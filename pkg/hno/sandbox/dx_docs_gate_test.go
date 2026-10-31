@@ -396,3 +396,86 @@ func TestGuideFencedMethodCallsExist(t *testing.T) {
 		t.Errorf("fence call gate saw only %d calls; it would silently pass a page with no API usage left in it", checked)
 	}
 }
+
+// linkRe matches a markdown link with its target.
+var linkRe = regexp.MustCompile(`(?m)\[[^\]]*\]\(([^)]+)\)`)
+
+// headingRe matches an ATX heading, capturing the text.
+var headingRe = regexp.MustCompile("(?m)^#{1,6}\\s+(.+?)\\s*$")
+
+// TestGuideLinksResolve exists because this site sets ignoreDeadLinks: true in
+// .vitepress/config.mjs, so `npm run docs:build` completes happily no matter how many links
+// point at pages that were never written. Measured: a deliberately dead /guide/does-not-exist
+// link built clean in 68 seconds with exit 0. A green site build is therefore not evidence
+// about links, and the check has to live where the rest of the guide contract is enforced.
+func TestGuideLinksResolve(t *testing.T) {
+	lines := readGuide(t)
+	body := strings.Join(lines, "\n")
+
+	// Slugs are derived the way the renderer does it: lowercase, drop markup punctuation,
+	// spaces to hyphens. Verified against the built page, which produced
+	// "from-a-shell-hno-sandbox" for "From a shell: `hno sandbox`".
+	slugify := func(s string) string {
+		s = strings.ToLower(strings.TrimSpace(s))
+		s = strings.NewReplacer("`", "", "*", "", ":", "", "—", "-", "–", "-").Replace(s)
+		words := strings.Fields(s)
+		return strings.Join(words, "-")
+	}
+	anchors := map[string]bool{}
+	for _, m := range headingRe.FindAllStringSubmatch(body, -1) {
+		anchors[slugify(m[1])] = true
+	}
+
+	// Third depth from a nested package to the repo root, and the second time this exact
+	// off-by-one made a gate invent findings: a wrong root reads as "every link is dead".
+	// The root is asserted before anything is concluded from it.
+	siteRoot := mustAbs(t, "../../../website")
+	if _, err := os.Stat(filepath.Join(siteRoot, ".vitepress", "config.mjs")); err != nil {
+		t.Fatalf("site root %s is not the VitePress site (%v); the link gate cannot tell a wrong path from a dead link", siteRoot, err)
+	}
+	checked := 0
+	for _, m := range linkRe.FindAllStringSubmatch(body, -1) {
+		target := strings.TrimSpace(m[1])
+		if target == "" {
+			t.Errorf("empty link target in the guide")
+			continue
+		}
+		// External and asset links are out of scope for a local-resolution check.
+		if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") ||
+			strings.HasPrefix(target, "mailto:") {
+			continue
+		}
+		checked++
+		path, frag, _ := strings.Cut(target, "#")
+
+		if frag != "" && path == "" {
+			if !anchors[slugify(frag)] {
+				t.Errorf("guide link %q points at an anchor this page does not produce; headings present: %d", target, len(anchors))
+			}
+			continue
+		}
+
+		if strings.HasPrefix(path, "/") {
+			rel := strings.TrimPrefix(path, "/")
+			if rel == "" {
+				continue
+			}
+			if !strings.HasSuffix(rel, ".md") {
+				rel += ".md"
+			}
+			if _, err := os.Stat(filepath.Join(siteRoot, rel)); err != nil {
+				t.Errorf("guide link %q points at %s, which does not exist under website/; this site ignores dead links, so nothing else will catch it", target, rel)
+			}
+			continue
+		}
+
+		// Relative link: resolve against this page's directory.
+		rel := filepath.Join(filepath.Dir(guidePath(t)), path)
+		if _, err := os.Stat(rel); err != nil {
+			t.Errorf("guide link %q does not resolve to a file (%s)", target, rel)
+		}
+	}
+	if checked == 0 {
+		t.Errorf("the guide contains no local links at all; the link gate would be silently vacuous")
+	}
+}
