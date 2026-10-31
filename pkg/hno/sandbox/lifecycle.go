@@ -362,6 +362,23 @@ func (sb *Sandbox) Diagnose(ctx context.Context) (*DiagReport, error) {
 	}
 	caps := sb.caps.Strings()
 	report.Checks = append(report.Checks, Check{Env: "capabilities", Want: "non-empty", Got: fmt.Sprint(caps), OK: len(caps) > 0})
+	// Declared is not delivered. Two separate facts get reported here because they
+	// need different fixes: a bit the core has no behaviour for is a vocabulary
+	// problem, while a bit with no interface behind it is a provider bug.
+	if dead := sb.caps.Unconsumed(); len(dead) > 0 {
+		names := make([]string, 0, len(dead))
+		for _, c := range dead {
+			names = append(names, c.String())
+		}
+		report.Checks = append(report.Checks, Check{
+			Env:  "capabilities-without-behaviour",
+			Want: "none",
+			Got:  fmt.Sprint(names),
+			OK:   false,
+			Fix:  "these bits are declared but no core path acts on them; do not rely on them, see SemanticsOf",
+		})
+		report.Fixes = append(report.Fixes, fmt.Sprintf("capabilities %v are declared but unimplemented in the core — treat them as absent", names))
+	}
 	if err := sb.provider.Probe(ctx); err != nil {
 		report.Checks = append(report.Checks, Check{Env: "probe", Want: "ok", Got: err.Error(), OK: false, Fix: firstFix(err)})
 		if fix := firstFix(err); fix != "" {

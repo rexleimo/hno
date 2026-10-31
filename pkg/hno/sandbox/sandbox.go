@@ -121,12 +121,31 @@ func (sb *Sandbox) bind(ctx context.Context) error {
 		iso := prov.Isolation()
 		caps := prov.Capabilities()
 		if !iso.AtLeast(sb.cfg.MinIsolation) {
-			tried = append(tried, Attempt{Provider: name, Reason: fmt.Sprintf("isolation %s below required %s", iso, sb.cfg.MinIsolation), Fix: "choose a provider that meets the floor or lower WithMinimumIsolation"})
+			tried = append(tried, Attempt{Provider: name, Isolation: iso, Reason: fmt.Sprintf("isolation %s below required %s", iso, sb.cfg.MinIsolation), Fix: "choose a provider that meets the floor or lower WithMinimumIsolation",
+				Cause: &IsolationError{Provider: name, Want: sb.cfg.MinIsolation, Got: iso}})
 			_ = prov.Close(ctx)
 			continue
 		}
 		if sb.cfg.Egress.Mode == EgressAllowlist && !caps.Has(CapEgressAllowlist) {
-			tried = append(tried, Attempt{Provider: name, Reason: "provider cannot enforce an egress allowlist", Fix: "use a provider with egress control or run with EgressNone"})
+			tried = append(tried, Attempt{Provider: name, Isolation: iso, Reason: "provider cannot enforce an egress allowlist", Fix: "use a provider with egress control or run with EgressNone",
+				Cause: &CapabilityError{Provider: name, Missing: CapEgressAllowlist, Wanted: caps}})
+			_ = prov.Close(ctx)
+			continue
+		}
+		// Claims are reconciled against implementations before the provider is
+		// adopted. A declared capability whose backing interface is absent can never
+		// work, and the alternative is a caller discovering it on their 400th run from
+		// an error message that contradicts itself.
+		if problems := caps.VerifyClaims(prov); len(problems) > 0 {
+			var fix, reason string
+			if ue, ok := problems[0].(*UnimplementedCapabilityError); ok {
+				reason = fmt.Sprintf("declares %q without implementing %s", ue.Capability, ue.Iface)
+				fix = fmt.Sprintf("implement %s or drop the capability from Capabilities()", ue.Iface)
+			} else {
+				reason = problems[0].Error()
+				fix = "fix the provider's capability declaration"
+			}
+			tried = append(tried, Attempt{Provider: name, Isolation: iso, Reason: reason, Fix: fix, Cause: problems[0]})
 			_ = prov.Close(ctx)
 			continue
 		}

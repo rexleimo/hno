@@ -300,6 +300,13 @@ type Attempt struct {
 	Reason    string
 	Fix       string
 	Fixes     []string
+	// Cause keeps the typed reason for the rejection addressable by errors.As.
+	//
+	// Without it the aggregate error flattened everything to prose, so a caller who
+	// wanted to distinguish "this engine cannot do snapshots" from "this engine is
+	// not installed" had to match on the sentence. Prose is for humans; the typed
+	// chain is for code, and both belong in an error the retry layer reads (§16.1).
+	Cause error
 }
 
 // UnavailableError means no provider could satisfy the ask. Fixes are
@@ -313,7 +320,16 @@ type UnavailableError struct {
 
 func (e *UnavailableError) Error() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "no sandbox provider satisfies isolation %s", e.Want)
+	// The headline names the requirement that actually failed. It used to say
+	// "satisfies isolation <level>" unconditionally, even when every provider was
+	// rejected for capability, egress, or a claim it could not back — so the first
+	// line a human or model reads attributed the failure to the wrong axis, and the
+	// real reason was only in the indented list below it.
+	if isolationOnly := e.isolationBlocked(); isolationOnly {
+		fmt.Fprintf(&b, "no sandbox provider satisfies isolation %s", e.Want)
+	} else {
+		fmt.Fprintf(&b, "no sandbox provider can meet this request (isolation floor %s)", e.Want)
+	}
 	if e.Reason != "" {
 		fmt.Fprintf(&b, ": %s", e.Reason)
 	}
@@ -324,6 +340,38 @@ func (e *UnavailableError) Error() string {
 		}
 	}
 	return b.String()
+}
+
+// isolationBlocked reports whether isolation was the only kind of rejection seen.
+//
+// An attempt counts as isolation-caused only when it carries the typed isolation
+// shortfall. Anything else — a missing binary, an egress posture the engine cannot
+// enforce, an unbackable capability claim — means the headline should not blame the
+// isolation floor.
+func (e *UnavailableError) isolationBlocked() bool {
+	if len(e.Tried) == 0 {
+		return true
+	}
+	for _, a := range e.Tried {
+		if _, ok := a.Cause.(*IsolationError); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// Unwrap exposes every attempt cause so errors.As reaches the typed reason.
+func (e *UnavailableError) Unwrap() []error {
+	var out []error
+	if e.Reason != "" {
+		out = append(out, errors.New(e.Reason))
+	}
+	for _, a := range e.Tried {
+		if a.Cause != nil {
+			out = append(out, a.Cause)
+		}
+	}
+	return out
 }
 
 // Class marks provider unavailability as permanent: it is an install problem.
@@ -368,7 +416,30 @@ type CapabilityError struct {
 }
 
 func (e *CapabilityError) Error() string {
+	// The two cases used to share one sentence, which produced a message that
+	// contradicted itself: "provider X lacks capability snapshot (has:
+	// session,snapshot,clone)". The claim set and the implemented interfaces are
+	// separate facts, and when a provider declares a capability it cannot service the
+	// caller must be told that, not pointed at a different engine.
+	if e.Wanted.Has(e.Missing) {
+		return fmt.Sprintf("provider %q declares capability %q but the core cannot service it (declared: %s) — the declaration is not backed by an implementation",
+			e.Provider, e.Missing, strings.Join(e.Wanted.Strings(), ","))
+	}
 	return fmt.Sprintf("provider %q lacks capability %q (has: %s)", e.Provider, e.Missing, strings.Join(e.Wanted.Strings(), ","))
+}
+
+// Remediation separates "wrong engine" from "lying engine".
+func (e *CapabilityError) Remediation() []string {
+	if e.Wanted.Has(e.Missing) {
+		return []string{
+			fmt.Sprintf("provider %q already declares %q: the gap is implementation, not selection", e.Provider, e.Missing),
+			"pick a provider that implements the interface behind the capability, or file the bug against this one",
+		}
+	}
+	return []string{
+		fmt.Sprintf("choose a provider that declares %q", e.Missing),
+		fmt.Sprintf("or drop the request that needs %q", e.Missing),
+	}
 }
 
 // Class marks capability gaps as permanent.

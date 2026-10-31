@@ -495,3 +495,66 @@ B2a 的教训不是「docker provider 有 9 个 bug」，而是**能力位是 pr
 
 离线：`go test -race ./pkg/hno/sandbox/...` 全绿，core 覆盖率 68.7%。
 真实：5/5（工程往返、实时输出、`ClassLost` 注入、引擎侧孤儿清扫、增量流式）。
+
+### 17.6 SB-B2c：能力声明核对 + 真实门 flake 与跨进程数据损毁
+
+本轮从「把 B2b 的测量思路推广到其余能力位」开始，实际产出四类修复。全部有
+真实引擎证据，且两个最严重的缺陷是用**双进程实验**证明的。
+
+**（一）能力位与实现接口从不对账。** 探针打印出的错误自相矛盾：
+
+```
+provider "liar2" lacks capability "snapshot" (has: session,snapshot,clone)
+```
+
+同一句话既否认又承认同一个位，而补救建议（换引擎）是错的——引擎没问题，缺的是
+它的实现。修复：`CapabilitySet.VerifyClaims(Provider)` 在 `Open` 采纳 provider 前
+把声明与核心实际断言的接口对账（表 `interfaceGatedCaps` 从核心自己的断言点推导
+而来，不靠猜），矛盾则拒绝采纳；`CapabilityError` 区分「未声明」与「声明了但无
+实现」，并首次带上 `Remediation()`。
+
+**（二）枚举里的空词汇。** 逐一统计核心查询次数后确认：`CapAudit`、
+`CapIdleSuspend`、`CapQueryStatus`、`CapPTY`、`CapHostedTrust` **没有任何核心代码
+路径消费**（`CapQueryStatus` 在注释里被写成 `Attacher` 的门，实际代码只看
+`CapBackground`）。调用方检查这些位会得到一个不产生任何行为的「是」。
+处理是建语义登记表 `capabilitySemanticsTable`（未接线者显式记录 Owner=""并附
+原因），`Unconsumed()` 经 `Diagnose` 报出，并用
+`TestEveryCapabilityHasDeclaredSemantics` 钉住「枚举长于表」这件事。没有为这些位
+发明语义——那是设计工作，不是修复。
+
+**（三）真实门 flake 的根因：create 与 start 共用一个 deadline。** 门在 4 次里挂
+2 次，症状是 `container start exited nonzero` **且没有任何原因**。小预算
+（`startup_timeout=1200ms`）可确定性复现：create 吃满启动预算，start 拿到已过期
+ctx，CLI 被杀、非零退出、stderr 为空。修复：两步各得独立窗口
+（`startupWindow()`），并新增 `engineFailure()`——被 deadline 杀死时必须说是
+deadline 及窗口长度，有 stderr 时保留引擎原文，全空时如实说「无输出」而不是给
+出一条空原因。顺带发现并修复：`startup_timeout` **写在文档形状里却从未被读取**
+（又一个静默 no-op），现在解析并拒绝未知/畸形键。
+
+**（四）跨进程数据损毁（本轮最严重）。** 原 `Sweep` 用「不在本进程内存 map」判定
+孤儿。双进程实验：A 持有 session 并写入 `victim.txt`，B 调
+`Reclaimer().Prune()`，结果——
+
+```
+修复前： VICTEM LOST: container 477ac2b9… not found     → FAIL（数据被毁）
+修复后： VICTIM survived, content="still in use"        → PASS（B 仍跑过 Prune）
+```
+
+内存 map 对引擎没有权威，而并发进程是 agent/CI 的常态。修复：容器打
+`hno.sandbox.owner`（host/pid/nonce）；`listedContainer` 带引擎自述的
+`Running`；`Sweep` 如实报告全部外来容器；`Prune` **只回收已停止的残骸**，拒删
+外来运行中容器并把拒绝记入 `SkippedPrune()`（空结果不能被读成「没东西可清」）；
+`prune_running` 为显式 opt-in，供单租户机器使用。
+
+同轮修复 probe 泄漏：`Probe` 每次 `create` 一个**固定名**容器且从不删除——每次
+`Open()` 留一个残骸，且并发第二个进程必然撞上 `container already exists`，把健康
+机器误报为不可用引擎（与 B2a 的「说谎 probe」对称的危害）。现在名字带 pid+nonce，
+探测后删除，失败也清理。
+
+自我纠正两处：曾在测试里用固定容器名，并发时自己复现了刚修掉的撞名缺陷（已改
+带 pid）；曾误判「`OverflowFault` 无公开选项可选」，核对 `WithOverflow` 后撤回并
+未动 API。
+
+**证据。** 离线 `go test -race` 全绿，core 覆盖 69.3%、docker provider 57.5%。
+真实门 6 个，单进程连跑 4/4 全绿（修复前 4 次挂 2 次）；**两个进程并发各 6/6
+PASS、零 SKIP、零 FAIL**，并发后引擎侧 `hno.sandbox.managed` 容器残留为 **0**。

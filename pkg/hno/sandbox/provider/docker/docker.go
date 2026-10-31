@@ -30,10 +30,12 @@ package docker
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +61,26 @@ const LabelManaged = labelPrefix + ".managed"
 // label alone could not tell the two apart.
 const LabelProbe = labelPrefix + ".probe"
 
+// LabelOwner records which process created a container.
+//
+// It exists because "not in my map" is not evidence of abandonment. A container
+// belongs to a live process on some host until proven otherwise, and a sweep that
+// decides ownership from one process's memory deletes the containers other sessions
+// are actively using. The label makes ownership a fact readable from the engine.
+const LabelOwner = labelPrefix + ".owner"
+
+// ownerID identifies this process for ownership checks: host, pid, and a per-process
+// nonce, so a recycled pid cannot make a dead process's containers look alive.
+var ownerID = func() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown-host"
+	}
+	var b [3]byte
+	_, _ = rand.Read(b[:])
+	return fmt.Sprintf("%s/%d/%x", host, os.Getpid(), b)
+}()
+
 // Config configures the docker provider.
 type Config struct {
 	// Binary is the container CLI. Defaults to "docker"; "podman" also works
@@ -78,6 +100,12 @@ type Config struct {
 	// sandbox write the host directory, which is a different trust decision
 	// than copying a snapshot in (D-12).
 	AllowBindMounts bool
+	// PruneRunning lets a sweep delete managed containers that are running but not
+	// held by this process. Off by default and only correct on a single-tenant
+	// machine: with two processes sharing an engine, turning this on means either can
+	// destroy the other's live workload. Measured, not theoretical — the default
+	// refusal exists because an experiment reproduced that deletion.
+	PruneRunning bool
 	// StartupTimeout bounds container creation, which is engine control-plane
 	// work rather than user code time (§16.2).
 	StartupTimeout time.Duration
@@ -263,14 +291,16 @@ func (b *boundedBuffer) String() string {
 
 // Provider is the docker/podman container-backed sandbox provider.
 type Provider struct {
-	cfg     sandbox.ProviderConfig
-	d       Config
-	runner  Runner
-	bin     string
-	dial    dialect
-	live    map[string]*Environment
-	mu      syncMu
-	closeTo time.Duration
+	cfg    sandbox.ProviderConfig
+	d      Config
+	runner Runner
+	bin    string
+	dial   dialect
+	live   map[string]*Environment
+	// skippedPrune holds the containers the last Prune refused to delete.
+	skippedPrune []string
+	mu           syncMu
+	closeTo      time.Duration
 }
 
 // New builds a provider from the engine-facing config.
@@ -310,6 +340,27 @@ func NewProvider(cfg sandbox.ProviderConfig) (sandbox.Provider, error) {
 	}
 	if v, ok := cfg.Raw["allow_bind_mounts"].(bool); ok {
 		d.AllowBindMounts = v
+	}
+	// startup_timeout was documented-shaped but never read, so a host that set it
+	// watched nothing happen: the classic silent no-op. It now accepts a duration
+	// string or a time.Duration, and an unusable value is an error rather than a
+	// quietly ignored key.
+	if v, present := cfg.Raw["startup_timeout"]; present {
+		window, err := parseDurationAttr("startup_timeout", v)
+		if err != nil {
+			return nil, err
+		}
+		d.StartupTimeout = window
+	}
+	if v, ok := cfg.Raw["prune_running"].(bool); ok {
+		d.PruneRunning = v
+	}
+	if unknown := unknownRawKeys(cfg.Raw); len(unknown) > 0 {
+		// Unrecognised keys are refused, not skipped. Raw is the engine-specific
+		// passthrough, so a typo here ("startup-timeout") otherwise reads as
+		// configuration that took effect while the provider used a default — the one
+		// failure mode a passthrough map must not have.
+		return nil, fmt.Errorf("sandbox/provider/docker: unrecognised engine attributes %v (known: binary, dialect, allow_bind_mounts, startup_timeout, prune_running)", unknown)
 	}
 	p, err := New(d)
 	if err != nil {
@@ -385,10 +436,26 @@ func (p *Provider) Probe(ctx context.Context) error {
 	// The create-capability question, asked without starting anything and without
 	// pulling. This is the check that caught a CLI answering `version` happily
 	// while its runtime refused every container.
+	probeName := p.probeContainerName()
 	cres, cerr := p.runner.Run(ctx, Command{
 		Bin:  p.bin,
-		Args: append([]string{"create"}, p.createArgsForProbe()...),
+		Args: append([]string{"create"}, p.createArgsForProbe(probeName)...),
 	})
+	// A probe asks a question; it must not leave an answer behind. The container this
+	// create produces was permanent, so every Open() added one stopped container to
+	// the engine, and because the name was derived from the image the second
+	// concurrent process failed with "container already exists" — which reads as an
+	// engine fault and turns a healthy machine into an unavailable provider under
+	// parallelism, the exact situation an agent workload creates.
+	if cerr == nil && cres.Exit == 0 {
+		if removed := strings.TrimSpace(cres.Stdout); removed != "" {
+			_ = p.remove(context.WithoutCancel(ctx), removed)
+		}
+	} else if cres.Exit != 0 {
+		// A failed create may still have registered the name; clean it so the next
+		// probe is not poisoned by this one.
+		_ = p.remove(context.WithoutCancel(ctx), probeName)
+	}
 	if cerr == nil && cres.Exit != 0 {
 		if msg := strings.TrimSpace(cres.Stderr); refusesCreate(msg) {
 			return p.unavailable(
@@ -405,9 +472,9 @@ func (p *Provider) Probe(ctx context.Context) error {
 // createArgsForProbe renders the minimal "can this engine create at all"
 // invocation through the dialect, so the question is asked in the dialect's own
 // syntax rather than assuming Docker flags.
-func (p *Provider) createArgsForProbe() []string {
+func (p *Provider) createArgsForProbe(name string) []string {
 	args := p.dial.createArgs(createSpec{
-		Name:    "hno-probe-" + p.d.Image[:min(6, len(p.d.Image))],
+		Name:    name,
 		Image:   p.probeImage(),
 		Network: "none",
 		Labels:  map[string]string{LabelManaged: "probe", LabelProbe: "true"},
@@ -497,7 +564,7 @@ func (p *Provider) NewEnvironment(ctx context.Context, spec sandbox.EnvSpec) (sa
 		Image:      image,
 		WorkingDir: workspaceCWD(spec.MountMode, p.d.AllowBindMounts),
 		Env:        envMap(spec.Spec.Env),
-		Labels:     labels,
+		Labels:     withOwner(labels),
 		Mounts:     mounts,
 		Network:    "none",
 		CPUCount:   spec.Limits.CPUCount,
@@ -506,16 +573,27 @@ func (p *Provider) NewEnvironment(ctx context.Context, spec sandbox.EnvSpec) (sa
 		Argv:       []string{"sleep", "infinity"},
 	})
 
-	startCtx, cancel := p.bounded(ctx, p.d.StartupTimeout)
-	defer cancel()
-	res, err := p.runner.Run(startCtx, Command{Bin: p.bin, Args: args})
+	// Create and start get separate deadlines.
+	//
+	// They used to share one context, so a create that took most of the startup
+	// budget left start with whatever remained — sometimes nothing. The CLI was then
+	// killed mid-invocation, exited nonzero, and printed no stderr, which surfaced as
+	// "container start exited nonzero" with no reason at all. That was not a rare
+	// engine fault: it reproduced on demand with startup_timeout=1200ms and made the
+	// real-engine gate flake across every test, because the engine's create takes
+	// 1-3s under load. One budget per operation is the whole difference between a
+	// slow step and an impossible step.
+	createCtx, createCancel := p.bounded(ctx, p.startupWindow())
+	res, err := p.runner.Run(createCtx, Command{Bin: p.bin, Args: args})
+	createErr := createCtx.Err()
+	createCancel()
 	if err != nil {
 		return nil, p.unavailable("container create failed", err,
 			fmt.Sprintf("check that image %q exists locally, or pull it deliberately", image))
 	}
 	if res.Exit != 0 {
 		return nil, p.unavailable("container create exited nonzero",
-			errors.New(strings.TrimSpace(res.Stderr)),
+			engineFailure(res, p.startupWindow(), createErr),
 			fmt.Sprintf("image %q may be missing: pull it explicitly, or point the profile at an image that exists", image))
 	}
 	id := strings.TrimSpace(res.Stdout)
@@ -526,12 +604,20 @@ func (p *Provider) NewEnvironment(ctx context.Context, spec sandbox.EnvSpec) (sa
 	// Start is separate from create so a failure between them still has an id
 	// to clean up; a half-created container is exactly the leak that orphan
 	// reclamation is supposed to catch.
-	if sres, err := p.runner.Run(startCtx, Command{Bin: p.bin, Args: []string{"start", id}}); err != nil || sres.Exit != 0 {
+	startCtx, startCancel := p.bounded(ctx, p.startupWindow())
+	sres, err := p.runner.Run(startCtx, Command{Bin: p.bin, Args: []string{"start", id}})
+	startErr := startCtx.Err()
+	startCancel()
+	if err != nil || sres.Exit != 0 {
+		// The cleanup must not inherit a deadline that has already passed, or the
+		// container we are refusing to adopt stays behind as a leak.
 		_ = p.remove(context.WithoutCancel(ctx), id)
 		if err != nil {
-			return nil, p.unavailable("container start failed", err, "inspect daemon capacity and run the CLI manually once")
+			return nil, p.unavailable("container start failed", err, "inspect daemon capacity and run the CLI once by hand")
 		}
-		return nil, p.unavailable("container start exited nonzero", errors.New(strings.TrimSpace(sres.Stderr)), "inspect daemon capacity")
+		return nil, p.unavailable("container start exited nonzero",
+			engineFailure(sres, p.startupWindow(), startErr),
+			fmt.Sprintf("raise WithTimeouts(Setup) / startup timeout above %s, or run `container start %s` by hand to read the engine error", p.startupWindow(), id))
 	}
 
 	env := &Environment{provider: p, id: id, session: spec.SessionID, spec: spec.Spec.Clone()}
@@ -828,3 +914,124 @@ func (p *Provider) Sweep(ctx context.Context) ([]string, error) { return sweeper
 
 // Prune deletes what Sweep reported.
 func (p *Provider) Prune(ctx context.Context) ([]string, error) { return sweeper{p: p}.Prune(ctx) }
+
+// startupWindow is the deadline for one engine control-plane step.
+func (p *Provider) startupWindow() time.Duration {
+	if p.d.StartupTimeout > 0 {
+		return p.d.StartupTimeout
+	}
+	return defaultStartupTimeout
+}
+
+// engineFailure turns a CLI step that did not succeed into the reason a caller can
+// act on.
+//
+// The engine writes real diagnostics to stderr, but a killed process writes none:
+// reporting "exited nonzero" with an empty cause was how a deadline problem masqueraded
+// as an unknown container fault, which is the one class of error a retry layer should
+// not be guessing about.
+func engineFailure(res Outcome, window time.Duration, ctxErr error) error {
+	if msg := strings.TrimSpace(res.Stderr); msg != "" {
+		return errors.New(msg)
+	}
+	if ctxErr != nil || res.Canceled {
+		return fmt.Errorf("the engine command was killed by its own deadline after %s (no engine output): %w", window, context.DeadlineExceeded)
+	}
+	if strings.TrimSpace(res.Stdout) != "" {
+		return errors.New("no stderr; engine wrote to stdout: " + strings.TrimSpace(res.Stdout))
+	}
+	return fmt.Errorf("the container CLI exited %d without any output", res.Exit)
+}
+
+// defaultStartupTimeout bounds one control-plane step when the profile is silent.
+const defaultStartupTimeout = 60 * time.Second
+
+// parseDurationAttr reads a duration attribute that may arrive as a string, an
+// integer of nanoseconds, or a time.Duration, since Raw comes from decoded config
+// where a duration is usually text.
+func parseDurationAttr(key string, v any) (time.Duration, error) {
+	switch t := v.(type) {
+	case time.Duration:
+		return t, nil
+	case string:
+		d, err := time.ParseDuration(t)
+		if err != nil {
+			return 0, fmt.Errorf("sandbox/provider/docker: attribute %q is not a duration: %w", key, err)
+		}
+		return d, nil
+	case int:
+		return time.Duration(t) * time.Second, nil
+	case int64:
+		return time.Duration(t) * time.Second, nil
+	case float64:
+		return time.Duration(t) * time.Second, nil
+	default:
+		return 0, fmt.Errorf("sandbox/provider/docker: attribute %q has unsupported type %T", key, v)
+	}
+}
+
+// knownRawKeys lists the attributes this provider honours.
+var knownRawKeys = map[string]bool{
+	"binary":            true,
+	"dialect":           true,
+	"allow_bind_mounts": true,
+	"startup_timeout":   true,
+	"prune_running":     true,
+}
+
+func unknownRawKeys(raw map[string]any) []string {
+	var out []string
+	for k := range raw {
+		if !knownRawKeys[k] {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// probeContainerName is unique per process and per call, so concurrent probes do
+// not collide on a name the engine treats as global.
+func (p *Provider) probeContainerName() string {
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	stem := p.probeImage()
+	if i := strings.LastIndexAny(stem, "/:"); i >= 0 {
+		stem = stem[i+1:]
+	}
+	if len(stem) > 6 {
+		stem = stem[:6]
+	}
+	return fmt.Sprintf("hno-probe-%s-%d-%x", stem, os.Getpid(), b)
+}
+
+// withOwner adds the owner label without overwriting an explicit value.
+func withOwner(labels map[string]string) map[string]string {
+	out := make(map[string]string, len(labels)+1)
+	for k, v := range labels {
+		out[k] = v
+	}
+	if out[LabelOwner] == "" {
+		out[LabelOwner] = ownerID
+	}
+	return out
+}
+
+// noteSkippedPrune records what a safe prune refused to delete, so the refusal is
+// answerable instead of invisible. Last write wins: the list is operational detail,
+// not a queue that grows without bound.
+func (p *Provider) noteSkippedPrune(refused []string) {
+	p.mu.lock()
+	defer p.mu.unlock()
+	p.skippedPrune = refused
+}
+
+// SkippedPrune reports the containers the last prune declined, naming the owner
+// label so an operator can find the process that is using them.
+func (p *Provider) SkippedPrune() []string {
+	p.mu.lock()
+	defer p.mu.unlock()
+	out := make([]string, len(p.skippedPrune))
+	copy(out, p.skippedPrune)
+	return out
+}

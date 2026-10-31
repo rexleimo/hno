@@ -297,3 +297,61 @@ func TestTailExcerptKeepsTheReason(t *testing.T) {
 		t.Fatal("empty in, empty out")
 	}
 }
+
+// --- capability semantics registry ---------------------------------------
+
+// TestEveryCapabilityHasDeclaredSemantics is the anti-drift guard. A capability bit
+// is a promise in the public vocabulary; the enum growing past the table is how
+// CapAudit and CapIdleSuspend came to be declared, advertised, and consulted by
+// nothing. Adding a bit without recording what the core does with it fails here.
+func TestEveryCapabilityHasDeclaredSemantics(t *testing.T) {
+	seen := map[Capability]bool{}
+	for _, c := range allCapabilities {
+		if seen[c] {
+			t.Fatalf("capability %v listed twice in allCapabilities", c)
+		}
+		seen[c] = true
+		sem, ok := SemanticsOf(c)
+		if !ok {
+			t.Fatalf("capability %v has no semantics entry; either wire it or record that it is unwired", c)
+		}
+		if sem.Owner == "" && sem.Note == "" {
+			t.Fatalf("capability %v is unimplemented but carries no explanation", c)
+		}
+	}
+}
+
+// TestUnconsumedCapabilitiesAreReported keeps the honest record visible: the bits
+// with no core behaviour must be listable, so Preflight and a provider author's own
+// test can see that "declared" is not "delivered".
+func TestUnconsumedCapabilitiesAreReported(t *testing.T) {
+	cs := Capabilities(
+		CapSession, CapAudit, CapIdleSuspend,
+		CapQueryStatus, CapPTY, CapHostedTrust,
+	)
+	got := cs.Unconsumed()
+	names := make(map[string]bool, len(got))
+	for _, c := range got {
+		names[c.String()] = true
+	}
+	for _, want := range []string{"audit", "idle-suspend", "query-status", "pty", "hosted-trust"} {
+		if !names[want] {
+			t.Fatalf("%s should be reported as having no core behaviour, got %v", want, got)
+		}
+	}
+	// And a bit that IS wired must not be swept into the same bucket.
+	for _, c := range got {
+		if c == CapSession {
+			t.Fatal("CapSession is consulted by the core and must not be flagged")
+		}
+	}
+	if honest := Capabilities(CapSession, CapFileBridge).Unconsumed(); len(honest) != 0 {
+		t.Fatalf("a fully-wired set was flagged: %v", honest)
+	}
+}
+
+// sandboxCapabilitiesHas reports whether Capabilities() can carry the bit, which is
+// the same construction providers use.
+func sandboxCapabilitiesHas(c Capability) bool {
+	return Capabilities(c).Has(c)
+}

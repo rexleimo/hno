@@ -20,10 +20,43 @@ type sweeper struct{ p *Provider }
 
 var _ sandbox.LeaseSweeper = sweeper{}
 
-// Sweep returns managed containers this process is no longer holding. It deletes
+// Sweep returns managed containers this process is not holding. It deletes
 // nothing: reporting and reclaiming are separate so a caller can inspect a leaked
 // container before it disappears.
+//
+// The list includes containers another process is running, because they are
+// genuinely foreign to this one and hiding them would make the inventory look clean.
+// Prune is where the safety decision lives.
 func (s sweeper) Sweep(ctx context.Context) ([]string, error) {
+	detail, err := s.Inspect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, o := range detail.Orphans {
+		out = append(out, o.ID)
+	}
+	for _, r := range detail.RunningForeign {
+		out = append(out, r.ID)
+	}
+	return out, nil
+}
+
+// Inspect separates what may be reclaimed from what must not, and says why.
+//
+// The rule changed after a two-process experiment on a real engine: one process held
+// a live session with data written into its container, another process called Prune,
+// and the container was deleted underneath it — because "not in my in-memory map" had
+// been taken as evidence of abandonment. It is not. Concurrent processes on one
+// engine are the normal case for an agent workload or CI, so the only defensible
+// default is that a running container belongs to somebody until the engine says
+// otherwise.
+//
+// Orphans are managed containers this process does not hold and the engine reports as
+// not running: crash residue, safe to reclaim. RunningForeign are managed containers
+// running under another process: reported so an operator can see them, never deleted
+// unless the provider explicitly opted in.
+func (s sweeper) Inspect(ctx context.Context) (*SweepDetail, error) {
 	items, err := s.p.dial.listed(ctx, s.p.runner, s.p.bin)
 	if err != nil {
 		return nil, s.p.unavailable("container listing failed", err,
@@ -33,27 +66,73 @@ func (s sweeper) Sweep(ctx context.Context) ([]string, error) {
 	// provider lock across an engine round trip would stall every other
 	// session's cleanup behind a single slow daemon.
 	live := s.p.liveIDs()
-	var orphans []string
+	detail := &SweepDetail{}
 	for _, it := range items {
-		if _, owned := live[it.ID]; !owned {
-			orphans = append(orphans, it.ID)
+		if _, owned := live[it.ID]; owned {
+			detail.Owned = append(detail.Owned, it)
+			continue
 		}
+		if it.Running {
+			detail.RunningForeign = append(detail.RunningForeign, it)
+			continue
+		}
+		detail.Orphans = append(detail.Orphans, it)
 	}
-	return orphans, nil
+	return detail, nil
 }
 
-// Prune deletes the orphans Sweep reported and returns what it removed.
+// SweepDetail is the engine-side inventory classified by reclaim safety.
+type SweepDetail struct {
+	// Owned is held by this process and is never a sweep candidate.
+	Owned []listedContainer
+	// Orphans is managed, not held here, and not running: safe to reclaim.
+	Orphans []listedContainer
+	// RunningForeign is managed and running under another process. Deleting it is
+	// data loss, so Prune refuses unless the provider opts into PruneRunning.
+	RunningForeign []listedContainer
+}
+
+// Refused names what a safe Prune declined to delete, for an operator report.
+func (d *SweepDetail) Refused() []string {
+	var out []string
+	for _, c := range d.RunningForeign {
+		who := c.Owner
+		if who == "" {
+			who = "unknown owner"
+		}
+		out = append(out, fmt.Sprintf("%s (running, owner %s)", c.ID, who))
+	}
+	return out
+}
+
+// Prune deletes the abandoned containers Sweep reported and returns what it removed.
+//
+// Running containers held by another process are refused by default; the refusal is
+// recorded on the provider so a caller who asked for a prune can see that something
+// was skipped, rather than reading an empty result as "nothing was left".
 func (s sweeper) Prune(ctx context.Context) ([]string, error) {
-	orphans, err := s.Sweep(ctx)
+	detail, err := s.Inspect(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var removed []string
-	for _, id := range orphans {
-		if err := s.p.remove(ctx, id); err != nil {
+	for _, it := range detail.Orphans {
+		if err := s.p.remove(ctx, it.ID); err != nil {
 			return removed, err
 		}
-		removed = append(removed, id)
+		removed = append(removed, it.ID)
+	}
+	if len(detail.RunningForeign) > 0 {
+		if !s.p.d.PruneRunning {
+			s.p.noteSkippedPrune(detail.Refused())
+		} else {
+			for _, it := range detail.RunningForeign {
+				if err := s.p.remove(ctx, it.ID); err != nil {
+					return removed, err
+				}
+				removed = append(removed, it.ID)
+			}
+		}
 	}
 	return removed, nil
 }

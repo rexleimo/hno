@@ -52,10 +52,29 @@ type dialect interface {
 	name() Dialect
 }
 
+// appleListed is the shape Apple's `list --format json` produces. One type rather
+// than an anonymous copy per call site, because two readers of the same engine
+// surface drifting apart is how a container gets silently excluded from a sweep.
+type appleListed struct {
+	ID            string `json:"id"`
+	Configuration struct {
+		Labels map[string]string `json:"labels"`
+	} `json:"configuration"`
+	Status struct {
+		State string `json:"state"`
+	} `json:"status"`
+}
+
 // listedContainer is one managed container as the engine reports it.
 type listedContainer struct {
 	ID      string
 	Session string
+	// Running is the engine's own answer about the container's state. The sweeper
+	// needs it because "foreign to this process" and "abandoned" are different facts,
+	// and deleting a running container somebody else is using is data loss.
+	Running bool
+	// Owner is the process label that created it, for operator-visible attribution.
+	Owner string
 }
 
 // createSpec is everything the create argv needs, kept flat so neither dialect
@@ -176,7 +195,7 @@ func (d dockerDialect) listed(ctx context.Context, r Runner, bin string) ([]list
 		Bin: bin,
 		Args: []string{"ps", "--all", "--no-trunc",
 			"--filter", "label=" + LabelManaged,
-			"--format", "{{.ID}}|{{.Label \"` + LabelSession + `\"}}"},
+			"--format", "{{.ID}}|{{.Label \"` + LabelSession + `\"}}|{{.State}}|{{.Label \"` + LabelOwner + `\"}}"},
 	})
 	if err != nil {
 		return nil, err
@@ -190,14 +209,28 @@ func (d dockerDialect) listed(ctx context.Context, r Runner, bin string) ([]list
 		// always emits `id|label`, but a version that changes the template must not
 		// turn the sweep into a silent no-op: a container the sweeper skips is a
 		// container that leaks.
-		id, session, _ := strings.Cut(line, "|")
-		if session == "<no value>" {
-			session = ""
-		}
-		if id = strings.TrimSpace(id); id == "" {
+		parts := strings.Split(line, "|")
+		id := strings.TrimSpace(parts[0])
+		if id == "" {
 			continue
 		}
-		items = append(items, listedContainer{ID: id, Session: strings.TrimSpace(session)})
+		it := listedContainer{ID: id}
+		if len(parts) > 1 {
+			it.Session = strings.TrimSpace(parts[1])
+			if it.Session == "<no value>" {
+				it.Session = ""
+			}
+		}
+		if len(parts) > 2 {
+			it.Running = strings.EqualFold(strings.TrimSpace(parts[2]), "running")
+		}
+		if len(parts) > 3 {
+			it.Owner = strings.TrimSpace(parts[3])
+			if it.Owner == "<no value>" {
+				it.Owner = ""
+			}
+		}
+		items = append(items, it)
 	}
 	return items, nil
 }
@@ -284,12 +317,7 @@ func (appleDialect) ids(ctx context.Context, r Runner, bin string) ([]string, er
 	// `name` — the id doubles as the name when one was supplied. Reading the
 	// obvious keys would silently return an empty set, which makes the orphan
 	// sweep look healthy while it reclaims nothing.
-	var items []struct {
-		ID            string `json:"id"`
-		Configuration struct {
-			Labels map[string]string `json:"labels"`
-		} `json:"configuration"`
-	}
+	var items []appleListed
 	if err := json.Unmarshal([]byte(strings.TrimSpace(out.Stdout)), &items); err != nil {
 		return nil, fmt.Errorf("parsing container list: %w", err)
 	}
@@ -357,12 +385,7 @@ func (d appleDialect) listed(ctx context.Context, r Runner, bin string) ([]liste
 	if out.Exit != 0 {
 		return nil, fmt.Errorf("listing containers failed: %s", strings.TrimSpace(out.Stderr))
 	}
-	var items []struct {
-		ID            string `json:"id"`
-		Configuration struct {
-			Labels map[string]string `json:"labels"`
-		} `json:"configuration"`
-	}
+	var items []appleListed
 	trimmed := strings.TrimSpace(out.Stdout)
 	if trimmed == "" || trimmed == "[]" {
 		return nil, nil
@@ -375,7 +398,12 @@ func (d appleDialect) listed(ctx context.Context, r Runner, bin string) ([]liste
 		if it.Configuration.Labels[LabelManaged] == "" || it.ID == "" {
 			continue
 		}
-		out2 = append(out2, listedContainer{ID: it.ID, Session: it.Configuration.Labels[LabelSession]})
+		out2 = append(out2, listedContainer{
+			ID:      it.ID,
+			Session: it.Configuration.Labels[LabelSession],
+			Owner:   it.Configuration.Labels[LabelOwner],
+			Running: strings.EqualFold(it.Status.State, "running"),
+		})
 	}
 	return out2, nil
 }

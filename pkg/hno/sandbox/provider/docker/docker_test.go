@@ -1263,3 +1263,168 @@ func TestSinkFaultIsNotSwallowed(t *testing.T) {
 		t.Fatalf("captured output must survive a sink fault: %q", rep.Stdout)
 	}
 }
+
+// --- sweep ownership safety --------------------------------------------
+
+// sweepRunner answers the dialect's inventory query with a mix of running and
+// stopped managed containers, none of which this process holds.
+type sweepRunner struct {
+	items []listedContainer
+	// running marks the ids the docker-format inventory should report as running.
+	states  map[string]string
+	removed []string
+}
+
+func (r *sweepRunner) Run(_ context.Context, c Command) (Outcome, error) {
+	joined := strings.Join(c.Args, " ")
+	switch {
+	case strings.HasPrefix(joined, "ps"), strings.HasPrefix(joined, "list"):
+		var lines []string
+		for _, it := range r.items {
+			state := r.states[it.ID]
+			if state == "" {
+				state = "exited"
+			}
+			lines = append(lines, fmt.Sprintf("%s|%s|%s|%s", it.ID, it.Session, state, it.Owner))
+		}
+		return Outcome{Stdout: strings.Join(lines, "\n")}, nil
+	case strings.HasPrefix(joined, "rm"):
+		parts := strings.Fields(joined)
+		if len(parts) >= 3 {
+			r.removed = append(r.removed, parts[2])
+		}
+		return Outcome{}, nil
+	default:
+		return defaultResponse(c), nil
+	}
+}
+
+func newSweepProvider(t *testing.T, fr *sweepRunner, pruneRunning bool) *Provider {
+	t.Helper()
+	p, err := New(Config{
+		Image: "golang:1.26", Binary: "docker", Runner: fr,
+		PruneRunning: pruneRunning,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return p
+}
+
+// TestPruneNeverDeletesAForeignRunningContainer is the unit-level guard for the
+// two-process data loss measured on a real engine: a container another process is
+// running must be reported, not reclaimed.
+func TestPruneNeverDeletesAForeignRunningContainer(t *testing.T) {
+	ctx := context.Background()
+	fr := &sweepRunner{
+		items: []listedContainer{
+			{ID: "live-other", Session: "other", Running: true, Owner: "host/999/abc"},
+			{ID: "dead-residue", Session: "crashed"},
+		},
+		states: map[string]string{"live-other": "running", "dead-residue": "exited"},
+	}
+	p := newSweepProvider(t, fr, false)
+
+	swept, err := sweeper{p: p}.Sweep(ctx)
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(swept) != 2 {
+		t.Fatalf("Sweep must report both foreign containers, got %v", swept)
+	}
+	removed, err := sweeper{p: p}.Prune(ctx)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	for _, id := range removed {
+		if id == "live-other" {
+			t.Fatal("Prune deleted a running container belonging to another process")
+		}
+	}
+	if len(removed) != 1 || removed[0] != "dead-residue" {
+		t.Fatalf("only the stopped residue should be reclaimed, got %v", removed)
+	}
+	// The refusal has to be answerable, or an empty result reads as "nothing left".
+	skipped := p.SkippedPrune()
+	if len(skipped) != 1 || !strings.Contains(skipped[0], "live-other") {
+		t.Fatalf("the refused container must be recorded, got %v", skipped)
+	}
+	if !strings.Contains(skipped[0], "host/999/abc") {
+		t.Fatalf("the refusal should name the owner so an operator can find the process, got %q", skipped[0])
+	}
+}
+
+// TestPruneRunningIsExplicitOptIn: the destructive behaviour exists for
+// single-tenant machines, but only when asked for.
+func TestPruneRunningIsExplicitOptIn(t *testing.T) {
+	ctx := context.Background()
+	fr := &sweepRunner{
+		items:  []listedContainer{{ID: "live-other", Session: "other", Running: true}},
+		states: map[string]string{"live-other": "running"},
+	}
+	p := newSweepProvider(t, fr, true)
+	removed, err := sweeper{p: p}.Prune(ctx)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(removed) != 1 || removed[0] != "live-other" {
+		t.Fatalf("with PruneRunning the container should be reclaimed, got %v", removed)
+	}
+	if len(p.SkippedPrune()) != 0 {
+		t.Fatalf("nothing was skipped, so nothing should be recorded: %v", p.SkippedPrune())
+	}
+}
+
+// TestStartupTimeoutAttrIsHonoured catches the silent no-op where a documented
+// engine attribute was read by nothing: the provider used one shared deadline for
+// create and start, so a slow create starved start and the failure arrived without a
+// reason.
+func TestStartupTimeoutAttrIsHonoured(t *testing.T) {
+	cfg := sandbox.ProviderConfig{
+		Image: "golang:1.26",
+		Raw:   map[string]any{"binary": "container", "startup_timeout": "2500ms"},
+	}
+	p, err := NewProvider(cfg)
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	prov, ok := p.(*Provider)
+	if !ok {
+		t.Fatalf("NewProvider returned %T", p)
+	}
+	if got := prov.startupWindow(); got != 2500*time.Millisecond {
+		t.Fatalf("startup_timeout was ignored: window = %v", got)
+	}
+	// An unknown key must be refused rather than quietly dropped.
+	if _, err := NewProvider(sandbox.ProviderConfig{Raw: map[string]any{"startupTimeout": "5s"}}); err == nil {
+		t.Fatal("a misspelled attribute must not be silently ignored")
+	}
+	// A malformed duration is an error, not a default.
+	if _, err := NewProvider(sandbox.ProviderConfig{Raw: map[string]any{"startup_timeout": "soon"}}); err == nil {
+		t.Fatal("an unparsable duration must be an error")
+	}
+}
+
+// TestEngineFailureNamesTheDeadline proves that a killed CLI call is reported as a
+// deadline problem instead of "exited nonzero" with nothing to act on.
+func TestEngineFailureNamesTheDeadline(t *testing.T) {
+	// Killed by context, no stderr: the exact shape of the flake.
+	killed := Outcome{Exit: -1, Canceled: true}
+	err := engineFailure(killed, 3*time.Second, context.DeadlineExceeded)
+	if !strings.Contains(err.Error(), "deadline") {
+		t.Fatalf("a deadline kill must say so: %v", err)
+	}
+	if !strings.Contains(err.Error(), "3s") {
+		t.Fatalf("the message should name the window that expired: %v", err)
+	}
+	// Engine wrote a real reason: that reason must survive.
+	real := Outcome{Exit: 1, Stderr: "Error: no such container: abc"}
+	if got := engineFailure(real, time.Minute, nil); !strings.Contains(got.Error(), "no such container") {
+		t.Fatalf("engine stderr must be preserved: %v", got)
+	}
+	// Silent nonzero exit is reported as silence, not as a blank message.
+	quiet := engineFailure(Outcome{Exit: 7}, time.Minute, nil)
+	if strings.TrimSpace(quiet.Error()) == "" {
+		t.Fatal("an empty cause is how an unknown fault reaches a retry layer")
+	}
+}

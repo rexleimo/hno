@@ -140,7 +140,50 @@ bit is a provider's assertion about itself, and nothing enforced it.
 - New real-engine gate `TestRealStreamingIsIncremental`: the container runs
   `echo; sleep 2; echo`, and the two lines must arrive as separate deliveries at
   least 500ms apart with `Report.OutputSent` agreeing with the sink's byte count.
-  A buffered provider cannot pass. Real gates now stand at 5/5.
+  A buffered provider cannot pass.
+- New real-engine gate `TestRealPruneRefusesAnotherProcessesContainer`: a running,
+  managed, foreign container is reported by `Sweep` and refused by `Prune`. Verified
+  under two concurrent gate processes: 6/6 pass each, zero skips, and zero
+  `hno.sandbox.managed` residue left in the engine afterwards.
+### 🐛 Fixed (SB-B2c: claim reconciliation, a flaky gate, and cross-process data loss)
+- **Capability claims were never reconciled with implementations.** A provider that
+  declared `CapSnapshot` without implementing `Snapshotter` produced the message
+  `provider "x" lacks capability "snapshot" (has: session,snapshot,clone)` — denying
+  and affirming the same bit in one line, with a remedy ("choose another engine")
+  pointing away from the real fault. `CapabilitySet.VerifyClaims` now compares the
+  declared set against the interfaces the core actually asserts on, at `Open`, so an
+  unserviceable claim is refused before anything runs; `CapabilityError` distinguishes
+  "not declared" from "declared but unbacked" and carries `Remediation()`.
+- **Five capability bits had no consumer at all** (`CapAudit`, `CapIdleSuspend`,
+  `CapQueryStatus`, `CapPTY`, `CapHostedTrust`): a caller checking them got a yes
+  that produced no behaviour. They are now registered in a semantics table that names
+  what the core does with each bit, reported by `Diagnose` through
+  `CapabilitySet.Unconsumed()`, and pinned by a test that fails when the enum grows
+  past the table. No semantics were invented for them.
+- **The real-engine gate was flaky (2 failures in 4 runs) because `create` and
+  `start` shared one deadline.** A slow create left start with nothing, the CLI was
+  killed, and the failure surfaced as `container start exited nonzero` with no reason
+  whatsoever. Reproduced deterministically at `startup_timeout=1200ms`. Each step now
+  gets its own window, and `engineFailure` reports a killed command as the deadline
+  expiry it is, preserves engine stderr when present, and says so when the engine
+  stayed silent. `startup_timeout` itself was read by nobody — a documented-shaped
+  attribute that silently did nothing; it now parses, and unknown or malformed keys
+  are refused instead of ignored.
+- **`Prune` deleted containers other live processes were using.** Ownership was
+  inferred from this process's in-memory map, which has no authority over the engine.
+  A two-process experiment on a real engine showed it: process A held a session with
+  data written into its container, process B called `Prune`, and A's workload was
+  destroyed (`VICTEM LOST: container … not found`). Containers now carry an owner
+  label, the engine's own running state decides reclaimability, `Prune` reclaims only
+  stopped residue, refusals are recorded in `SkippedPrune()` so an empty result is not
+  misread as a clean engine, and `prune_running` is an explicit opt-in for
+  single-tenant machines. After the fix the same experiment reads
+  `VICTIM survived, content="still in use"`.
+- **`Probe` leaked a container on every `Open()`**, under a name derived from the
+  image, so residue accumulated and a second concurrent process failed with
+  "container already exists" — reporting a healthy machine as an unavailable engine.
+  Probe names are now per-process, and the probe container is removed whether the
+  create passed or failed.
 
 ## [3.0.0] - 2026-09-29
 

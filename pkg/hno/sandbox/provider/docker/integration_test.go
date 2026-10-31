@@ -422,3 +422,66 @@ func TestRealStreamingIsIncremental(t *testing.T) {
 	}
 	_ = runReturned
 }
+
+// TestRealPruneRefusesAnotherProcessesContainer is the regression for the worst
+// defect found on a real engine: Prune deleted a container another live process was
+// using, destroying that session's data. Ownership was inferred from this process's
+// in-memory map, which has no authority over the engine, and concurrent processes are
+// the normal case rather than an edge.
+//
+// The two-process shape is reproduced here honestly: a container started through the
+// CLI with our managed label, running, and unknown to this process's map — the exact
+// view the victim process presented to the attacker.
+func TestRealPruneRefusesAnotherProcessesContainer(t *testing.T) {
+	ctx := context.Background()
+	sb := requireRealEngine(t, ctx)
+	image := testImage(t)
+	bin := dockerBinary()
+
+	// The name is per-process. Using a fixed one reproduced the collision this round
+	// fixed in Probe: two concurrent runs fight over one engine-global name, and the
+	// loser skips (or, worse, reports the engine as broken).
+	name := fmt.Sprintf("hno-foreign-live-%d", os.Getpid())
+	out, err := runCLI(bin, "create", "--name", name, "--network", "none",
+		"--label", LabelManaged+"=true", "--label", LabelSession+"=other-process", image, "sleep", "infinity")
+	if err != nil {
+		t.Skipf("could not create the stand-in container: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		_, _ = runCLI(bin, "start", name)
+		_, _ = runCLI(bin, "rm", "-f", name)
+	})
+	if out, err := runCLI(bin, "start", name); err != nil {
+		t.Fatalf("could not start the stand-in container: %v\n%s", err, out)
+	}
+
+	r, ok := sb.Reclaimer()
+	if !ok {
+		t.Fatal("the docker provider must implement Reclaimer")
+	}
+	ids, err := r.Sweep(ctx)
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	var reported bool
+	for _, id := range ids {
+		if id == name {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Fatalf("the live foreign container should be reported by Sweep, got %v", ids)
+	}
+	removed, err := r.Prune(ctx)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	for _, id := range removed {
+		if id == name {
+			t.Fatal("Prune deleted a RUNNING container owned by another process — that is data loss, not cleanup")
+		}
+	}
+	if _, err := runCLI(bin, "inspect", name); err != nil {
+		t.Fatalf("the running foreign container disappeared: %v", err)
+	}
+}

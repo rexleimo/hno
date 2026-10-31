@@ -569,3 +569,208 @@ func TestStreamingContractPassesWhenOutputArrived(t *testing.T) {
 		t.Fatalf("genuine streaming flagged as a violation: %v", err)
 	}
 }
+
+// --- capability claim verification ---------------------------------------
+
+// unimplEnv declares capabilities it has no interface for.
+type unimplEnv struct{}
+
+func (unimplEnv) ID() string                  { return "env-unimpl" }
+func (unimplEnv) Close(context.Context) error { return nil }
+func (unimplEnv) Exec(context.Context, sandbox.RunSpec, sandbox.ChunkReporter) (*sandbox.Report, error) {
+	return &sandbox.Report{ExitCode: 0}, nil
+}
+
+// unimplProvider claims snapshot/clone/file-bridge and implements none of the
+// interfaces behind them.
+type unimplProvider struct{}
+
+func (unimplProvider) Name() string                 { return "overclaim" }
+func (unimplProvider) Isolation() sandbox.Isolation { return sandbox.IsolationNone }
+func (unimplProvider) Capabilities() sandbox.CapabilitySet {
+	return sandbox.Capabilities(sandbox.CapSession, sandbox.CapSnapshot, sandbox.CapClone, sandbox.CapFileBridge)
+}
+func (unimplProvider) Probe(context.Context) error { return nil }
+func (unimplProvider) Close(context.Context) error { return nil }
+func (unimplProvider) NewEnvironment(context.Context, sandbox.EnvSpec) (sandbox.Environment, error) {
+	return unimplEnv{}, nil
+}
+
+// TestOpenRefusesUnimplementableClaims is the class fix the streaming audit
+// generalised into: a capability set is a provider asserting about itself, and the
+// assertion was never reconciled with the code. Before this check, the contradiction
+// surfaced only on the first Checkpoint call, as an error message that said the
+// provider "lacks capability snapshot" while listing snapshot as present — telling
+// the caller to switch engines when the engine was fine and its implementation was
+// missing.
+func TestOpenRefusesUnimplementableClaims(t *testing.T) {
+	ctx := context.Background()
+	if err := sandbox.RegisterProvider("overclaim", func(sandbox.ProviderConfig) (sandbox.Provider, error) {
+		return unimplProvider{}, nil
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { sandbox.UnregisterProvider("overclaim") })
+
+	_, err := sandbox.Open(ctx,
+		sandbox.WithProvider("overclaim"),
+		sandbox.WithAllowedProviders("overclaim"),
+		sandbox.WithMinimumIsolation(sandbox.IsolationNone),
+	)
+	if err == nil {
+		t.Fatal("Open must refuse a provider whose declared capabilities cannot be honoured")
+	}
+	var ue *sandbox.UnimplementedCapabilityError
+	if !errors.As(err, &ue) {
+		t.Fatalf("want *UnimplementedCapabilityError, got %T: %v", err, err)
+	}
+	// The message must not contradict itself.
+	if strings.Contains(err.Error(), "lacks capability") {
+		t.Fatalf("error still uses the contradiction wording: %v", err)
+	}
+	if len(ue.Remediation()) == 0 {
+		t.Fatal("an unimplementable claim needs a provider-side remedy")
+	}
+	// And the remedy must not send the caller to another engine.
+	joined := strings.Join(ue.Remediation(), " ")
+	if !strings.Contains(joined, "implement") {
+		t.Fatalf("remediation should name the missing interface, got: %s", joined)
+	}
+}
+
+// honestProvider carries every interface the reconciliation table gates on, so the
+// table cannot be extended without a provider that satisfies it being exercised.
+type honestProvider struct{ unimplProvider }
+
+func (honestProvider) Name() string { return "honest" }
+func (honestProvider) Files(context.Context, sandbox.Environment) (sandbox.FileService, error) {
+	return nil, errors.New("unused")
+}
+func (honestProvider) Snapshot(context.Context, sandbox.Environment, string) (sandbox.SnapshotHandle, error) {
+	return sandbox.SnapshotHandle{}, errors.New("unused")
+}
+func (honestProvider) Restore(context.Context, sandbox.Environment, sandbox.SnapshotHandle) error {
+	return errors.New("unused")
+}
+func (honestProvider) DeleteSnapshot(context.Context, sandbox.SnapshotHandle) error {
+	return errors.New("unused")
+}
+func (honestProvider) Clone(context.Context, sandbox.Environment, string) (sandbox.Environment, error) {
+	return nil, errors.New("unused")
+}
+func (honestProvider) Status(context.Context, sandbox.RunRef) (sandbox.RunState, *sandbox.Report, error) {
+	return sandbox.RunStateUnknown, nil, errors.New("unused")
+}
+func (honestProvider) Attach(context.Context, sandbox.RunRef, sandbox.ChunkReporter) error {
+	return errors.New("unused")
+}
+func (honestProvider) Suspend(context.Context, sandbox.Environment) error {
+	return errors.New("unused")
+}
+func (honestProvider) Resume(context.Context, string) (sandbox.Environment, error) {
+	return nil, errors.New("unused")
+}
+func (honestProvider) Leases(context.Context) ([]string, error) { return nil, nil }
+
+// TestVerifyClaimsAcceptsAProviderThatCarriesTheInterfaces: the check must reject
+// contradictions, not capabilities in general.
+func TestVerifyClaimsAcceptsAProviderThatCarriesTheInterfaces(t *testing.T) {
+	caps := sandbox.Capabilities(sandbox.CapSession, sandbox.CapSnapshot, sandbox.CapClone, sandbox.CapFileBridge, sandbox.CapBackground)
+	if problems := caps.VerifyClaims(honestProvider{}); len(problems) > 0 {
+		t.Fatalf("an honest claim set was rejected: %v", problems)
+	}
+	// Same set, same table, provider without the interfaces: must flag all four.
+	if problems := caps.VerifyClaims(unimplProvider{}); len(problems) != 4 {
+		t.Fatalf("want 4 contradictions, got %d: %v", len(problems), problems)
+	}
+}
+
+// TestDiagnoseReportsCapabilityWithoutBehaviour proves the finding is observable. A
+// check nobody can see is the same silent no-op it exists to detect, so this asserts
+// against the reference provider — the one that really does declare bits the core has
+// no behaviour for.
+func TestDiagnoseReportsCapabilityWithoutBehaviour(t *testing.T) {
+	ctx := context.Background()
+	sb := openHandle(t)
+	diag, err := sb.Diagnose(ctx)
+	if err != nil {
+		t.Fatalf("Diagnose: %v", err)
+	}
+	var hit bool
+	var fix string
+	for i := range diag.Checks {
+		if diag.Checks[i].Env == "capabilities-without-behaviour" {
+			hit = true
+			fix = diag.Checks[i].Fix
+			if diag.Checks[i].OK {
+				t.Fatal("the reference provider declares unwired bits, so this check must not read as OK")
+			}
+		}
+	}
+	if !hit {
+		names := make([]string, 0)
+		for _, c := range diag.Checks {
+			names = append(names, c.Env)
+		}
+		t.Fatalf("diagnose never reported the unwired capabilities; checks: %v", names)
+	}
+	if fix == "" {
+		t.Fatal("a finding without a fix is only a complaint")
+	}
+	// And the fix text must reach the same list a caller iterates for remedies.
+	var listed bool
+	for _, f := range diag.Fixes {
+		if strings.Contains(f, "unimplemented in the core") {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Fatalf("the remedy must appear in DiagReport.Fixes, got %v", diag.Fixes)
+	}
+}
+
+// TestCapabilityErrorNeverContradictsItself is the regression that started this
+// round. The probe printed:
+//
+//	provider "liar2" lacks capability "snapshot" (has: session,snapshot,clone)
+//
+// — a sentence that denies and affirms the same bit, in one line, and whose remedy
+// ("choose another engine") was wrong because the engine was fine and its
+// implementation was missing.
+func TestCapabilityErrorNeverContradictsItself(t *testing.T) {
+	declared := sandbox.Capabilities(sandbox.CapSession, sandbox.CapSnapshot, sandbox.CapClone)
+
+	// Case 1: the bit IS declared, so the gap is implementation.
+	lying := &sandbox.CapabilityError{Provider: "liar2", Missing: sandbox.CapSnapshot, Wanted: declared}
+	msg := lying.Error()
+	if strings.Contains(msg, "lacks capability") {
+		t.Fatalf("message still denies a declared capability: %s", msg)
+	}
+	if !strings.Contains(msg, "not backed by an implementation") {
+		t.Fatalf("message must name the real gap: %s", msg)
+	}
+	rem := strings.Join(lying.Remediation(), "\n")
+	if strings.Contains(rem, "choose a provider that declares") {
+		t.Fatalf("remedy sends the caller to select a capability it already has:\n%s", rem)
+	}
+
+	// Case 2: the bit is genuinely absent — the original wording is correct there.
+	missing := &sandbox.CapabilityError{Provider: "plain", Missing: sandbox.CapSnapshot,
+		Wanted: sandbox.Capabilities(sandbox.CapSession)}
+	if !strings.Contains(missing.Error(), "lacks capability") {
+		t.Fatalf("a true gap should still read as a gap: %s", missing.Error())
+	}
+	if len(missing.Remediation()) == 0 {
+		t.Fatal("capability errors must carry a remedy")
+	}
+	// Neither message may list a bit as both present and missing.
+	for _, e := range []*sandbox.CapabilityError{lying, missing} {
+		text := e.Error()
+		for _, c := range e.Wanted.Strings() {
+			if strings.Contains(text, `lacks capability "`+c+`"`) && strings.Contains(text, "has: ") &&
+				strings.Contains(strings.SplitAfter(text, "has: ")[1], c) {
+				t.Fatalf("self-contradictory message: %s", text)
+			}
+		}
+	}
+}
