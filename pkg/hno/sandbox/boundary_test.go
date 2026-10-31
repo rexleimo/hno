@@ -3,6 +3,7 @@ package sandbox_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -253,6 +254,33 @@ func (overclaimProvider) Isolation() sandbox.Isolation { return sandbox.Isolatio
 // TestKernelBoundaryVocabularyIsRoundTripped guards the CLI's --expect and the guide's
 // names the same way the isolation vocabulary is guarded: a typo must not silently
 // become a different verdict.
+// TestBoundaryErrorStringsAreTheirOwnContract covers the two typed errors' text inside this
+// package. They were exercised only from cmd/hno, where the calls do not count toward this
+// package's coverage and, more importantly, nothing here pinned the wording. Actionable
+// strings are an API surface without a compiler (D-34): an empty or drifted Remediation()
+// would still have left every test green.
+func TestBoundaryErrorStringsAreTheirOwnContract(t *testing.T) {
+	unsupported := &sandbox.BoundaryUnsupportedError{Provider: "quiet"}
+	if !strings.Contains(unsupported.Error(), "quiet") || !strings.Contains(unsupported.Error(), "KernelBoundaryQueryable") {
+		t.Errorf("Error() %q neither names the provider nor the interface to implement", unsupported.Error())
+	}
+	if !strings.Contains(unsupported.Remediation(), "KernelBoundaryQueryable") {
+		t.Errorf("Remediation() %q does not repeat what must be implemented", unsupported.Remediation())
+	}
+
+	budget := &sandbox.BoundaryBudgetError{Boxes: 9}
+	if !strings.Contains(budget.Error(), "9") {
+		t.Errorf("Error() %q does not show the rejected box count", budget.Error())
+	}
+	rem := budget.Remediation()
+	if !strings.Contains(rem, "2") || !strings.Contains(rem, fmt.Sprint(sandbox.MaxBoundaryBoxes)) {
+		t.Errorf("Remediation() %q does not state the accepted range", rem)
+	}
+	if !strings.Contains(rem, fmt.Sprint(sandbox.DefaultBoundaryBoxes)) {
+		t.Errorf("Remediation() %q does not offer the default the caller can omit", rem)
+	}
+}
+
 func TestKernelBoundaryVocabularyIsRoundTripped(t *testing.T) {
 	for _, want := range []sandbox.KernelBoundary{
 		sandbox.BoundaryUnmeasured,
