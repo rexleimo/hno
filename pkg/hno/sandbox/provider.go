@@ -166,9 +166,15 @@ type ProviderConfig struct {
 	Image     string
 	Formation Formation
 	Endpoint  string
-	Timeout   Duration
-	Labels    map[string]string
-	Raw       map[string]any // engine-specific passthrough, opaque to core
+	// Timeout bounds one engine control-plane step: creating and starting an
+	// environment. It is not a dial budget — a provider that has to reach a daemon
+	// answers that separately — because the window that matters here is how long the
+	// engine may take to render a box. The docker provider used to be fed the
+	// connection timeout, so a 3s dial default silently capped container startup and
+	// every busy-engine run died in a deadline the caller never configured.
+	Timeout Duration
+	Labels  map[string]string
+	Raw     map[string]any // engine-specific passthrough, opaque to core
 }
 
 // Duration is an int64 nanosecond span kept serialisable for adapters.

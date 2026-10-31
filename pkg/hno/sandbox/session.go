@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -39,9 +40,10 @@ type Session struct {
 	// stateSource names how this environment got the state it has, for reports.
 	stateSource string
 
-	runs     int
-	queued   int
-	lastSeen time.Time
+	runs      int
+	queued    int
+	lastSeen  time.Time
+	createdAt time.Time // absolute-lifetime anchor for Timeouts.SessionTTL
 
 	lock       chan struct{} // capacity from Limits.SessionMaxConcurrentRuns
 	snapshots  []SnapshotHandle
@@ -68,7 +70,7 @@ func (s *Session) StateSource() string {
 func (s *Session) Status() SessionStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	expires := s.lastSeen.Add(s.sb.cfg.Timeouts.SessionTTL)
+	expires, _ := s.deadlineLocked(time.Now())
 	return SessionStatus{
 		ID:           s.id,
 		State:        s.state,
@@ -125,6 +127,9 @@ func (s *Session) RunProject(ctx context.Context, proj Project, opts ...RunOptio
 // provider without CapFileBridge gets a *CapabilityError rather than a host-side
 // fallback (§5, D-05).
 func (s *Session) Files() (FileService, error) {
+	if err := s.checkAlive(ctx0()); err != nil {
+		return nil, err
+	}
 	bridge, ok := s.sb.provider.(FileBridge)
 	if !s.sb.caps.Has(CapFileBridge) || !ok {
 		return nil, &CapabilityError{Provider: s.provider, Missing: CapFileBridge, Wanted: s.sb.caps}
@@ -222,8 +227,54 @@ func (s *Session) Setup(ctx context.Context, script string) error {
 
 // RecordInput declares a workspace file so a rebuild materialises it again.
 func (s *Session) RecordInput(ctx context.Context, in Input) error {
-	step := Step{Kind: StepMaterialize, Path: in.Path, Digest: inputDigest(in)}
-	return s.record(step)
+	src, err := s.replayableInput(in)
+	if err != nil {
+		return err
+	}
+	step := Step{Kind: StepMaterialize, Path: in.Path, Digest: inputDigest(in), Input: src}
+	if err := s.record(step); err != nil {
+		return err
+	}
+	// Recording is not the same as writing. The file has to be in this environment too,
+	// or a session that only records never has its input.
+	req := Request{Inputs: []Input{*src}}
+	if len(src.Bytes) == 0 && src.HostPath == "" && src.Reader == nil {
+		req = Request{Inputs: []Input{in}}
+	}
+	if err := s.runStateful(ctx, req, "record input "+in.Path); err != nil {
+		s.dropLastStep()
+		return err
+	}
+	return nil
+}
+
+// replayableInput keeps the part of an Input that a later rebuild can read again.
+//
+// A Reader is single use: recording it would produce a step whose content no rebuild can
+// reproduce, which is the promise this used to break. Inline bytes are kept as they are;
+// a host path is read now, so the recorded step holds the bytes that existed at record
+// time rather than whatever the path happens to contain on the next attempt.
+func (s *Session) replayableInput(in Input) (*Input, error) {
+	if in.Path == "" {
+		return nil, fmt.Errorf("record input requires a path")
+	}
+	if in.Reader != nil {
+		return nil, &UnrecoverableInputError{Path: in.Path, Cause: "a Reader cannot be replayed: it has already been consumed by the time the session records it", Fix: "pass Bytes, or HostPath with AllowHostPaths enabled, so a rebuild can read the same content again"}
+	}
+	if in.Bytes != nil {
+		out := in
+		out.Reader = nil
+		return &out, nil
+	}
+	if in.HostPath != "" {
+		raw, err := os.ReadFile(in.HostPath)
+		if err != nil {
+			return nil, fmt.Errorf("sandbox: record input %q: cannot read %q for replay: %w", in.Path, in.HostPath, err)
+		}
+		mode := in.Mode
+		return &Input{Path: in.Path, Bytes: raw, Mode: mode, Executable: in.Executable}, nil
+	}
+	return nil, fmt.Errorf("sandbox: record input %q has no content", in.Path)
 }
 
 // Phase runs one named phase, recording start/finish for downstream resumption.
@@ -245,6 +296,9 @@ func (s *Session) Phase(ctx context.Context, name string, req Request, opts ...R
 
 // Checkpoint saves the environment state for a later rollback (§17, D-14).
 func (s *Session) Checkpoint(ctx context.Context, name string) (SnapshotHandle, error) {
+	if err := s.checkAlive(ctx); err != nil {
+		return SnapshotHandle{}, err
+	}
 	snap, ok := s.sb.provider.(Snapshotter)
 	if !s.sb.caps.Has(CapSnapshot) || !ok {
 		return SnapshotHandle{}, &CapabilityError{Provider: s.provider, Missing: CapSnapshot, Wanted: s.sb.caps}
@@ -287,6 +341,9 @@ func (s *Session) Checkpoint(ctx context.Context, name string) (SnapshotHandle, 
 
 // Restore rolls the environment back to a checkpoint (§16.4).
 func (s *Session) Restore(ctx context.Context, handle SnapshotHandle) error {
+	if err := s.checkAlive(ctx); err != nil {
+		return err
+	}
 	snap, ok := s.sb.provider.(Snapshotter)
 	if !s.sb.caps.Has(CapSnapshot) || !ok {
 		return &CapabilityError{Provider: s.provider, Missing: CapSnapshot, Wanted: s.sb.caps}
@@ -316,6 +373,9 @@ func (s *Session) Restore(ctx context.Context, handle SnapshotHandle) error {
 // near nothing; on an engine without CapClone it is a *CapabilityError, never a
 // silent shared-directory write (§15).
 func (s *Session) CloneAs(ctx context.Context, as string) (*Session, error) {
+	if err := s.checkAlive(ctx); err != nil {
+		return nil, err
+	}
 	clone, ok := s.sb.provider.(Cloner)
 	if !s.sb.caps.Has(CapClone) || !ok {
 		return nil, &CapabilityError{Provider: s.provider, Missing: CapClone, Wanted: s.sb.caps}
@@ -484,9 +544,126 @@ func (s *Session) Wait(ctx context.Context, ref RunRef, timeout time.Duration) (
 	}
 }
 
+// deadlineLocked reports when this session stops being usable and which limit decided
+// it. Both halves of the documented keep-alive are honoured here: SessionTTL is an
+// absolute lifetime measured from creation, and Idle is measured from the last
+// activity. A zero duration disables that half instead of expiring instantly, because
+// "unset" and "expire immediately" are different claims.
+//
+// Before this, Timeouts.Idle had no consumer anywhere and SessionTTL only produced an
+// ExpiresAt that nothing acted on, so the promised "expire then reclaim" never
+// happened: an untouched session kept its environment for the life of the process
+// (D-09, §197).
+func (s *Session) deadlineLocked(now time.Time) (time.Time, string) {
+	var best time.Time
+	cause := ""
+	if ttl := s.sb.cfg.Timeouts.SessionTTL; ttl > 0 {
+		if d := s.createdAt.Add(ttl); best.IsZero() || d.Before(best) {
+			best, cause = d, "session-ttl"
+		}
+	}
+	if idle := s.sb.cfg.Timeouts.Idle; idle > 0 {
+		if d := s.lastSeen.Add(idle); best.IsZero() || d.Before(best) {
+			best, cause = d, "idle"
+		}
+	}
+	return best, cause
+}
+
+// expiredAtLocked reports whether the keep-alive has run out at now.
+func (s *Session) expiredAtLocked(now time.Time) bool {
+	deadline, _ := s.deadlineLocked(now)
+	return !deadline.IsZero() && !now.Before(deadline)
+}
+
+// ExpireNow releases the session as though its keep-alive had run out. It exists for
+// an operator who wants the host resource back immediately, and for tests, which must
+// not sleep to prove a timeout works.
+func (s *Session) ExpireNow(ctx context.Context) error {
+	cause := s.CauseOfExpiry()
+	return s.expire(ctx, cause)
+}
+
+// CauseOfExpiry names the limit that fired or would fire: "session-ttl", "idle", or
+// "keep-alive" when neither is configured.
+func (s *Session) CauseOfExpiry() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, cause := s.deadlineLocked(time.Now())
+	if cause == "" {
+		return "keep-alive"
+	}
+	return cause
+}
+
+// expire releases the environment and moves the session to StateReleased. The recorded
+// spec survives: an expired session is not a corrupted one, and the same id may be
+// provisioned again, which is what makes it safe to hand control to the TTL at all.
+func (s *Session) expire(ctx context.Context, cause string) error {
+	s.mu.Lock()
+	if s.state == StateReleased || s.state == StateCorrupted {
+		s.mu.Unlock()
+		return nil
+	}
+	env := s.env
+	s.env = nil
+	s.state = StateReleased
+	s.mu.Unlock()
+
+	if env != nil {
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.sb.cfg.Timeouts.Cleanup)
+		err := env.Close(cctx)
+		cancel()
+		if err != nil {
+			s.sb.emit(ctx, Event{Kind: EventHookFault, SessionID: s.id, Provider: s.provider,
+				Detail: map[string]any{"stage": "expire-cleanup", "error": err.Error()}})
+		}
+	}
+	s.sb.emit(ctx, Event{Kind: EventSessionExpired, SessionID: s.id, Provider: s.provider,
+		Detail: map[string]any{"cause": cause}})
+	return nil
+}
+
+// checkAlive is the gate for operations that reach the environment without going
+// through reserve. Expiry is enforced rather than merely reported: a session that says
+// it is usable after its keep-alive ran out is the same silent-no-op class as a config
+// key nobody reads.
+func (s *Session) checkAlive(ctx context.Context) error {
+	s.mu.Lock()
+	expired := s.expiredAtLocked(time.Now())
+	state := s.state
+	s.mu.Unlock()
+	if !expired {
+		return nil
+	}
+	_ = s.expire(ctx, s.CauseOfExpiry())
+	return expiredStateError(s.id, state)
+}
+
+// expiredStateError is the single wording for "the keep-alive ran out", so an operator
+// sees the same remedy wherever the gate fires.
+func expiredStateError(id string, from SessionState) *StateError {
+	return &StateError{
+		SessionID: id,
+		State:     from,
+		Action:    "use session",
+		Allowed:   []SessionState{StateReady, StateBusy},
+		Reason:    "keep-alive ran out; the environment was released and the recorded spec was kept",
+		Fix:       "call Session again with WithCreateIfMissing to re-provision from the recorded spec, or WithTimeouts to raise Idle/SessionTTL",
+	}
+}
+
 // reserve takes the session lock, honouring the configured lock mode (§15).
 func (s *Session) reserve(ctx context.Context, queue bool) error {
 	s.mu.Lock()
+	// Expiry is decided under the same lock that admits work, so a run cannot slip in
+	// against an environment that is being released.
+	if s.expiredAtLocked(time.Now()) {
+		state := s.state
+		s.mu.Unlock()
+		_ = s.expire(ctx, s.CauseOfExpiry())
+		return expiredStateError(s.id, state)
+	}
 	switch {
 	case s.closed:
 		s.mu.Unlock()
@@ -699,3 +876,6 @@ func (d *DriftReport) sortedItems() []string {
 	sort.Strings(out)
 	return out
 }
+
+// ctx0 is the context for gates that have none of their own.
+func ctx0() context.Context { return context.Background() }

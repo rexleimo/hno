@@ -511,3 +511,230 @@ func TestRealPruneRefusesAnotherProcessesContainer(t *testing.T) {
 		t.Fatalf("the running foreign container disappeared: %v", err)
 	}
 }
+
+// TestRealReadinessProbeSeesARealListener proves the in-guest port probe against a
+// service that genuinely is, and genuinely is not, listening. It calls the provider's
+// ReadinessProber directly because the docker provider does not yet declare
+// CapBackground, and the core only accepts a ReadyProbe on a detached run — so going
+// through Request.Expose-style probing here would test a path the provider has not
+// opted into, and the assertion would be about the wrong thing.
+func TestRealReadinessProbeSeesARealListener(t *testing.T) {
+	ctx := context.Background()
+	image := testImage(t)
+	dockerBinary() // fails fast when the CLI is absent
+	if os.Getenv("HNO_SANDBOX_DOCKER") == "" {
+		t.Skip("B2 real-engine gate not exercised: set HNO_SANDBOX_DOCKER=1")
+	}
+	p, err := New(Config{Image: image, Binary: dockerBinary()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	env, err := p.NewEnvironment(ctx, sandbox.EnvSpec{SessionID: "probe-real", Image: image})
+	if err != nil {
+		t.Fatalf("NewEnvironment: %v", err)
+	}
+	t.Cleanup(func() { _ = env.Close(context.Background()) })
+
+	// The port is chosen so its hex form contains letters: /proc/net/tcp prints
+	// uppercase, and a port like 39217 (0x9911) would match under a lowercase bug too.
+	const port = 44713
+	probe := sandbox.ReadyProbe{Port: port}
+
+	// Ask about a port nothing listens on first. Reporting ready here would mean the
+	// probe is not looking at the guest at all.
+	ready, observed, err := p.ProbeReady(ctx, env, probe)
+	if err != nil {
+		var uns *sandbox.UnsupportedProbeError
+		if errors.As(err, &uns) {
+			t.Skipf("image %s cannot be asked about a port: %s", image, uns.Fix)
+		}
+		t.Fatalf("ProbeReady(closed port): %v", err)
+	}
+	if ready {
+		t.Fatalf("a port with no listener was reported ready; observed %q", observed)
+	}
+
+	// Start a real listener in its own session. A plain `cmd &` is a child of the exec
+	// session and dies when that exec returns, so the probe would then be waiting on a
+	// process that was never going to exist.
+	listener := "import socket, time\n" +
+		"s = socket.socket()\n" +
+		"s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" +
+		"s.bind((\"0.0.0.0\", 44713))\n" +
+		"s.listen(5)\n" +
+		"time.sleep(300)\n"
+	files, err := p.Files(ctx, env)
+	if err != nil {
+		t.Fatalf("Files: %v", err)
+	}
+	if err := files.Write(ctx, "l.py", []byte(listener), 0o644); err != nil {
+		t.Fatalf("write listener source: %v", err)
+	}
+	if _, err := env.Exec(ctx, sandbox.RunSpec{
+		RunID:   "probe-start",
+		Request: sandbox.Request{Runtime: "shell", Code: "setsid python3 /workspace/l.py >/dev/null 2>&1 </dev/null & sleep 2; kill -0 $(pgrep -f 'python3 /workspace/l.py') 2>/dev/null && echo alive || echo dead"},
+	}, nil); err != nil {
+		t.Fatalf("start listener: %v", err)
+	}
+
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		ready, observed, err = p.ProbeReady(ctx, env, probe)
+		if err != nil {
+			t.Fatalf("ProbeReady(listening port): %v", err)
+		}
+		if ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a real listener on :%d was not detected; last observation %q", port, observed)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if strings.TrimSpace(observed) == "" {
+		t.Fatal("a ready answer should say what it saw")
+	}
+}
+
+func TestRealRebuildRestoresRecordedState(t *testing.T) {
+	ctx := context.Background()
+	sb := requireRealEngine(t, ctx)
+	image := testImage(t)
+
+	sess, err := sb.Session(ctx, "rebuild-real", sandbox.WithCreateIfMissing(true))
+	if err != nil {
+		t.Fatalf("Session: %v", err)
+	}
+	if got := sess.Status().Image; got != image {
+		t.Fatalf("session image = %q, want the gate image %q", got, image)
+	}
+	// Two declared effects the rebuilt box cannot possibly have unless replay ran.
+	if err := sess.Setup(ctx, "mkdir -p /app/reported && printf 'built-by-replay' > /app/reported/marker"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if err := sess.RecordInput(ctx, sandbox.Input{Path: "inputs/spec.txt", Bytes: []byte("payload-42")}); err != nil {
+		t.Fatalf("RecordInput: %v", err)
+	}
+
+	rep, err := sess.Rebuild(ctx)
+	if err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	if rep.StateSource != "base image" {
+		t.Fatalf("a from-spec rebuild must report that it inherited nothing, got %q", rep.StateSource)
+	}
+	if rep.Cached != 0 {
+		t.Fatalf("a fresh container cannot have inherited a step, yet %d were skipped", rep.Cached)
+	}
+	if len(rep.Replayed) < 2 {
+		t.Fatalf("rebuild replayed %d steps, want the setup and the recorded input: %+v", len(rep.Replayed), rep.Replayed)
+	}
+
+	// The evidence is the file existing in the new container, not the report saying it
+	// tried.
+	check, err := sess.Exec(ctx, sandbox.Shell("cat /app/reported/marker 2>/dev/null; echo ---; cat /workspace/inputs/spec.txt 2>/dev/null || cat inputs/spec.txt 2>/dev/null"))
+	if err != nil {
+		t.Fatalf("verify Exec: %v", err)
+	}
+	joined := check.Stdout + check.Stderr
+	if !strings.Contains(joined, "built-by-replay") {
+		t.Fatalf("the setup step did not survive a real rebuild; engine output %q", joined)
+	}
+	if !strings.Contains(joined, "payload-42") {
+		t.Fatalf("the recorded input did not survive a real rebuild; engine output %q", joined)
+	}
+}
+
+// TestRealExpiredSessionReclaimsTheContainer is the TTL promise measured against a live
+// engine rather than the in-memory double. The design says an expired session emits
+// EventSessionExpired and is reclaimed; on a real engine "reclaimed" has to mean the
+// container is gone, because a stopped-but-present container is a leak the host pays for.
+func TestRealExpiredSessionReclaimsTheContainer(t *testing.T) {
+	ctx := context.Background()
+	image := testImage(t)
+	if os.Getenv("HNO_SANDBOX_DOCKER") == "" {
+		t.Skip("B2 real-engine gate not exercised: set HNO_SANDBOX_DOCKER=1")
+	}
+	var mu sync.Mutex
+	var kinds []sandbox.EventKind
+	events := sandbox.ObserverFunc(func(_ context.Context, ev sandbox.Event) error {
+		mu.Lock()
+		defer mu.Unlock()
+		kinds = append(kinds, ev.Kind)
+		return nil
+	})
+
+	if err := Register(); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	p, err := New(Config{Image: image, Binary: dockerBinary()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	env, err := p.NewEnvironment(ctx, sandbox.EnvSpec{SessionID: "ttl-real", Image: image})
+	if err != nil {
+		t.Fatalf("NewEnvironment: %v", err)
+	}
+	envID := env.ID()
+	running, err := ContainerRunning(ctx, envID, dockerBinary(), "")
+	if err != nil || !running {
+		t.Fatalf("the container should be running after create (running=%v err=%v)", running, err)
+	}
+
+	// Close is what the core calls when a session expires, so the question is whether
+	// that leaves a container behind on the engine.
+	if err := env.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if running, err := ContainerRunning(ctx, envID, dockerBinary(), ""); err == nil && running {
+		t.Fatal("the closed environment's container is still running on the engine")
+	}
+
+	// And the handle-level promise: expiry emits EventSessionExpired and no later run
+	// pretends the environment is still there.
+	sb, err := sandbox.Open(ctx,
+		sandbox.WithProvider("docker"),
+		sandbox.WithAllowedProviders("docker"),
+		sandbox.WithImage(image),
+		sandbox.WithMinimumIsolation(sandbox.IsolationContainer),
+		sandbox.WithAttrs(map[string]any{"binary": dockerBinary()}),
+		sandbox.WithObserver(events),
+		sandbox.WithTimeouts(sandbox.Timeouts{Idle: 50 * time.Millisecond, Provision: 2 * time.Minute}),
+	)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = sb.Close() }()
+
+	sess, err := sb.Session(ctx, "ttl-handle", sandbox.WithCreateIfMissing(true))
+	if err != nil {
+		t.Fatalf("Session: %v", err)
+	}
+	if _, err := sess.Exec(ctx, sandbox.Shell("echo alive")); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	_, err = sess.Exec(ctx, sandbox.Shell("echo after"))
+	if err == nil {
+		t.Fatal("an idle-expired session accepted a later run")
+	}
+
+	mu.Lock()
+	sawExpired := false
+	for _, k := range kinds {
+		if k == sandbox.EventSessionExpired {
+			sawExpired = true
+		}
+	}
+	mu.Unlock()
+	if !sawExpired {
+		t.Fatal("expiry emitted no EventSessionExpired, so a dashboard watching sessions sees a session that vanished without a cause")
+	}
+	if st := sess.Status().State; st != sandbox.StateLost && st != sandbox.StateReleased {
+		t.Fatalf("an expired session reports %s, want lost or released", st)
+	}
+}

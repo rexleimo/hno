@@ -140,14 +140,18 @@ type Config struct {
 // Timeouts are the handle-level knobs. They always bound, never disable; a
 // zero value resolves to the documented default.
 type Timeouts struct {
-	Probe        time.Duration // default 5s, cached 60s (§16.5)
-	Connect      time.Duration // default 3s
-	Provision    time.Duration // default 120s: image pull plus boot
-	Exec         time.Duration // default 30s
-	Setup        time.Duration // boot budget inside Exec (§16.2)
-	Collect      time.Duration // default 30s
-	Drain        time.Duration // post-kill output rescue, default 200ms
-	Idle         time.Duration // default 15m
+	Probe     time.Duration // default 5s, cached 60s (§16.5)
+	Connect   time.Duration // default 3s
+	Provision time.Duration // default 120s: image pull plus boot
+	Exec      time.Duration // default 30s
+	Setup     time.Duration // boot budget inside Exec (§16.2)
+	Collect   time.Duration // default 30s
+	Drain     time.Duration // post-kill output rescue, default 200ms
+	// Idle releases a session this long after its last activity. Set it negative for no
+	// idle limit.
+	Idle time.Duration // default 15m
+	// SessionTTL is the absolute lifetime, measured from creation and independent of how
+	// busy the session stays. Set it negative for no absolute limit.
 	SessionTTL   time.Duration // default 30m (D-09)
 	Cleanup      time.Duration // default 10s
 	ApprovalHold time.Duration // default 5m before a suspended run expires
@@ -365,10 +369,18 @@ func (c *Config) resolve() error {
 		if c.Timeouts.Drain == 0 {
 			c.Timeouts.Drain = def.Drain
 		}
-		if c.Timeouts.Idle == 0 {
+		// A negative limit means "no limit" and normalises to the disabled zero rather
+		// than to the default. Without it there was no way to ask for a session that
+		// never ages: leaving the field alone was indistinguishable from not having
+		// decided, which the defaults then overwrote.
+		if c.Timeouts.Idle < 0 {
+			c.Timeouts.Idle = 0
+		} else if c.Timeouts.Idle == 0 {
 			c.Timeouts.Idle = def.Idle
 		}
-		if c.Timeouts.SessionTTL == 0 {
+		if c.Timeouts.SessionTTL < 0 {
+			c.Timeouts.SessionTTL = 0
+		} else if c.Timeouts.SessionTTL == 0 {
 			c.Timeouts.SessionTTL = def.SessionTTL
 		}
 		if c.Timeouts.Cleanup == 0 {

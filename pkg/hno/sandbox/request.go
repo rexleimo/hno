@@ -183,8 +183,19 @@ func (r Request) clone() Request {
 
 // hasPayload reports whether the request actually asks for work. An empty
 // request is a configuration error, never a no-op run.
+//
+// Declaring content without a command is work: placing files is what a recorded input
+// does, and what rebuilding one has to do again. It used to be rejected unless a Runtime
+// was also named, which made "write this file back" an illegal request and therefore made
+// every rebuild of a session that had recorded an input fail before reaching a provider.
 func (r Request) hasPayload() bool {
-	return len(r.Argv) > 0 || (r.Runtime != "" && (r.Code != "" || len(r.Files) > 0 || len(r.Inputs) > 0))
+	if len(r.Argv) > 0 {
+		return true
+	}
+	if r.Runtime != "" && (r.Code != "" || len(r.Files) > 0 || len(r.Inputs) > 0) {
+		return true
+	}
+	return len(r.Inputs) > 0 || len(r.Files) > 0 || r.Workspace != nil
 }
 
 // Validate rejects requests that must never reach a provider.

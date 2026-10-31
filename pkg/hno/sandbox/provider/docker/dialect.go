@@ -87,11 +87,16 @@ type createSpec struct {
 	Labels     map[string]string
 	Mounts     []mount
 	Network    string
-	CPUCount   int
-	MemoryMB   int64
-	PidsLimit  int
-	Argv       []string
-	ReadOnly   bool
+	// Runtime names the OCI runtime the engine should boot the box under, e.g.
+	// "runsc" for gVisor. Empty means the engine default. This is how the design's
+	// syscall-filtered rung (§12.2) is reached without a second provider: the isolation
+	// differs, the lifecycle vocabulary does not.
+	Runtime   string
+	CPUCount  int
+	MemoryMB  int64
+	PidsLimit int
+	Argv      []string
+	ReadOnly  bool
 }
 
 func newDialect(d Dialect, bin string) dialect {
@@ -126,6 +131,9 @@ func (d dockerDialect) probe(ctx context.Context, r Runner, bin string) (bool, s
 
 func (dockerDialect) createArgs(s createSpec) []string {
 	args := []string{"create", "--pull=never"}
+	if s.Runtime != "" {
+		args = append(args, "--runtime", s.Runtime)
+	}
 	if s.Name != "" {
 		args = append(args, "--name", s.Name)
 	}
@@ -272,6 +280,9 @@ func (d appleDialect) probe(ctx context.Context, r Runner, bin string) (bool, st
 // here, and the engine refuses to pull when the image is absent anyway).
 func (appleDialect) createArgs(s createSpec) []string {
 	args := []string{"create"}
+	if s.Runtime != "" {
+		args = append(args, "--runtime", s.Runtime)
+	}
 	if s.Name != "" {
 		args = append(args, "--name", s.Name)
 	}
@@ -478,4 +489,19 @@ func memString(b int64) string {
 func ImagePresent(ctx context.Context, image, binary string, d Dialect) (bool, error) {
 	dial := newDialect(d, binary)
 	return dial.hasImage(ctx, execRunner{}, binary, image)
+}
+
+// ContainerRunning reports whether an engine object is running, asked in the
+// dialect's own vocabulary.
+//
+// It exists for the same reason ImagePresent does: `inspect --format` is a docker flag
+// and Apple's CLI rejects it with a usage error. A caller that hard-codes the docker
+// shape then reads "not running" from a healthy container, which is how a working
+// environment gets classified as lost.
+func ContainerRunning(ctx context.Context, id, binary string, d Dialect) (bool, error) {
+	if strings.TrimSpace(id) == "" {
+		return false, fmt.Errorf("sandbox/provider/docker: ContainerRunning needs a container id")
+	}
+	dial := newDialect(d, binary)
+	return dial.running(ctx, execRunner{}, binary, id)
 }

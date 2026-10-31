@@ -770,10 +770,24 @@ type StateError struct {
 	State     SessionState
 	Action    string
 	Allowed   []SessionState
+	// Reason explains why the state is what it now is. It is set when the transition
+	// was not the caller's doing -- an expired keep-alive, a lost environment -- because
+	// a bare "state released cannot use session" leaves the caller guessing whether
+	// they released it or the runtime did.
+	Reason string
+	// Fix names the call that would make the action legal.
+	Fix string
 }
 
 func (e *StateError) Error() string {
-	return fmt.Sprintf("session %q in state %s cannot %s (valid: %s)", e.SessionID, e.State, e.Action, joinStates(e.Allowed))
+	msg := fmt.Sprintf("session %q in state %s cannot %s (valid: %s)", e.SessionID, e.State, e.Action, joinStates(e.Allowed))
+	if e.Reason != "" {
+		msg += ": " + e.Reason
+	}
+	if e.Fix != "" {
+		msg += "; fix: " + e.Fix
+	}
+	return msg
 }
 
 // Class marks illegal transitions as permanent: the caller must change state
@@ -855,3 +869,25 @@ func (e *ExposeConflictError) Remediation() string {
 	return "declare the mapping when the session is created, in SessionSpec.Expose, and start a new session; " +
 		"Request.Expose on an existing session can only reuse what that session already published"
 }
+
+// UnrecoverableInputError says a recorded input cannot be re-created by a rebuild.
+//
+// It is separate from a generic error because the remedy is different: the caller has to
+// change what they recorded, not retry the run. Retrying a rebuild that has nothing to
+// write back is the same failure forever.
+type UnrecoverableInputError struct {
+	Path  string
+	Cause string
+	Fix   string
+}
+
+func (e *UnrecoverableInputError) Error() string {
+	msg := fmt.Sprintf("sandbox: input %q is not recoverable: %s", e.Path, e.Cause)
+	if e.Fix != "" {
+		msg += "; fix: " + e.Fix
+	}
+	return msg
+}
+
+// Class is permanent: no retry changes what a recorded step contains.
+func (e *UnrecoverableInputError) Class() FailureClass { return ClassPermanent }

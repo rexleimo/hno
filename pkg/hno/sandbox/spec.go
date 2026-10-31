@@ -58,9 +58,15 @@ type Step struct {
 	// Argv is the exact command line the core ran. Rebuild prefers it over
 	// reconstructing flags from a tool name, because a reconstructed command is
 	// how a rebuilt environment silently differs from the original (§17.1).
-	Argv     []string
-	Script   string // body for StepSetup
-	Path     string // workspace-relative target for materialize
+	Argv   []string
+	Script string // body for StepSetup
+	Path   string // workspace-relative target for materialize
+	// Input is the payload a materialise step re-creates on replay. Path and Digest
+	// alone were a promise the replay could not keep: a rebuilt box has no file to
+	// find, and "test -e" then failed every rebuild that had ever recorded an input.
+	// Only a source that can be read again belongs here, so RecordInput normalises the
+	// Input at record time and refuses what cannot be replayed.
+	Input    *Input
 	Env      string // KEY for StepEnv
 	Source   *WorkspaceSource
 	Digest   string // content hash for cache identity

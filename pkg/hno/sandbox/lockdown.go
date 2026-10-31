@@ -170,7 +170,7 @@ func (sb *Sandbox) Probe(ctx context.Context) error {
 	if sb.provider == nil {
 		return sb.unavailable(ctx)
 	}
-	return sb.provider.Probe(ctx)
+	return probeBounded(ctx, sb.provider, sb.cfg.Timeouts.Connect)
 }
 
 // unavailable rebuilds the typed error listing what was attempted (§5.3).
@@ -184,9 +184,8 @@ func (sb *Sandbox) unavailable(ctx context.Context) error {
 			continue
 		}
 		iso := prov.Isolation()
-		perr := prov.Probe(ctx)
+		perr := probeAndClose(ctx, prov, sb.cfg.Timeouts.Connect)
 		tried = append(tried, Attempt{Provider: n, Isolation: iso, Formation: sb.cfg.Formation, Reason: errString(perr), Fixes: fixesOf(perr)})
-		_ = prov.Close(ctx)
 	}
 	un := &UnavailableError{Tried: tried, Want: sb.cfg.MinIsolation, Fixes: defaultFixes(isoForNames(tried))}
 	for _, a := range tried {

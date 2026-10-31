@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Preflight answers "why can't this run here?" before any handle exists.
@@ -76,8 +77,7 @@ func Preflight(ctx context.Context, opts ...Option) (*DiagReport, error) {
 		caps := prov.Capabilities()
 		// Probe is the honest test: a provider can be registered and still be
 		// unusable on this machine, and that is the finding a team needs.
-		probeErr := prov.Probe(ctx)
-		_ = prov.Close(ctx)
+		probeErr := probeAndClose(ctx, prov, cfg.Timeouts.Connect)
 		check.Got = iso.String()
 		check.OK = iso.AtLeast(cfg.MinIsolation) && probeErr == nil
 		if probeErr != nil {
@@ -196,4 +196,34 @@ func joinOrNone(in []string) string {
 		return "none"
 	}
 	return strings.Join(in, ", ")
+}
+
+// probeBounded asks a provider whether the engine answers, within the connect window.
+//
+// The question needs a deadline of its own. A CLI hanging on an unreachable daemon used
+// to hang the caller for as long as it liked, while Timeouts.Connect was documented as the
+// dial budget and nothing read it — the same "documented-shaped but unread" failure this
+// package removes elsewhere. Ownership stays with the caller: a probe of the bound
+// provider must not close the handle the sandbox is running on, so this only bounds the
+// question.
+func probeBounded(ctx context.Context, prov Provider, window time.Duration) error {
+	if window <= 0 {
+		window = 3 * time.Second
+	}
+	cctx, cancel := context.WithTimeout(ctx, window)
+	defer cancel()
+	return prov.Probe(cctx)
+}
+
+// probeAndClose is for candidates the caller is merely surveying: it answers the same
+// question and then releases the instance, so a preflight sweep cannot leak a provider per
+// name it tried.
+func probeAndClose(ctx context.Context, prov Provider, window time.Duration) error {
+	err := probeBounded(ctx, prov, window)
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), window)
+	defer cancel()
+	if cerr := prov.Close(cctx); cerr != nil && err == nil {
+		return fmt.Errorf("sandbox: provider probed successfully but could not be closed: %w", cerr)
+	}
+	return err
 }

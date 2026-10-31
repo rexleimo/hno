@@ -22,8 +22,12 @@ type Report struct {
 	SessionID string
 	// ExitCode is the payload's exit status. -1 means "never started".
 	ExitCode int
-	Stdout   string
-	Stderr   string
+	// Staged names what a content-only run placed in the sandbox. A request that
+	// declares inputs but no command runs nothing, so it has no exit code to report and
+	// nothing else in the record says the files went in.
+	Staged []string
+	Stdout string
+	Stderr string
 	// OutputSent is the number of output bytes the provider delivered *while the
 	// run was still executing*, counted per chunk at the sink boundary. It is zero
 	// for a provider that only hands over a finished buffer.

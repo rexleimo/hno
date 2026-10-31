@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -99,8 +100,11 @@ func (sb *Sandbox) bind(ctx context.Context) error {
 			Name:      name,
 			Image:     sb.cfg.Image,
 			Formation: sb.cfg.Formation,
-			Timeout:   Duration(sb.cfg.Timeouts.Connect),
-			Labels:    labelAttrs(sb.cfg.Attrs),
+			// Provision is the boot window; Connect is how long to reach a
+			// daemon. Feeding the latter into container create/start capped
+			// startup at 3s on a busy engine.
+			Timeout: Duration(sb.cfg.Timeouts.Provision),
+			Labels:  labelAttrs(sb.cfg.Attrs),
 			// Raw carries the engine-specific half of WithAttrs. Without it the
 			// field exists in the contract but nothing can ever reach a provider,
 			// which leaves an engine with no way to be configured except through
@@ -161,11 +165,27 @@ func (sb *Sandbox) bind(ctx context.Context) error {
 		}
 		return nil
 	}
+	// The headline names what actually stopped the build. "No provider met the required
+	// isolation" was reported even when no provider was ever found to ask, which sent
+	// readers to the isolation ladder over a missing registration or a typo in
+	// WithProvider. The first recorded attempt carries the real reason, so it leads.
 	reason := "no registered provider met the required isolation"
+	if len(tried) > 0 && tried[0].Reason != "" {
+		reason = fmt.Sprintf("no provider could be used for %q", strings.Join(candidates, ", "))
+	}
 	if !sb.cfg.AllowFallback {
 		reason += "; fallback is disabled (FailFast per D-13)"
 	}
-	return &UnavailableError{Tried: tried, Want: sb.cfg.MinIsolation, Reason: reason}
+	un := &UnavailableError{Tried: tried, Want: sb.cfg.MinIsolation, Reason: reason}
+	for _, a := range tried {
+		if a.Fix != "" {
+			un.Fixes = append(un.Fixes, a.Fix)
+		}
+		if a.Reason != "" && strings.Contains(a.Reason, "not registered") {
+			un.Fixes = append(un.Fixes, fmt.Sprintf("register provider %q before Open, or name one that is registered", a.Provider))
+		}
+	}
+	return un
 }
 
 // candidates lists provider names to try, honouring the explicit choice, the
@@ -298,17 +318,45 @@ func (sb *Sandbox) Session(ctx context.Context, id string, opts ...SessionOption
 		return nil, &CapabilityError{Provider: sb.name, Missing: CapSession, Wanted: sb.caps}
 	}
 	sb.mu.Lock()
-	if existing, ok := sb.sessions[id]; ok {
-		sb.mu.Unlock()
+	existing, held := sb.sessions[id]
+	sb.mu.Unlock()
+	// carriedSpec is the recorded spec of a released session in this process. It has to
+	// survive into the replacement, or re-acquiring an expired id yields an empty box:
+	// a store-less handle has no SessionRecord to replay from, yet the spec was never
+	// lost -- only the environment was.
+	var carriedSpec *SessionSpec
+	if held {
 		st := existing.Status()
-		switch {
-		case st.State.Terminal():
-			return nil, &StateError{SessionID: id, State: st.State, Action: "reuse session"}
-		default:
+		if !st.State.Terminal() {
 			return existing, nil
 		}
+		if st.State == StateCorrupted {
+			return nil, &StateError{SessionID: id, State: st.State, Action: "reuse session",
+				Reason: "the recorded spec could not be replayed; retrying reproduces the same failure",
+				Fix:    "inspect and correct SessionSpec, or Destroy the id and create it anew"}
+		}
+		// A released session is gone, which is exactly what CreateIfMissing promises to
+		// handle: the id may come back because the recorded spec survived. Refusing here
+		// would make the remedy named by the expiry error false, and would turn "the TTL
+		// is the safety net" into a one-way door.
+		if !opt.CreateIfMissing {
+			return nil, &StateError{SessionID: id, State: st.State, Action: "reuse session",
+				Reason: "the session was released and its environment is gone; the recorded spec is still kept",
+				Fix:    "pass WithCreateIfMissing to re-provision the id from that spec"}
+		}
+		sb.mu.Lock()
+		// Re-check under the lock: another caller may already have replaced it.
+		if cur, still := sb.sessions[id]; still && cur != existing {
+			sb.mu.Unlock()
+			return cur, nil
+		}
+		delete(sb.sessions, id)
+		sb.mu.Unlock()
+		sp := existing.Spec()
+		if len(sp.Steps) > 0 || len(sp.Env) > 0 || len(sp.Expose) > 0 {
+			carriedSpec = &sp
+		}
 	}
-	sb.mu.Unlock()
 
 	rec, found, err := sb.loadRecord(ctx, id)
 	if err != nil {
@@ -324,6 +372,10 @@ func (sb *Sandbox) Session(ctx context.Context, id string, opts ...SessionOption
 	spec := SessionSpec{Base: sb.cfg.Image, MountMode: sb.cfg.Limits.DefaultMountMode}
 	if rec != nil {
 		spec = rec.Spec
+	} else if carriedSpec != nil {
+		// The persisted record is the authority when one exists; in memory is the next
+		// best thing, and better than starting from nothing.
+		spec = *carriedSpec
 	}
 	if opt.Image != "" {
 		spec.Base = opt.Image
@@ -341,11 +393,14 @@ func (sb *Sandbox) Session(ctx context.Context, id string, opts ...SessionOption
 	sess.mu.Lock()
 	sess.lineage, sess.inherited, sess.stateSource = prov.lineage, prov.upto, prov.source
 	sess.mu.Unlock()
-	// A record with steps means this environment is a reconstruction, not the box that
+	// A spec with steps means this environment is a reconstruction, not the box that
 	// ran them. Replaying is the difference between "resumed" and "empty and claiming
 	// to be ready": without it every install and setup a workflow recorded is gone, and
 	// the first failure gets attributed to the caller's code.
-	if rec != nil && len(spec.Steps) > 0 {
+	// inheritedSpec is true when the spec above came from a session that already ran
+	// these steps -- from the persisted record, or from a released session's in-memory
+	// spec. Either way the environment in hand is new and has executed none of them.
+	if (rec != nil || carriedSpec != nil) && len(spec.Steps) > 0 {
 		rep := &RebuildReport{SessionID: id, StateSource: prov.source}
 		if rerr := sb.replayRecorded(ctx, env, spec, rep, prov); rerr != nil {
 			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sb.cfg.Timeouts.Cleanup)
@@ -466,6 +521,10 @@ func (sb *Sandbox) adoptWorkspace(id string, env Environment, spec SessionSpec, 
 		workspace:   cloneSource(ws),
 		lock:        make(chan struct{}, cap),
 		lastSeen:    time.Now(),
+		// The absolute lifetime is measured from here, not from the last activity:
+		// Status().ExpiresAt used to take lastSeen for both, so a busy session could
+		// never reach its absolute deadline at all.
+		createdAt: time.Now(),
 	}
 	sb.mu.Lock()
 	sb.sessions[id] = sess
@@ -493,7 +552,7 @@ func (sb *Sandbox) persistSession(sess *Session) error {
 		Image:        sess.image,
 		Isolation:    sess.isolation,
 		Spec:         sess.spec.Clone(),
-		CreatedAt:    UnixTime{Seconds: sess.lastSeen.Unix()},
+		CreatedAt:    UnixTime{Seconds: sess.createdAtLocked()},
 		LastActiveAt: UnixTime{Seconds: sess.lastSeen.Unix()},
 		TTLSeconds:   int64(sb.cfg.Timeouts.SessionTTL.Seconds()),
 	}
@@ -640,4 +699,14 @@ func firstString(in []string) string {
 		}
 	}
 	return ""
+}
+
+// createdAtLocked is the session's absolute-lifetime anchor. Callers hold s.mu, like
+// every other ...Locked helper here: persistSession already holds the session lock, so
+// a locking accessor would self-deadlock on a mutex Go does not make reentrant.
+func (s *Session) createdAtLocked() int64 {
+	if s.createdAt.IsZero() {
+		return s.lastSeen.Unix()
+	}
+	return s.createdAt.Unix()
 }

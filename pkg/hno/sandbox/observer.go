@@ -38,6 +38,7 @@ const (
 	EventClosed
 	EventRetryAttempt
 	EventRetryGaveUp
+	EventSessionExpired
 	EventQuotaBlocked
 	EventHookFault
 )

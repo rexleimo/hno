@@ -123,10 +123,11 @@ func (sb *Sandbox) replayStep(ctx context.Context, env Environment, step Step) e
 	case StepEnv:
 		req = Request{Runtime: "shell", Code: fmt.Sprintf("printf %%s %q", step.Digest)}
 	case StepMaterialize, StepWorkspaceDelta:
-		if step.Source == nil {
-			return fmt.Errorf("materialize step %q has no source", step.Path)
-		}
-		req = Request{Runtime: "shell", Code: "test -e " + step.Path, Workspace: step.Source}
+		// Replaying a materialise step means putting the file back. Asserting it
+		// already exists cannot be the whole of it: in a box rendered from the base
+		// image nothing exists yet, which is why every rebuild of a session that had
+		// recorded an input failed here.
+		return sb.replayContent(ctx, env, step)
 	default:
 		return fmt.Errorf("cannot replay step kind %s", step.Kind)
 	}
@@ -434,7 +435,29 @@ func (sb *Sandbox) Diagnose(ctx context.Context) (*DiagReport, error) {
 		})
 		report.Fixes = append(report.Fixes, fmt.Sprintf("capabilities %v are declared but unimplemented in the core — treat them as absent", names))
 	}
-	if err := sb.provider.Probe(ctx); err != nil {
+	// A readiness probe needs somewhere to look. Pattern probes read the core's own output
+	// tail and need nothing from the engine, but a Port or URL probe has to be answered
+	// inside the sandbox, and a provider that cannot keep a process running cannot serve
+	// any probe at all. Reporting that here saves a caller from discovering it on the run
+	// that was supposed to depend on the probe.
+	if !sb.caps.Has(CapBackground) {
+		report.Checks = append(report.Checks, Check{
+			Env:  "readiness",
+			Want: "detached runs so a probe can be answered",
+			Got:  "provider declares no background support",
+			OK:   true,
+			Fix:  "Request.ReadyProbe will be refused on this provider; gate on a finished run instead, or pick a provider with background support",
+		})
+	} else if _, ok := sb.provider.(ReadinessProber); !ok {
+		report.Checks = append(report.Checks, Check{
+			Env:  "readiness",
+			Want: "Port or URL probes answerable in-guest",
+			Got:  "provider is not a ReadinessProber",
+			OK:   true,
+			Fix:  "only Pattern probes can be answered here; a Port or URL probe returns UnsupportedProbeError",
+		})
+	}
+	if err := probeBounded(ctx, sb.provider, sb.cfg.Timeouts.Connect); err != nil {
 		report.Checks = append(report.Checks, Check{Env: "probe", Want: "ok", Got: err.Error(), OK: false, Fix: firstFix(err)})
 		if fix := firstFix(err); fix != "" {
 			report.Fixes = append(report.Fixes, fix)
@@ -581,4 +604,59 @@ func (sb *Sandbox) snapshotMarkFor(handle SnapshotHandle) (snapshotMark, bool) {
 		return m, true
 	}
 	return snapshotMark{}, false
+}
+
+// verifyStaged confirms a re-materialised path is readable through the provider's own
+// file service. A provider without a bridge cannot be checked this way, and that is
+// reported rather than assumed away.
+func (sb *Sandbox) verifyStaged(ctx context.Context, env Environment, path string) error {
+	bridge, ok := sb.provider.(FileBridge)
+	if !ok || !sb.caps.Has(CapFileBridge) {
+		return &CapabilityError{Provider: sb.name, Missing: CapFileBridge, Wanted: sb.caps}
+	}
+	files, ferr := bridge.Files(ctx, env)
+	if ferr != nil {
+		return fmt.Errorf("sandbox: rebuild cannot verify %q: %w", path, ferr)
+	}
+	info, err := files.Stat(ctx, path)
+	if err != nil {
+		return fmt.Errorf("rebuild placed %q but it cannot be read back: %w", path, err)
+	}
+	if info.Size == 0 {
+		return fmt.Errorf("rebuild placed %q but the file is empty", path)
+	}
+	return nil
+}
+
+// replayContent puts a recorded materialise step back into the environment.
+//
+// Two decisions live here. Staging goes through the core pipeline because a provider is
+// not required to interpret Request.Inputs in its Exec at all — asking the engine to "run"
+// a content-only step wrote nothing. And when the content is placed and read back through
+// the provider's own file service, the step is satisfied: inventing a follow-up shell
+// command would test the engine's shell grammar instead of the promise that the file is
+// there, and would give a provider without a shell a way to fail a replay that worked.
+func (sb *Sandbox) replayContent(ctx context.Context, env Environment, step Step) error {
+	switch {
+	case step.Input != nil:
+		in := *step.Input
+		if in.Path == "" {
+			in.Path = step.Path
+		}
+		if err := sb.stageInputs(ctx, env, &Request{Inputs: []Input{in}}); err != nil {
+			return fmt.Errorf("re-materialise %q: %w", in.Path, err)
+		}
+		return sb.verifyStaged(ctx, env, in.Path)
+	case step.Source != nil:
+		if err := sb.stageInputs(ctx, env, &Request{Workspace: step.Source}); err != nil {
+			return fmt.Errorf("re-materialise workspace: %w", err)
+		}
+		return nil
+	default:
+		return &UnrecoverableInputError{
+			Path:  step.Path,
+			Cause: "the recorded step keeps no content a rebuild can write back",
+			Fix:   "record the input with Bytes or HostPath; a step holding only a path cannot survive a rebuild",
+		}
+	}
 }

@@ -106,6 +106,11 @@ type Config struct {
 	// destroy the other's live workload. Measured, not theoretical — the default
 	// refusal exists because an experiment reproduced that deletion.
 	PruneRunning bool
+	// Runtime names the OCI runtime to boot under, e.g. "runsc" for gVisor. Empty
+	// uses the engine default. It is the syscall-filtered rung of §12.2: same provider,
+	// same lifecycle, different isolation, which is why it is an attribute rather than a
+	// second driver.
+	Runtime string
 	// StartupTimeout bounds container creation, which is engine control-plane
 	// work rather than user code time (§16.2).
 	StartupTimeout time.Duration
@@ -355,12 +360,18 @@ func NewProvider(cfg sandbox.ProviderConfig) (sandbox.Provider, error) {
 	if v, ok := cfg.Raw["prune_running"].(bool); ok {
 		d.PruneRunning = v
 	}
+	// runtime selects the OCI runtime the engine boots the box under, which is how
+	// gVisor's syscall filtering (the middle rung of §12.2) is reached without adding a
+	// provider. An empty string is the engine default, so unset costs nothing.
+	if v, ok := cfg.Raw["runtime"].(string); ok {
+		d.Runtime = v
+	}
 	if unknown := unknownRawKeys(cfg.Raw); len(unknown) > 0 {
 		// Unrecognised keys are refused, not skipped. Raw is the engine-specific
 		// passthrough, so a typo here ("startup-timeout") otherwise reads as
 		// configuration that took effect while the provider used a default — the one
 		// failure mode a passthrough map must not have.
-		return nil, fmt.Errorf("sandbox/provider/docker: unrecognised engine attributes %v (known: binary, dialect, allow_bind_mounts, startup_timeout, prune_running)", unknown)
+		return nil, fmt.Errorf("sandbox/provider/docker: unrecognised engine attributes %v (known: binary, dialect, allow_bind_mounts, startup_timeout, prune_running, runtime)", unknown)
 	}
 	p, err := New(d)
 	if err != nil {
@@ -474,8 +485,12 @@ func (p *Provider) Probe(ctx context.Context) error {
 // syntax rather than assuming Docker flags.
 func (p *Provider) createArgsForProbe(name string) []string {
 	args := p.dial.createArgs(createSpec{
-		Name:    name,
-		Image:   p.probeImage(),
+		Name:  name,
+		Image: p.probeImage(),
+		// The probe must ask about the runtime the provider will actually use.
+		// Probing the engine default while creating under "runsc" would report a
+		// healthy engine for a configuration that cannot start anything.
+		Runtime: p.d.Runtime,
 		Network: "none",
 		Labels:  map[string]string{LabelManaged: "probe", LabelProbe: "true"},
 		Argv:    []string{"true"},
@@ -562,6 +577,7 @@ func (p *Provider) NewEnvironment(ctx context.Context, spec sandbox.EnvSpec) (sa
 	}
 	args := p.dial.createArgs(createSpec{
 		Image:      image,
+		Runtime:    p.d.Runtime,
 		WorkingDir: workspaceCWD(spec.MountMode, p.d.AllowBindMounts),
 		Env:        envMap(spec.Spec.Env),
 		Labels:     withOwner(labels),
@@ -944,6 +960,7 @@ func parseDurationAttr(key string, v any) (time.Duration, error) {
 // knownRawKeys lists the attributes this provider honours.
 var knownRawKeys = map[string]bool{
 	"binary":            true,
+	"runtime":           true,
 	"dialect":           true,
 	"allow_bind_mounts": true,
 	"startup_timeout":   true,

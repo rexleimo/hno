@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"sort"
 	"time"
 )
 
@@ -93,6 +94,19 @@ func (sb *Sandbox) execute(ctx context.Context, sess *Session, req Request, ro r
 		sb.commitOutcome(ctx, rc, rep, serr)
 		sb.recordAudit(ctx, rc, rep, serr)
 		return rep, serr
+	}
+
+	// 5c. A request that declares only content has nothing to run. Staging wrote the
+	// files, and reporting a payload that never existed would be the provider inventing
+	// an exit code. This is a real shape, not an edge: replaying a recorded input is
+	// exactly "put this file back", and the alternative was the engine refusing the run
+	// for having no command, which made every rebuild of a session that had recorded an
+	// input fail.
+	if payloadless(rc.Request) {
+		rep := materialisedReport(sb, rc, time.Now())
+		sb.commitOutcome(ctx, rc, rep, nil)
+		sb.recordAudit(ctx, rc, rep, nil)
+		return rep, nil
 	}
 
 	// 6. Run. Events bracket the execution so a dashboard can see a phase even
@@ -701,4 +715,48 @@ func (sb *Sandbox) checkExposed(sess *Session, want []PortMap) error {
 		}
 	}
 	return nil
+}
+
+// payloadless reports a request that carries content but no command. A request with
+// neither is a caller error and still reaches the provider, which says so.
+func payloadless(req *Request) bool {
+	if req == nil {
+		return false
+	}
+	if len(req.Argv) > 0 || req.Runtime != "" || req.Code != "" || req.Background {
+		return false
+	}
+	return len(req.Inputs) > 0 || len(req.Files) > 0 || req.Workspace != nil
+}
+
+// materialisedReport is the honest record of a content-only run: the files were written,
+// nothing executed, so there is no exit code to report.
+func materialisedReport(sb *Sandbox, rc *RunContext, started time.Time) *Report {
+	rep := &Report{
+		RunID:     rc.RunID,
+		SessionID: rc.SessionID,
+		Provider:  sb.name,
+		Isolation: sb.iso,
+		ExitCode:  0,
+		Duration:  time.Since(started),
+		Staged:    stagedSummary(rc.Request),
+	}
+	return rep
+}
+
+// stagedSummary names what a content-only run placed, so the report is checkable rather
+// than merely successful.
+func stagedSummary(req *Request) []string {
+	var out []string
+	for _, in := range req.Inputs {
+		out = append(out, in.Path)
+	}
+	for path := range req.Files {
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	if req.Workspace != nil {
+		out = append(out, "<workspace>")
+	}
+	return out
 }
