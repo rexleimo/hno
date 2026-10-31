@@ -197,6 +197,8 @@ func (g *Graph) newScheduler(ctx context.Context, seq, steps int) *scheduler {
 // type=="object"（缺省同义）+ required（键存在性）+ properties[name].type（值形状）。
 // 未声明的多余键放行；schema 为空放行；声明了子集之外的东西（顶层 type 非 object、
 // property type 未知、property spec 不是对象）→ 报不支持而不是放行（fail-closed）。
+// properties 中声明、但响应里没有这个**键**的字段视为可选并跳过值校验：强制出现只能靠
+// required。缺席只按「键是否存在」判定，显式 null 属于「出现了但不是那个类型」，照旧校验。
 func validateResponse(schema map[string]any, resp any) error {
 	if len(schema) == 0 {
 		return nil
@@ -238,7 +240,15 @@ func validateResponse(schema map[string]any, resp any) error {
 		if want == "" {
 			continue
 		}
-		if err := checkShape(n, want, respMap[n]); err != nil {
+		// 缺席由 required 判定，这里不能代替它：键不存在时 respMap[n] 取出的是 nil，
+		// 而 nil 撞任何类型都判红 —— 那会让「声明一个可选字段」变成「强制该字段必须出现」，
+		// 与本文件注释的承诺相反，也使可选响应字段在实践中无法声明。
+		// 缺席只按键存在性判定，显式 null 属于「出现了但不是那个类型」，仍要校验。
+		v, present := respMap[n]
+		if !present {
+			continue
+		}
+		if err := checkShape(n, want, v); err != nil {
 			return err
 		}
 	}
