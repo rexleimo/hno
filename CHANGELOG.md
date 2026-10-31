@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ Added (B2 真引擎收尾：CapRebuild / ReadyProbe / TTL / runsc 档位)
+- **`sandbox/provider/docker`：`Config.Runtime` 与 `ProviderConfig.Raw["runtime"]`** —— 把 gVisor 的 syscall-filtered 档位做成 provider 属性（`create --runtime`），而不是第二个 provider；`Probe` 带同一 runtime，避免「探默认档、跑另一档」把不可用配置报成健康。新增 `ContainerRunning` 导出查询（与 `ImagePresent` 同先例：Apple CLI 的 `inspect` 无 `--format`）。
+- **`sandbox.Diagnose`：readiness 档位如实上报** —— provider 无 `CapBackground` 时说明 `Request.ReadyProbe` 会被拒绝；有后台但非 `ReadinessProber` 时说明只有 `Pattern` 可答。选择时可见，而不是等依赖探针的服务起不来。
+- **`sandbox.Step.Input` + `Report.Staged`** —— 录制的输入现在带可重放载荷；纯内容请求是合法运行形状，报告写明放置了什么而没有退出码可报。
+- **`sandbox.UnrecoverableInputError`** —— 无法被重建复现的输入在**记录时**拒绝（`ClassPermanent` + remedy），不再留一个注定失败的重放步骤。
+- 真引擎门新增 `TestRealReadinessProbeSeesARealListener`、`TestRealRebuildRestoresRecordedState`、`TestRealExpiredSessionReclaimsTheContainer`、`TestGVisorTierIsExercisedOrExplicitlyAbsent`（可见 SKIP）。
+
+### 🐛 Fixed (B2 真引擎收尾)
+- **录制过输入的 session 一律无法重建** —— `RecordInput` 只存路径与摘要、不留内容，重放端则只做 `test -e`（检查存在、从不写回）。现按所有权归位修复：重放经核心 `stageInputs` 写回，后置校验用 provider 自己的文件服务 `Stat`，校验通过即结束，不再伪造一条 payload 命令。`HostPath` 在记录时读成字节，`Reader` 当场拒绝。
+- **容器启动窗口接错配置** —— provider 的 create/start 一直被喂 `Timeouts.Connect`（连 daemon 的 3s 预算），引擎繁忙时每次启动都死在调用方从未配置过的 deadline 里。改接 `Timeouts.Provision`。
+- **`Timeouts.Connect` 沦为有文档、零消费者** —— 补 `probeBounded`：探针获得自己的窗口（daemon 挂住不再无限挂住），并保持所有权分离（探测已绑定的 provider 不得关闭句柄；仅候选走 `probeAndClose`）。
+- **指定未注册的 provider 却报「isolation 不满足」** —— headline 现说出到底在找谁，并带上「先注册」的 remedy。
+
+### 🧪 Tests (B2 真引擎收尾)
+- 离线 `go test -race ./pkg/hno/sandbox/...` 绿；真引擎门 9 PASS / 0 FAIL / 1 可见 SKIP；两个并发进程各 9/0/1，引擎 `hno.sandbox.managed` 残留 0；覆盖率核心 70.8% → 72.6%，docker provider 57.9% → 59.6%。
+- 反向证伪 5 项均在破坏机制时变红，含一次自我纠正：第一版 `TestRecordedInputSurvivesRebuild` 关掉机制仍为绿，据此改造重放路径后才可读到 `file not found`。`TestUnknownProviderNamesTheProvider` 断言 `UnavailableError.Reason` headline 本身而非整串（整串会连旧文案一起放过）。
 ### ✨ Added
 - **Sandbox contract layer** (`pkg/hno/sandbox`): a provider-neutral execution
   contract that replaces the one-shot `Run`/`Close` shape of

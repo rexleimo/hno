@@ -743,3 +743,56 @@ D-20 一并清理（避免下一个谎报者据此声称实现了重放）。
 **清理**：删除 `EnvSpec.ReplayFrom`/`CachedSteps` 与 docker `Environment.replay()`。核心从不填充 `ReplayFrom`，而该 provider 循环只处理 `StepInstall`、会**静默丢弃** setup/materialise 步骤；注释声称核心会传入剩余步骤，是假话。核心经由 `Environment.Exec` 是步骤重放的唯一所有者。
 
 **验证**：`go test -race ./pkg/hno/sandbox/...` 绿；核心覆盖率 69.8% → **70.8%**，provider 57.5% → **57.9%**；真引擎门单进程 6/6；两个并发进程各 **6/6 PASS、0 SKIP、0 FAIL**，`hno.sandbox.managed` 残留 **0**。
+
+### 17.11 B2 真引擎收尾：四项全部量过，不是推定
+
+四项遗留都按「先在真引擎上量，再决定语义」处理。结论分两类：三项坐实（其中两项顺带挖出真缺陷），一项如实缺席。
+
+**1. `CapRebuild` 真引擎验证 —— 通过，但暴露 `RecordInput` 不可重放**
+
+`TestRealRebuildRestoresRecordedState` 用 setup + 录制输入两类步骤（不用 install，因为默认 egress=none，装包会去测网络而不是测重放）。断言的是**新容器里文件真的存在**，不是报告说它试过：
+
+- `Rebuild` 后 `StateSource == "base image"`、`Cached == 0`（真容器不可能继承任何步骤）；
+- `cat` 真读回 `built-by-replay` 与 `payload-42`。
+
+第一跑就把两层真缺陷打出来：
+
+- `RecordInput` 只存 `Path` + `Digest`，**不留任何内容来源** ⇒ `replayStep` 报 `materialize step "..." has no source` ⇒ **凡录制过输入的 session 一律无法重建**。
+- 即便补上 source，旧重放只做 `test -e path`：**只检查、从不写回**。基础镜像渲染的新盒子里文件必然不存在。
+
+修法（按所有权归位，而不是在 provider 里凑）：
+
+- `Step` 新增 `Input *Input`，`RecordInput` 在**记录时**归一化为可重放载荷：`Bytes` 原样保留；`HostPath` 立即读成字节（记录的就是当时的内容，不是下次重建时恰好还在的）；`Reader` **当场拒绝** —— 它已被消费，记录下来就是让重建去兑现一个不可能兑现的承诺（D-05）。拒绝时不留残步。
+- 重放走**核心自己的 `stageInputs`**。provider 的 `Exec` 从不负责解释 `Request.Inputs`（B2a 就定了 staging 是核心管线职责），所以让引擎「运行」一个纯内容步骤其实什么也没写。
+- 后置校验用 **provider 自己的文件服务 `Stat`**，不再伪造一条 shell 命令：用 shell 断言测的是引擎的 shell 语法，不是「文件在不在」。校验通过后**直接返回**，不发明 payload。
+
+**2. Request 层 `ReadyProbe` —— in-guest 探针坐实**
+
+`TestRealReadinessProbeSeesARealListener` 先问一个**没人监听**的端口，必须回「未就绪」（若这里回 ready，说明探针压根没看 guest），再起真监听器轮询到就绪，并断言 `observed` 非空。
+
+两处真机事实纠正了实现里的想当然：
+
+- guest 的 `/proc/net/tcp` 打印**大写** hex（实测 `00000000:AEA9`）。测试端口刻意选 **44713 = `AEA9`（含字母）**：若用 39217 = `0x9911`，大小写写错也能通过 —— 证伪测试必须让机制的错误方向可见。
+- `cmd &` 是 exec 会话的子进程，**exec 返回就被带走**。必须 `setsid`。第一版测试正是这样「探针没问题、被测服务不存在」。
+
+`Port` 探测的两级实现（bash `/dev/tcp` 优先，退回 `/proc/net/tcp{,6}` 监听表）与 `URL`（guest `curl`/`wget`，无 HTTP 客户端则 `*UnsupportedProbeError`）都由真引擎确认。「未就绪」不是错误；非 2xx 也只算未就绪。
+
+同时把「档位不匹配」提到 `Diagnose`：docker provider 有意不声明 `CapBackground`（`ReadyProbe` 语义上要求常驻进程），所以它**在 Request 层无法服务任何探针**。这现在是 `Diagnose` 的一行输出（带 remedy），而不是等到某次依赖探针的服务启动失败才发现。离线侧新增 `TestDiagnoseStatesWhetherReadinessIsPossible` 与 `TestDiagnoseNamesTheBackgroundGap`（后者用一个刻意不带 `CapBackground` 的真实 provider 走进另一分支，不是用散文断言）。
+
+**3. TTL / idle —— 真引擎坐实**
+
+`TestRealExpiredSessionReclaimsTheContainer` 在真引擎上问两个问题：`env.Close`（核心在 session 过期时走的路径）之后容器**是否还在跑**；过期是否发出 `EventSessionExpired` 且后续 run 不再假装环境还在。引擎状态一律经 `ContainerRunning` 查询，与 `ImagePresent` 同一先例 —— Apple CLI 的 `inspect` **不接受 `--format`**，测试里裸拼 docker 形状会把健康容器读成「未运行」。
+
+顺带消灭一个新的静默空转：把 provider 启动窗口从 `Timeouts.Connect` 改接到 `Timeouts.Provision` 之后，`Connect` 成了**有文档、零消费者**的字段。按同类标准补上 `probeBounded`：探针必须有了自己的窗口（此前 daemon 挂住就无限挂住），并且所有权与关闭分开 —— 探测**已绑定**的 provider 绝不能把它关掉，否则句柄被探针废掉；只有「只是看一眼」的候选走 `probeAndClose`。
+
+**4. `runsc` / gVisor —— 本机如实缺席**
+
+`TestGVisorTierIsExercisedOrExplicitlyAbsent` 是**可见 SKIP**，并说明原因：Apple `container info` 不回答 runtime 列表（`exit status 64`）。这不是失败，但必须让它显形 —— 否则一套静静跳过的测试会让设计的 syscall-filtered 档位看起来「有实现且有覆盖」，而本机只有 container 一档。
+
+档位实现为 **provider 的属性而非第二个 provider**：`Config.Runtime` / `ProviderConfig.Raw["runtime"]`（如 `"runsc"`），经由 `createArgs` 落到 `--runtime`。同一个 CLI、同一套生命周期词汇，隔离强度不同。`Probe` 也带上同一 runtime —— 探引擎默认档而去 create 另一档，会把「引擎可用」报成一个根本起不来的配置可用。`TestRuntimeAttributeReachesCreate` 钉住两处，撤掉 `Runtime` 传参即变红。
+
+**诊断缺陷（真门跑出的副产品，已修 + 证伪）**
+
+显式指定一个**从未注册**的 provider，旧报错是 `no registered provider met the required isolation` —— 把读者送去爬隔离梯子，而真正的问题只是名字没注册或拼错。现在 headline 说出到底在找谁，并把「先注册再 Open」的 remedy 带上。`TestUnknownProviderNamesTheProvider` 刻意断言 `UnavailableError.Reason` **headline 本身**：`Error()` 会附上所有 attempt，名字出现在整串里与否跟正确性无关，断言整串会连旧文案一起放过。
+
+**验证**：离线 `go test -race ./pkg/hno/sandbox/...` 绿；真引擎门 **9 PASS / 0 FAIL / 1 可见 SKIP**；两个并发进程各 9/0/1，`hno.sandbox.managed` 残留 **0**；覆盖率核心 70.8% → **72.6%**，docker provider 57.9% → **59.6%**。本轮新增/调整 19 个测试，其中 5 个反向证伪均在破坏机制时变红（含一次自我纠正：第一版 `TestRecordedInputSurvivesRebuild` 在关掉机制时仍绿，据此把 materialise 重放改为经核心 staging + 文件服务校验，之后关掉机制可读回 `file not found`）。
