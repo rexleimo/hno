@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 🐛 Fixed (D-32：图 HITL 的可选响应字段终于能声明)
+- `pkg/hno/graph`：`validateResponse` 的属性循环对**缺失的键**取 `respMap[n]`（读出 nil），nil 撞任何声明类型都判红——与它自己的注释「缺失的属性只由 required 管，这里跳过」直接矛盾。结果是「声明一个可选字段」等于「强制该字段必须出现」，任何省略它的合法响应都被拒。现改为按双值取键判定缺席并跳过值校验；强制出现只能靠 `required`。
+- 显式 `null` 不算缺席：它是「出现了但不是那个类型」，照旧拒绝（受测钉住）。
+- `pkg/hno/sandbox/graph`：默认响应 schema 把 `reason` 声明回**可选**。此前不可能声明——本包实际会用 `readResponse` 读它，却只能让 schema 少写一个字段；修复后 schema 与真实读取一致。
+
+### 🔒 Security (D-32 的收紧面)
+- 同一改动让非字符串的 `reason` 从「不声明因而不校验、值被静默丢弃」变为「类型不符即拒绝，且挂起不被消耗、可重新作答」。可选字段的宽容只作用于「不出现」，不作用于「出现但形状错」。
+
+### 🧪 Tests (D-32)
+- `pkg/hno/graph` 新增 5 条行为测试（走 `Run`/`Resume` 公开面，非内部谓词）：省略可选字段应通过、可选字段出现但类型错必须拒、显式 null 必须拒、伴随可选字段时必填仍必须拒、全可选 schema 接受空响应（把放宽变成明示合同而非事故副产品）。`pkg/hno/sandbox/graph` 新增 2 条：非字符串 `reason` 被拒且问题仍开放；只给决策不给理由的作答必须被接受。
+- 反证两条：旧 graph 实现下第 1、5 条以 `field "note" should be string, got <nil>` 判红；`sandboxgraph` 的「只答是/否」测试在旧 graph 下同样判红，证明两处耦合。`pkg/hno/graph` 覆盖率 90.8%，`sandbox/graph` 80.3%。
+
 ### 🔒 Security / Fixed (D-31：`WithCreateIfMissing(false)` 不再静默失效)
 - **核心**：`Sandbox.Session(ctx, id)` 在句柄**没有 session store** 时，此前无视 `WithCreateIfMissing(false)`：未知 id 会开出一台空环境并作为「正在恢复的那个会话」返回。跨进程恢复因此以为自己在续作，实际拿到空盒子，还会把缺失状态归因于自己的代码。现在无论有没有 store 都返回 `*StaleSessionError`，且不注册会话、不开机；`Cause` 按「有无 store」分别说明能证明的原因（无 store 时诚实说「无法核实该 id 是一次恢复」）。
 - `RunProject` 显式传 `WithCreateIfMissing(true)`：它本来就运行在自己创建的会话上，靠隐式宽容行为等于把创建意图藏起来。

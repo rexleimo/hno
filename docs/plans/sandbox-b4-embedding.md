@@ -156,3 +156,6 @@ B4d（`toolkit.go:106-115` 双写迁移）**未做**：需授权。
 `-race` 四包全过；真实门 9 PASS / 0 FAIL、残留 0；覆盖 `sandbox` 73.2%、`sandbox/graph` 80.3%。
 
 第 2 项（`pkg/hno/graph.checkShape` 校验缺失可选属性）**仍未修**：跨包、影响所有 schema 校验使用方。
+
+
+D-32：第 2 项上游缺陷（`pkg/hno/graph` 可选属性误校验）已按授权修复，`sandboxgraph` 默认 schema 声明回可选 `reason`。
