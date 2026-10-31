@@ -35,6 +35,22 @@ type Provider struct {
 	SlowBoot time.Duration
 }
 
+// ProbedProvider wraps Provider with in-guest readiness answers.
+//
+// It is a separate type on purpose. If the default double implemented
+// ReadinessProber, no offline test could reach the "this provider cannot look inside
+// the guest" path, which is the refusal that keeps an unevaluable probe from reading as
+// a passed one — the exact lie this whole area exists to prevent.
+type ProbedProvider struct {
+	*Provider
+	// Ready answers the probe when set.
+	Ready func(ctx context.Context, env sandbox.Environment, probe sandbox.ReadyProbe) (bool, string, error)
+	// ReadyPorts and ReadyURLs are the declarative form for tests that only want the
+	// service to be up.
+	ReadyPorts map[int]bool
+	ReadyURLs  map[string]bool
+}
+
 // NewProvider returns a fresh in-memory provider.
 func NewProvider(cfg sandbox.ProviderConfig) (sandbox.Provider, error) {
 	return &Provider{cfg: cfg, envs: map[string]*Env{}}, nil
@@ -239,8 +255,18 @@ type snapshot struct {
 
 // runRecord backs detached runs and reattach.
 type runRecord struct {
+	mu     sync.Mutex
 	chunks []sandbox.OutputChunk
 	done   chan struct{}
+}
+
+// recorded returns a copy of the chunks the background run pushed.
+func (r *runRecord) recorded() []sandbox.OutputChunk {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]sandbox.OutputChunk, len(r.chunks))
+	copy(out, r.chunks)
+	return out
 }
 
 // ID implements sandbox.Environment.
@@ -287,10 +313,20 @@ func (e *Env) Exec(ctx context.Context, spec sandbox.RunSpec, sink sandbox.Chunk
 		e.runs[spec.RunID] = rec
 		e.mu.Unlock()
 		go func() {
+			defer close(rec.done)
 			for i := 0; i < 3; i++ {
-				rec.chunks = append(rec.chunks, sandbox.OutputChunk{RunID: spec.RunID, Stream: sandbox.StreamStdout, Bytes: []byte(fmt.Sprintf("bg %d\n", i)), At: time.Now().UTC()})
+				ch := sandbox.OutputChunk{RunID: spec.RunID, Stream: sandbox.StreamStdout, Bytes: []byte(fmt.Sprintf("bg %d\n", i)), At: time.Now().UTC()}
+				// The chunk goes through the sink like a real provider would, so a
+				// ReadyProbe matched on run output sees it. Recording only into the
+				// provider's own buffer makes this double lie in exactly the direction
+				// a dishonest provider lies, and no offline test could notice.
+				rec.mu.Lock()
+				rec.chunks = append(rec.chunks, ch)
+				rec.mu.Unlock()
+				if sink != nil {
+					_ = sink.Report(ch)
+				}
 			}
-			close(rec.done)
 		}()
 		rep.RunRef = &sandbox.RunRef{ID: spec.RunID, SessionID: e.id}
 		rep.Duration = time.Since(started)
@@ -507,7 +543,7 @@ func (e *Env) reattach(runID string, sink sandbox.ChunkReporter) error {
 		return fmt.Errorf("sandboxtest: no detached run %q", runID)
 	}
 	<-rec.done
-	for _, c := range rec.chunks {
+	for _, c := range rec.recorded() {
 		if err := sink.Report(c); err != nil {
 			return err
 		}
@@ -769,3 +805,25 @@ var (
 	_ sandbox.FileService  = (*fileService)(nil)
 	_ io.ReadWriteCloser   = (*handle)(nil)
 )
+
+// ProbeReady implements sandbox.ReadinessProber for the in-memory provider.
+func (p *ProbedProvider) ProbeReady(ctx context.Context, env sandbox.Environment, probe sandbox.ReadyProbe) (bool, string, error) {
+	if p.Ready != nil {
+		return p.Ready(ctx, env, probe)
+	}
+	if probe.Port != 0 {
+		if p.ReadyPorts[probe.Port] {
+			return true, "", nil
+		}
+		return false, fmt.Sprintf("nothing listening on port %d", probe.Port), nil
+	}
+	if probe.URL != "" {
+		if p.ReadyURLs[probe.URL] {
+			return true, "", nil
+		}
+		return false, "GET " + probe.URL + " returned no response", nil
+	}
+	return false, "", fmt.Errorf("sandboxtest: no in-guest condition to check for %+v", probe)
+}
+
+var _ sandbox.ReadinessProber = (*ProbedProvider)(nil)

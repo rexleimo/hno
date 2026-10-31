@@ -35,7 +35,7 @@ func (sb *Sandbox) rebuild(ctx context.Context, sess *Session) (*RebuildReport, 
 		cancel()
 	}
 
-	env, err := sb.newEnvironment(ctx, sess.id, spec)
+	env, err := sb.newEnvironment(ctx, sess.id, spec, spec.Expose)
 	if err != nil {
 		sess.mu.Lock()
 		sess.state = StateLost

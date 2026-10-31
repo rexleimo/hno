@@ -432,6 +432,11 @@ type fanout struct {
 	seq    int64
 	sinks  []SinkBinding
 	closed bool
+	// tail holds the most recent output of the run, independent of whether any Sink
+	// is configured. A ReadyProbe that only worked when someone attached a sink would
+	// be the same class of no-op as the probe itself: a contract the caller cannot
+	// exercise without extra setup.
+	tail []byte
 	// delivered counts what the provider actually pushed while the run was alive,
 	// per stream. It exists so "this provider streams" is a measured fact rather
 	// than a capability bit the provider asserted about itself.
@@ -489,6 +494,7 @@ func (f *fanout) Report(chunk OutputChunk) error {
 		f.delivered = map[Stream]int64{}
 	}
 	f.delivered[chunk.Stream] += int64(len(chunk.Bytes))
+	f.retain(chunk.Bytes)
 	f.mu.Unlock()
 	if chunk.At.IsZero() {
 		chunk.At = time.Now().UTC()
@@ -546,4 +552,37 @@ func (f *fanout) deliveredBytes() (map[Stream]int64, int64) {
 		total += n
 	}
 	return out, total
+}
+
+// readinessTailBytes bounds the retained output window. It is a fixed cost per
+// background run, so it must stay small; it only has to be long enough to still
+// contain the line a service prints when it comes up.
+const readinessTailBytes = 64 << 10
+
+// retain appends to the bounded tail. Callers hold f.mu.
+func (f *fanout) retain(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	f.tail = append(f.tail, b...)
+	if len(f.tail) > readinessTailBytes {
+		// Keep the newest window: a readiness line is at the end, and an older
+		// startup banner that scrolled past is not something the probe should fire on.
+		f.tail = append(f.tail[:0], f.tail[len(f.tail)-readinessTailBytes:]...)
+	}
+}
+
+// outputSnapshot returns the retained output window.
+func (f *fanout) outputSnapshot() []byte {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.tail) == 0 {
+		return nil
+	}
+	out := make([]byte, len(f.tail))
+	copy(out, f.tail)
+	return out
 }

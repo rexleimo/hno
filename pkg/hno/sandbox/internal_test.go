@@ -586,3 +586,37 @@ func TestMergeHelpers(t *testing.T) {
 		t.Fatal("labelAttrs(nil)")
 	}
 }
+
+// TestFanoutTailStaysBounded is the cost guard for readiness matching. The core retains
+// a window of run output so a ReadyProbe works without any Sink, and an unbounded window
+// would turn a chatty background service into a memory leak inside the sandbox.
+func TestFanoutTailStaysBounded(t *testing.T) {
+	f := &fanout{runID: "r-1", delivered: map[Stream]int64{}}
+	chunk := make([]byte, 8<<10)
+	for i := range chunk {
+		chunk[i] = 'a'
+	}
+	for i := 0; i < 40; i++ { // 320 KiB through a 64 KiB window
+		f.mu.Lock()
+		f.retain(chunk)
+		f.mu.Unlock()
+	}
+	if got := len(f.outputSnapshot()); got > readinessTailBytes {
+		t.Fatalf("retained output window grew to %d bytes, cap is %d", got, readinessTailBytes)
+	}
+}
+
+// TestFanoutTailKeepsTheNewestOutput: a readiness line is at the end of a boot log, so a
+// ring that kept the head would never match.
+func TestFanoutTailKeepsTheNewestOutput(t *testing.T) {
+	f := &fanout{runID: "r-2", delivered: map[Stream]int64{}}
+	filler := bytes.Repeat([]byte("x"), readinessTailBytes)
+	f.mu.Lock()
+	f.retain(filler)
+	f.retain([]byte("server listening on 0.0.0.0:8080"))
+	f.mu.Unlock()
+	got := f.outputSnapshot()
+	if !bytes.Contains(got, []byte("server listening")) {
+		t.Fatal("the newest output was evicted, so a readiness pattern could never match")
+	}
+}

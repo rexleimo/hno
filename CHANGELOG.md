@@ -145,6 +145,37 @@ bit is a provider's assertion about itself, and nothing enforced it.
   managed, foreign container is reported by `Sweep` and refused by `Prune`. Verified
   under two concurrent gate processes: 6/6 pass each, zero skips, and zero
   `hno.sandbox.managed` residue left in the engine afterwards.
+### 🐛 Fixed (SB-B2d: silent no-ops on the request surface)
+- **`Request.ReadyProbe` was decorative.** `clone()` deep-copied it, `Validate()`
+  rejected an empty one, and no code ever read `URL`, `Port`, `Pattern`, or `Deadline`,
+  so "start a service and wait until it is ready" was implemented as "return
+  immediately" — the caller's next request hit a connection refused behind a reported
+  success. The core now waits: `Pattern` is matched against a bounded output window the
+  fanout retains regardless of whether any Sink is configured (a promise only
+  verifiable with extra machinery is its own silent no-op), while `Port`/`URL` are
+  answered by providers through the new optional `ReadinessProber` interface. A provider
+  that cannot inspect its guest is refused with `*UnsupportedProbeError`
+  (`ClassPermanent`) instead of being allowed to "pass", and a service that never comes
+  up yields `*ReadinessError` carrying what the provider actually saw plus a
+  `Remediation()`.
+- **`Request.Expose` could not be honoured by any provider.** The core checked
+  `CapPortForward`, but port mapping is a create-time property of the substrate and
+  `EnvSpec` — the only thing a provider receives at create — carried no field for it.
+  Expose now flows `SessionSpec.Expose` → `EnvSpec.Expose` at provisioning, reachable
+  through `WithSessionExpose(...)`, and a run asking for a mapping its session did not
+  publish is refused with `*ExposeConflictError` rather than silently dropped, which
+  would leave a caller probing a host port nothing forwards.
+- **Readiness validation tightened.** A `ReadyProbe` without `Background` is now refused
+  (a foreground run blocks until exit, so no moment exists to check it), a negative
+  `Deadline` is refused, and a non-compilable `Pattern` is refused at `Validate()`
+  instead of quietly being matched as a literal substring.
+- **The in-memory test double stopped lying in the same direction as a provider.** Its
+  background branch pushed chunks into its own buffer without ever calling
+  `sink.Report`, so pattern-based readiness could not see them; and implementing
+  `ReadinessProber` on the default double made the "provider cannot probe" path
+  untestable. Background output now flows through the sink, and probing lives on a
+  separate `sandboxtest.ProbedProvider` so both the supported and the unsupported path
+  stay reachable.
 ### 🐛 Fixed (SB-B2c: claim reconciliation, a flaky gate, and cross-process data loss)
 - **Capability claims were never reconciled with implementations.** A provider that
   declared `CapSnapshot` without implementing `Snapshotter` produced the message

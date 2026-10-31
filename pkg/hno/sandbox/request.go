@@ -3,6 +3,7 @@ package sandbox
 import (
 	"fmt"
 	"io"
+	"regexp"
 	"time"
 )
 
@@ -210,8 +211,28 @@ func (r Request) Validate() error {
 	if r.Timeout < 0 {
 		return fmt.Errorf("sandbox request timeout must not be negative")
 	}
-	if r.Background && r.ReadyProbe != nil && r.ReadyProbe.URL == "" && r.ReadyProbe.Port == 0 && r.ReadyProbe.Pattern == "" {
-		return fmt.Errorf("ready probe has no condition to check")
+	if r.ReadyProbe != nil {
+		// A probe needs a run that has already returned control, so only a detached
+		// run can be probed: a foreground command blocks until exit and nothing can
+		// observe it coming up. Rejecting the combination is the honest version of
+		// accepting a field that could never be evaluated.
+		if !r.Background {
+			return fmt.Errorf("ready probe requires Background: a foreground run blocks until it exits, so there is no moment at which to check readiness")
+		}
+		if r.ReadyProbe.URL == "" && r.ReadyProbe.Port == 0 && r.ReadyProbe.Pattern == "" {
+			return fmt.Errorf("ready probe has no condition to check")
+		}
+		if r.ReadyProbe.Deadline < 0 {
+			return fmt.Errorf("ready probe deadline must not be negative")
+		}
+		if r.ReadyProbe.Pattern != "" {
+			if _, err := regexp.Compile(r.ReadyProbe.Pattern); err != nil {
+				// Not fatal at run time — the core falls back to substring matching —
+				// but an uncompileable pattern is almost always a typo, and Validate is
+				// where a caller can still hear about it cheaply.
+				return fmt.Errorf("ready probe pattern is not a valid regexp (%v); it would be matched as a literal substring", err)
+			}
+		}
 	}
 	for path, file := range r.Files {
 		if err := checkRelPath("files", path); err != nil {

@@ -154,6 +154,11 @@ type SessionSpec struct {
 	Env       []string
 	Steps     []Step
 	MountMode MountMode
+	// Expose publishes guest ports when the environment is created. It lives here
+	// rather than only on Request because port mapping is a create-time property of the
+	// substrate: a run that asked for a mapping after the container existed could not
+	// have it applied, so the field would have been a promise no provider could keep.
+	Expose []PortMap
 	// Recorded is set once the spec has been persisted so callers can tell a
 	// fresh spec from a resumed one.
 	Recorded bool
@@ -164,6 +169,9 @@ type SessionSpec struct {
 func (sp SessionSpec) Clone() SessionSpec {
 	out := sp
 	out.Env = append([]string(nil), sp.Env...)
+	if sp.Expose != nil {
+		out.Expose = append([]PortMap(nil), sp.Expose...)
+	}
 	if sp.Steps != nil {
 		out.Steps = make([]Step, len(sp.Steps))
 		copy(out.Steps, sp.Steps)

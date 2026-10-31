@@ -711,6 +711,29 @@ func (e *ReadinessError) Error() string {
 // Class marks readiness failure as user code: the service is the payload.
 func (e *ReadinessError) Class() FailureClass { return ClassUserCode }
 
+// Remediation explains how to fix a service that never came up. It exists because
+// "never became ready" without a direction sends a caller to retry the same command,
+// and the class is ClassUserCode: the retry layer will not do it automatically, so the
+// message has to carry the whole answer.
+func (e *ReadinessError) Remediation() string {
+	kind := "condition"
+	switch {
+	case e.Probe.Pattern != "":
+		kind = "stdout/stderr pattern " + e.Probe.Pattern
+	case e.Probe.Port != 0:
+		kind = fmt.Sprintf("port %d accepting a connection", e.Probe.Port)
+	case e.Probe.URL != "":
+		kind = "URL " + e.Probe.URL + " returning 2xx"
+	}
+	window := "the session setup budget"
+	if e.Probe.Deadline > 0 {
+		window = e.Probe.Deadline.String()
+	}
+	return "the process is running but never satisfied " + kind + " within " + window +
+		"; check the service's own output for a startup error, bind to 0.0.0.0 rather than localhost, " +
+		"or widen ReadyProbe.Deadline if the boot is legitimately slow"
+}
+
 // VersionSkewError refuses to start when guest and SDK disagree (§15).
 type VersionSkewError struct {
 	Provider string
@@ -804,4 +827,31 @@ func joinStates(states []SessionState) string {
 		names = append(names, s.String())
 	}
 	return strings.Join(names, ", ")
+}
+
+// ExposeConflictError refuses a run that asks for a port the environment does not
+// publish.
+//
+// Port mapping is a create-time property of the substrate, so a request arriving after
+// the environment exists cannot be honoured. Silently ignoring it would leave the
+// caller probing a host port that nothing forwards, which is the same class of defect
+// as an unevaluated ReadyProbe.
+type ExposeConflictError struct {
+	SessionID   string
+	Wanted      PortMap
+	Provisioned []PortMap
+}
+
+func (e *ExposeConflictError) Error() string {
+	return fmt.Sprintf("session %s cannot publish guest port %d to host port %d: the environment was created with %s",
+		e.SessionID, e.Wanted.GuestPort, e.Wanted.HostPort, formatPortMaps(e.Provisioned))
+}
+
+// Class is permanent: repeating the run will not change what the substrate publishes.
+func (e *ExposeConflictError) Class() FailureClass { return ClassPermanent }
+
+// Remediation points at the only place the mapping can be declared.
+func (e *ExposeConflictError) Remediation() string {
+	return "declare the mapping when the session is created, in SessionSpec.Expose, and start a new session; " +
+		"Request.Expose on an existing session can only reuse what that session already published"
 }

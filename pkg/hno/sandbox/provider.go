@@ -44,6 +44,10 @@ type EnvSpec struct {
 	ReplayFrom  []Step // steps that still need replaying after cache lookup
 	CachedSteps []string
 	Labels      map[string]string
+	// Expose lists the guest ports the caller asked to publish. It arrives here rather
+	// than only in RunSpec.Request because a provider has to act on it at create:
+	// anything else would silently discard the request.
+	Expose []PortMap
 }
 
 // Environment is a live sandbox the provider manages: one micro-VM, one gVisor

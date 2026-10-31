@@ -135,6 +135,21 @@ func (sb *Sandbox) execute(ctx context.Context, sess *Session, req Request, ro r
 		runErr = collectErr
 	}
 
+	// 7b. A background run is not "started" until its ReadyProbe says so. The field
+	// used to be copied and validated and then read by nothing, which turned "start the
+	// service and wait until it is ready" into "return immediately" and left the
+	// caller's next request hitting a connection refused behind a reported success.
+	// Skipped once the run already failed: there is no service to wait for.
+	if runErr == nil && rc.Request.Background && rc.Request.ReadyProbe != nil {
+		if rerr := sb.waitReady(ctx, env, fan, rep.RunRef, rc.Request.ReadyProbe, rc.Budget.SetupTimeout); rerr != nil {
+			rep.Failure = AsFailure(rerr)
+			runErr = rerr
+			sb.reportFault(ctx, "readiness", rc.RunID, rerr)
+		} else {
+			sb.emit(ctx, Event{Kind: EventReady, RunID: rc.RunID, SessionID: rc.SessionID, Provider: sb.name})
+		}
+	}
+
 	// 8. Journal commit, breaker accounting, audit and events.
 	sb.commitOutcome(ctx, rc, rep, runErr)
 	sb.recordAudit(ctx, rc, rep, runErr)
@@ -384,7 +399,7 @@ func (sb *Sandbox) guardAttempt(rc *RunContext) error {
 // environmentFor resolves the execution substrate for a run.
 func (sb *Sandbox) environmentFor(ctx context.Context, sess *Session, rc *RunContext) (Environment, error) {
 	if sess == nil {
-		env, err := sb.newEnvironment(ctx, "", SessionSpec{Base: sb.cfg.Image, MountMode: rc.Request.Mode})
+		env, err := sb.newEnvironment(ctx, "", SessionSpec{Base: sb.cfg.Image, MountMode: rc.Request.Mode}, rc.Request.Expose)
 		if err != nil {
 			return nil, err
 		}
@@ -395,6 +410,15 @@ func (sb *Sandbox) environmentFor(ctx context.Context, sess *Session, rc *RunCon
 	sess.mu.Unlock()
 	switch {
 	case env != nil && state.AcceptsExec():
+		// Port mappings belong to the substrate: they are handed to the engine when the
+		// environment is created, so a later run cannot add one. Refusing is the only
+		// honest option — dropping the request would leave the caller believing a
+		// service was reachable from the host.
+		if len(rc.Request.Expose) > 0 {
+			if err := sb.checkExposed(sess, rc.Request.Expose); err != nil {
+				return nil, err
+			}
+		}
 		return env, nil
 	case state.Resumable() && sb.cfg.RetryMode == RebuildFromSpec && sb.caps.Has(CapRebuild):
 		if _, err := sb.rebuild(ctx, sess); err != nil {
@@ -652,4 +676,29 @@ func (sb *Sandbox) accountStreaming(rep *Report, fan *fanout) {
 	// can check without configuring anything) and through this event (for hosts that
 	// do observe).
 	sb.reportFault(context.Background(), "streaming", sb.name, violation)
+}
+
+// checkExposed verifies a run only asks for ports the session's environment already
+// publishes.
+func (sb *Sandbox) checkExposed(sess *Session, want []PortMap) error {
+	sess.mu.Lock()
+	have := append([]PortMap(nil), sess.spec.Expose...)
+	sess.mu.Unlock()
+	for _, w := range want {
+		matched := false
+		for _, h := range have {
+			if h.GuestPort == w.GuestPort && h.HostPort == w.HostPort {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return &ExposeConflictError{
+				SessionID:   sess.id,
+				Wanted:      w,
+				Provisioned: have,
+			}
+		}
+	}
+	return nil
 }

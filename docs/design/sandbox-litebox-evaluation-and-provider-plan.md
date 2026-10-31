@@ -575,3 +575,74 @@ PASS、零 SKIP、零 FAIL**，并发后引擎侧 `hno.sandbox.managed` 容器�
 未识别的键在 `NewProvider` 报错，不静默忽略——`Raw` 是引擎特定 passthrough，
 一个拼错或被忽略的键会被读成「配置已生效」，而 provider 其实在用默认值；passthrough
 表不能有这种失败模式。
+
+### 17.8 SB-B2d：Request 上的静默 no-op —— ReadyProbe 与 Expose
+
+延续 B2b/B2c 的思路，这次审计对象不是 provider 声明，而是**核心自己的请求字段**：
+被 `clone()` 深拷贝、被 `Validate()` 检查、然后被读完为止没有任何代码使用的字段。
+
+**（一）`ReadyProbe` 是装饰性字段。** `URL` / `Port` / `Pattern` / `Deadline` 四个字段
+的消费点数量为 **0**。文档承诺 `Background` + probe = 「起服务并等到就绪」，实际是
+「立刻返回，不管起没起」。证伪测试先行（`readiness_falsifier_test.go`）：
+
+```
+修复前： a background run whose probe never matched returned success → FAIL
+修复前： a ready probe on a foreground run was accepted              → FAIL
+```
+
+实现（`pkg/hno/sandbox/readiness.go`）：
+
+- `Pattern` 由**核心自己**匹配。为此 fanout 保留一段**有界输出窗口**（64 KiB 环形，
+  保留最新），并且**与是否配置 Sink 无关**——B2b 的教训是「只有装了 Observer 才能
+  验证的承诺本身就是静默 no-op」；这条用 `TestProbeWithoutSinkStillMatchesPattern`
+  钉住，用 `TestFanoutTailStaysBounded` / `TestFanoutTailKeepsTheNewestOutput` 钉住
+  成本与语义。
+- `Port` / `URL` 只能从 guest 内部回答，因此新增可选 provider 接口
+  `ReadinessProber`。**provider 做不到就明确拒绝**（`*UnsupportedProbeError`，
+  `ClassPermanent`，附 `Remediation()` 指向可用的 Pattern），而不是「探测通过」——
+  「静忽略」和「通过」在调用方看下来一模一样。
+- 超时返回 `*ReadinessError`（`ClassUserCode`，永不自动重试），带上 provider 实际
+  看到的 `LastSeen`（如 `connect: connection refused`）与回显的 probe，并首次补上
+  `Remediation()`。
+- 收紧校验：probe 不带 `Background` 现在**报错**（前台命令阻塞到退出，没有可以检查
+  的时刻）；`Deadline < 0` 报错；非法正则报错（此前会被当字面量子串匹配，是没人要求
+  的行为）。
+
+**（二）`Expose` 是结构性不可实现。** 核心在 `checkCapabilities` 里检查
+`CapPortForward`，看起来是接了；但端口映射必须在 **create** 时下发给引擎，而
+`EnvSpec`（create 时唯一交给 provider 的切面）**不含 Expose 字段**。因此不只是某个
+provider 没做——**任何 provider，现有与未来，都不可能履行这个字段**。
+
+修复把语义放到它只能在的地方：
+
+- `SessionSpec.Expose`（provision-time）+ `EnvSpec.Expose`，核心在 `newEnvironment`
+  把映射交给 provider；`WithSessionExpose(...)` 是调用方的声明入口。
+- run 级 `Request.Expose` 若与 session 已发布的映射不符 →
+  `*ExposeConflictError`（`ClassPermanent`，`Remediation()` 指明应在创建 session 时声明）。
+  静默丢弃会让调用方去探测一个根本没有转发的宿主端口。
+- 用 `TestEnvSpecCarriesExpose` 证明 provider 在 create 时真的收到映射，
+  用 `TestExposeOnForwardingSessionIsRefusedWhenNotPublished` /
+  `TestExposeMatchingWhatWasPublishedIsAccepted` 证明拒绝与放行都正确。
+
+**（三）上一轮的 bind 期核对立刻回敬了我。** 新写的测试 provider 声明了
+`CapFileBridge` 却没实现 `FileBridge`，`Open` 直接拒绝：
+
+```
+- forwarder: declares "files" without implementing FileBridge
+  (fix: implement FileBridge or drop the capability from Capabilities())
+```
+
+B2c 的机制在真实使用中抓住了一个新的谎报者——包括我自己刚写的那个。
+
+**（四）测试双再次差点朝同方向撒谎。** 给内存 provider 加 `ProbeReady` 后，它就不再
+是「无 prober 的 provider」，`UnsupportedProbeError` 路径**变得无法测试**。改为独立的
+`sandboxtest.ProbedProvider` 类型，默认双保持不可探测：一个接口必须留一个真实实现者
+（否则成功路径不可达），也必须留一个真实缺席者（否则拒绝路径不可达）。
+
+**语义表同步。** `CapPortForward` 原写「port mapping requests」是过度声明——请求被读
+了但没人能执行。现记录真实链路（SessionSpec→EnvSpec→create，mismatch→
+ExposeConflictError）；`CapBackground` 注明 ReadyProbe 在 detached run 上求值。
+
+**证据。** `go test -count=1 -race ./pkg/hno/sandbox/...` 全绿；core 覆盖 69.8%
+（↑自 69.3%），docker provider 57.5%。真实门 6/6 `ok 16.6s`（create 通路因
+EnvSpec 变更而受影响，故必须重跑）。新增 13 个测试，其中 2 个在修复前为红。

@@ -243,6 +243,16 @@ type sessionConfig struct {
 	IdleTTL         time.Duration
 	CreateIfMissing bool
 	Replay          bool
+	Expose          []PortMap
+}
+
+// WithSessionExpose publishes guest ports when this session's environment is created.
+//
+// Port mapping is a property of the substrate, not of a run: the engine learns about it
+// at create, so this is the only place a caller can ask. A Request.Expose that a session
+// did not publish is refused with *ExposeConflictError rather than dropped.
+func WithSessionExpose(maps ...PortMap) SessionOption {
+	return func(c *sessionConfig) { c.Expose = append([]PortMap(nil), maps...) }
 }
 
 // WithSessionImage overrides the handle image for this session.
@@ -316,7 +326,10 @@ func (sb *Sandbox) Session(ctx context.Context, id string, opts ...SessionOption
 	if opt.Image != "" {
 		spec.Base = opt.Image
 	}
-	env, err := sb.newEnvironment(ctx, id, spec)
+	if len(opt.Expose) > 0 {
+		spec.Expose = append([]PortMap(nil), opt.Expose...)
+	}
+	env, err := sb.newEnvironment(ctx, id, spec, spec.Expose)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +365,7 @@ func (sb *Sandbox) pickImage(opt sessionConfig, rec *SessionRecord) string {
 }
 
 // newEnvironment provisions the substrate for a session.
-func (sb *Sandbox) newEnvironment(ctx context.Context, id string, spec SessionSpec) (Environment, error) {
+func (sb *Sandbox) newEnvironment(ctx context.Context, id string, spec SessionSpec, expose []PortMap) (Environment, error) {
 	sb.emit(ctx, Event{Kind: EventProvisioning, SessionID: id, Provider: sb.name, Isolation: sb.iso})
 	pctx, cancel := context.WithTimeout(ctx, sb.cfg.Timeouts.Provision)
 	defer cancel()
@@ -365,6 +378,7 @@ func (sb *Sandbox) newEnvironment(ctx context.Context, id string, spec SessionSp
 		Budget:    Budget{SetupTimeout: sb.cfg.Timeouts.Setup, ExecTimeout: sb.cfg.Timeouts.Exec, OutputLimit: sb.cfg.Limits.OutputMaxBytes, WorkspaceLimit: sb.cfg.Limits.WorkspaceMaxBytes},
 		Limits:    sb.cfg.Limits,
 		Labels:    labelAttrs(sb.cfg.Attrs),
+		Expose:    append([]PortMap(nil), expose...),
 	})
 	if err != nil {
 		fix := "hno sandbox doctor"

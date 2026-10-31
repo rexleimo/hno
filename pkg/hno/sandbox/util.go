@@ -135,3 +135,15 @@ func tailExcerpt(s string, maxBytes int) string {
 	}
 	return fmt.Sprintf("[…%d bytes omitted] %s", cut, strings.TrimSpace(s[cut:]))
 }
+
+// formatPortMaps renders published ports for an error message.
+func formatPortMaps(maps []PortMap) string {
+	if len(maps) == 0 {
+		return "no published ports"
+	}
+	parts := make([]string, 0, len(maps))
+	for _, m := range maps {
+		parts = append(parts, fmt.Sprintf("%d->%d", m.HostPort, m.GuestPort))
+	}
+	return strings.Join(parts, ", ")
+}
