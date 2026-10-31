@@ -198,6 +198,7 @@ export default defineConfig({
                 { text: 'Tools 工具', link: '/zh/guide/tools' },
                 { text: '沙盒化文件 I/O', link: '/zh/guide/sandboxed-file-io' },
                 { text: '代码执行沙盒', link: '/zh/guide/code-execution-sandbox' },
+                { text: '沙盒运行时', link: '/zh/guide/sandbox-runtime' },
                 { text: 'Memory 记忆', link: '/zh/guide/memory' },
                 { text: '会话状态', link: '/zh/guide/session-state' },
                 { text: 'Go 会话服务', link: '/zh/guide/session-service' },
