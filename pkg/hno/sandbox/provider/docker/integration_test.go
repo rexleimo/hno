@@ -814,3 +814,92 @@ func findCheckNamed(diag *sandbox.DiagReport, env string) (sandbox.Check, bool) 
 	}
 	return sandbox.Check{}, false
 }
+
+// TestRealKernelBoundaryIsMeasured asks the live engine how much kernel its boxes
+// actually share, and pins the invariants that make the answer worth having.
+//
+// The assertions are deliberately about internal consistency rather than about what this
+// one host happened to report. Hardcoding "private-kernel" would make the test a record of
+// one machine, and hardcoding "shared-kernel" would make it pass on the very engine that
+// proved the name-based assumption wrong (the docker binary here is a shim over a VM
+// engine: four boxes, four distinct boot ids). What must hold everywhere is that the
+// verdict follows the readings, that the readings are real guest data, and that a
+// measurement that could not conclude says so instead of rounding up.
+func TestRealKernelBoundaryIsMeasured(t *testing.T) {
+	ctx := context.Background()
+	sb := requireRealEngine(t, ctx)
+
+	report, err := sb.MeasureKernelBoundary(ctx, 2)
+	if err != nil {
+		t.Fatalf("the live engine could not be measured: %v", err)
+	}
+	distinct := report.Distinct()
+	t.Logf("verdict=%s boxes=%d distinct=%d guest=%q host=%q", report.Verdict, report.Boxes, distinct, report.GuestKernel, report.HostKernel)
+
+	switch report.Verdict {
+	case sandbox.BoundaryPrivateKernel:
+		if distinct != report.Boxes {
+			t.Errorf("verdict %q with only %d distinct readings for %d boxes: the readings contradict the conclusion", report.Verdict, distinct, report.Boxes)
+		}
+	case sandbox.BoundarySharedKernel:
+		if distinct >= report.Boxes {
+			t.Errorf("verdict %q with %d distinct readings for %d boxes", report.Verdict, distinct, report.Boxes)
+		}
+	case sandbox.BoundaryUnknown:
+		t.Fatalf("the engine answered nothing usable; evidence=%v fixes=%v", report.Evidence, report.Fixes)
+	default:
+		t.Fatalf("verdict %q is not an answer", report.Verdict)
+	}
+
+	// The readings have to be real guest data, not placeholders. A boot id is an
+	// opaque uuid-shaped string; an uptime is a number.
+	for i, id := range report.BootIDs {
+		if len(strings.TrimSpace(id)) < 8 {
+			t.Errorf("box %d boot id %q is not a kernel reading", i+1, id)
+		}
+	}
+	if report.GuestKernel == "" {
+		t.Errorf("no guest kernel recorded, so the host/guest contrast is missing")
+	}
+	if len(report.Uptimes) != report.Boxes {
+		t.Errorf("uptimes=%v for %d boxes: corroboration is optional here and should not be", report.Uptimes, report.Boxes)
+	}
+
+	// A measurement must leave nothing behind. The boxes are real VMs on this host;
+	// leaking them is the most expensive way to answer a question.
+	if r, ok := sb.Reclaimer(); ok {
+		leaked, err := r.Sweep(ctx)
+		if err != nil {
+			t.Fatalf("Sweep after measuring: %v", err)
+		}
+		for _, ref := range leaked {
+			if strings.Contains(ref, "hno-boundary") {
+				t.Errorf("the boundary measurement left %q running: %v", ref, leaked)
+			}
+		}
+	}
+
+	// The verdict must be stable enough to gate on: two measurements of the same
+	// engine agree. One flip is noise; the CLI's --expect exists to be trusted.
+	again, err := sb.MeasureKernelBoundary(ctx, 2)
+	if err != nil {
+		t.Fatalf("second measurement: %v", err)
+	}
+	if again.Verdict != report.Verdict {
+		t.Errorf("the same engine measured %q then %q; a verdict that flip-flops cannot gate a script", report.Verdict, again.Verdict)
+	}
+
+	// And the cached verdict must reach the health report, which is where an operator
+	// looks first.
+	diag, err := sb.Diagnose(ctx)
+	if err != nil {
+		t.Fatalf("Diagnose: %v", err)
+	}
+	c, hit := findCheckNamed(diag, "kernel-boundary")
+	if !hit {
+		t.Fatal("the measurement is cached but Diagnose does not report it: implemented, unreachable")
+	}
+	if !c.OK {
+		t.Errorf("the floor this handle was opened with is container isolation, which either verdict satisfies, yet the check failed: %+v", c)
+	}
+}

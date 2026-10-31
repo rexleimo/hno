@@ -309,6 +309,13 @@ func TestGuideAPINamesResolve(t *testing.T) {
 var bareFamilyRe = regexp.MustCompile(`\b(?:With|Act|Isolation|Cap|Overflow|Mount|Profile|Err|Class)[A-Z][A-Za-z0-9]*`)
 
 func TestGuideBareAPINamesResolve(t *testing.T) {
+	// Every documented locale gets the same treatment: a broken fence or an invented
+	// method call in the translated page is just as broken for its readers, and before
+	// D-37 these three gates read only the first page.
+	forEachGuide(t, guideBareNames)
+}
+
+func guideBareNames(t *testing.T, lines []string, page string) {
 	// The universe is the documented family, not one directory: prose about graph nodes
 	// legitimately names sandbox/graph options, and a too-narrow universe reports real API
 	// as invented -- which trains readers to ignore the gate.
@@ -317,7 +324,7 @@ func TestGuideBareAPINamesResolve(t *testing.T) {
 	graphPkg := surfaceOf(t, mustAbs(t, "./graph"))
 	var buf strings.Builder
 	depth := 0
-	for _, ln := range readGuide(t) {
+	for _, ln := range lines {
 		if strings.HasPrefix(strings.TrimSpace(ln), "```") {
 			depth++
 			continue
@@ -337,7 +344,7 @@ func TestGuideBareAPINamesResolve(t *testing.T) {
 		if core.names[name] || runPkg.names[name] || graphPkg.names[name] {
 			continue
 		}
-		t.Errorf("guide prose uses %q, which looks like an API name from a fixed prefix family but is exported by neither pkg/hno/sandbox, pkg/hno/tools/run, nor pkg/hno/sandbox/graph", name)
+		t.Errorf("%s prose uses %q, which looks like an API name from a fixed prefix family but is exported by neither pkg/hno/sandbox, pkg/hno/tools/run, nor pkg/hno/sandbox/graph", page, name)
 	}
 }
 
@@ -360,7 +367,13 @@ func mustAbs(t *testing.T, rel string) string {
 // TestGuideCodeFencesParse keeps the copy-paste path honest: a fenced example that is not
 // valid Go is not an example.
 func TestGuideCodeFencesParse(t *testing.T) {
-	lines := readGuide(t)
+	// Every documented locale gets the same treatment: a broken fence or an invented
+	// method call in the translated page is just as broken for its readers, and before
+	// D-37 these three gates read only the first page.
+	forEachGuide(t, guideCodeFences)
+}
+
+func guideCodeFences(t *testing.T, lines []string, page string) {
 	var (
 		fence []string
 		in    bool
@@ -421,7 +434,13 @@ var stdlibCalls = map[string]bool{
 }
 
 func TestGuideFencedMethodCallsExist(t *testing.T) {
-	lines := readGuide(t)
+	// Every documented locale gets the same treatment: a broken fence or an invented
+	// method call in the translated page is just as broken for its readers, and before
+	// D-37 these three gates read only the first page.
+	forEachGuide(t, guideFencedMethodCalls)
+}
+
+func guideFencedMethodCalls(t *testing.T, lines []string, page string) {
 	universe := map[string]bool{}
 	for _, rel := range []string{".", "../tools/run", "./graph", "./provider/docker", "../graph"} {
 		dir := mustAbs(t, rel)

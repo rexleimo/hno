@@ -26,6 +26,12 @@ func TestMain(m *testing.M) {
 	if err := reclaimFixture(); err != nil {
 		panic(err)
 	}
+	if err := boundaryFixture(); err != nil {
+		panic(err)
+	}
+	if err := boundaryQuietFixture(); err != nil {
+		panic(err)
+	}
 	// The memory provider is not container isolation, and several tests ask the CLI for
 	// the floor it actually satisfies.
 	m.Run()
@@ -454,6 +460,189 @@ func reclaimFixture() error {
 		return recFixture, nil
 	})
 }
+
+// boundaryFixture is the memory double under its own name, reachable so a test can set
+// what the engine "answered" without editing the runtime's behaviour.
+var bndFixture *sandboxtest.Provider
+
+const boundaryProviderName = "hno-cli-boundary"
+
+func boundaryQuietFixture() error {
+	base, err := sandboxtest.NewProvider(sandbox.ProviderConfig{})
+	if err != nil {
+		return err
+	}
+	inner := base.(*sandboxtest.Provider)
+	return sandbox.RegisterProvider("hno-cli-no-boundary", func(sandbox.ProviderConfig) (sandbox.Provider, error) {
+		return quietProvider{inner: inner}, nil
+	})
+}
+
+func boundaryFixture() error {
+	base, err := sandboxtest.NewProvider(sandbox.ProviderConfig{})
+	if err != nil {
+		return err
+	}
+	bndFixture = base.(*sandboxtest.Provider)
+	return sandbox.RegisterProvider(boundaryProviderName, func(sandbox.ProviderConfig) (sandbox.Provider, error) {
+		return bndFixture, nil
+	})
+}
+
+func runBoundary(args ...string) (code int, stdout, stderr string) {
+	var out, errOut bytes.Buffer
+	code = sandboxMain(append([]string{"boundary", "--provider", boundaryProviderName}, args...), &out, &errOut)
+	return code, out.String(), errOut.String()
+}
+
+// TestBoundaryVerbReportsWhatTheEngineSaid is the reachability half again: the runtime
+// answer must arrive through the CLI, because an API nobody can call from a shell is the
+// defect D-36 was.
+func TestBoundaryVerbReportsWhatTheEngineSaid(t *testing.T) {
+	bndFixture.BoundaryReport = nil
+	code, stdout, stderr := runBoundary()
+	if code != 0 {
+		t.Fatalf("exit %d, want 0 (measured, no expectation set): %s", code, stderr)
+	}
+	// The per-box reading lines are the docker provider's prose, not part of the
+	// contract, so the assertions stay on what the runtime guarantees to render.
+	for _, want := range []string{"kernel boundary:", "shared-kernel", "distinct kernel readings", "boxes: 2"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("boundary output missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+// TestBoundaryExpectationIsADecisionNotAComment: --expect exists so a script can gate on
+// the measurement. A mismatch has to change the exit code, not just the prose.
+func TestBoundaryExpectationIsADecisionNotAComment(t *testing.T) {
+	bndFixture.BoundaryReport = nil
+	if code, _, stderr := runBoundary("--expect", "shared-kernel"); code != 0 {
+		t.Errorf("matching expectation exited %d: %s", code, stderr)
+	}
+	code, stdout, stderr := runBoundary("--expect", "private-kernel")
+	if code != exitDiagFailed {
+		t.Fatalf("a measured shared kernel passed a private-kernel expectation (exit %d):\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "measured shared-kernel") || !strings.Contains(stderr, "expected private-kernel") {
+		t.Errorf("mismatch message does not name both sides: %s", stderr)
+	}
+}
+
+// TestBoundaryTypoInExpectationIsAUsageError keeps a mistyped gate from silently
+// meaning something else, the same way --isolation refuses a typo.
+func TestBoundaryTypoInExpectationIsAUsageError(t *testing.T) {
+	code, _, stderr := runBoundary("--expect", "privae")
+	if code != exitUsage {
+		t.Fatalf("a typo in --expect exited %d, want %d: %s", code, exitUsage, stderr)
+	}
+	if !strings.Contains(stderr, "shared-kernel") {
+		t.Errorf("the rejection does not list the accepted vocabulary: %s", stderr)
+	}
+}
+
+// TestBoundaryBoxBudgetExitsAsAUsageError: an out-of-range box count is a bad flag, and
+// the cost guard must say so before booting anything.
+func TestBoundaryBoxBudgetExitsAsAUsageError(t *testing.T) {
+	before := bndFixture.BoundaryCalls
+	code, _, stderr := runBoundary("--boxes", "9")
+	if code != exitUsage {
+		t.Fatalf("boxes=9 exited %d, want %d: %s", code, exitUsage, stderr)
+	}
+	if bndFixture.BoundaryCalls != before {
+		t.Errorf("an invalid box count still reached the engine %d times", bndFixture.BoundaryCalls-before)
+	}
+	if !strings.Contains(stderr, "hno sandbox boundary") {
+		t.Errorf("the remediation does not repeat the command: %s", stderr)
+	}
+}
+
+// TestBoundaryUnknownIsNotSilentlyGreen: an engine that gave no usable readings must not
+// exit 0, because "unknown" read as healthy is the exact bug this batch keeps meeting.
+func TestBoundaryUnknownIsNotSilentlyGreen(t *testing.T) {
+	bndFixture.BoundaryReport = &sandbox.KernelBoundaryReport{Boxes: 2, Verdict: sandbox.BoundaryUnknown}
+	defer func() { bndFixture.BoundaryReport = nil }()
+	code, stdout, _ := runBoundary()
+	if code != exitDiagFailed {
+		t.Fatalf("an unknown verdict exited %d (want %d):\n%s", code, exitDiagFailed, stdout)
+	}
+}
+
+// TestBoundaryPrivateVerdictSatisfiesTheMicroVMExpectation is the positive case the
+// feature exists for, driven end to end through the CLI.
+func TestBoundaryPrivateVerdictSatisfiesTheMicroVMExpectation(t *testing.T) {
+	bndFixture.BoundaryReport = &sandbox.KernelBoundaryReport{
+		Boxes:       2,
+		Verdict:     sandbox.BoundaryPrivateKernel,
+		BootIDs:     []string{"f5fe7518-a61c", "d2cc867c-082b"},
+		GuestKernel: "Linux 6.18.35",
+		Evidence:    []string{"box 1: boot_id=f5fe7518-a61c"},
+	}
+	defer func() { bndFixture.BoundaryReport = nil }()
+	code, stdout, stderr := runBoundary("--expect", "private")
+	if code != 0 {
+		t.Fatalf("a genuine private-kernel measurement failed: exit %d\n%s\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "guest kernel: Linux 6.18.35") {
+		t.Errorf("the guest/host contrast is missing from the output:\n%s", stdout)
+	}
+}
+
+// TestBoundaryJSONCarriesTheReadings keeps --json a contract, not a summary: a reader
+// has to be able to check the verdict against the numbers it came from.
+func TestBoundaryJSONCarriesTheReadings(t *testing.T) {
+	bndFixture.BoundaryReport = nil
+	code, stdout, stderr := runBoundary("--json")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("--json is not parseable: %v\n%s", err, stdout)
+	}
+	if got["Verdict"] != "shared-kernel" {
+		t.Errorf("verdict in json is %#v; it must be the name, not an integer", got["Verdict"])
+	}
+	ids, ok := got["BootIDs"].([]any)
+	if !ok || len(ids) != 2 {
+		t.Errorf("json carries no readable boot ids: %#v", got["BootIDs"])
+	}
+}
+
+// TestBoundaryProviderThatCannotAnswerIsAnEnvironmentProblem checks the exit code
+// separation: nothing about the command line was wrong.
+func TestBoundaryProviderThatCannotAnswerIsAnEnvironmentProblem(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := sandboxMain([]string{"boundary", "--provider", "hno-cli-no-boundary"}, &out, &errOut)
+	if code == 0 {
+		t.Fatalf("a provider that cannot measure exited 0: %s", out.String())
+	}
+	if code == exitUsage {
+		t.Errorf("an engine limitation was reported as a bad command line: %s", errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "KernelBoundaryQueryable") {
+		t.Errorf("the message does not name the interface to implement: %s", errOut.String())
+	}
+}
+
+// quietProvider delegates the six required methods and deliberately drops every
+// optional one. Delegation rather than embedding is the point: embedding
+// *sandboxtest.Provider would promote MeasureKernelBoundary and the assertion below
+// would pass whether the engine could answer or not.
+type quietProvider struct {
+	inner sandbox.Provider
+}
+
+func (p quietProvider) Name() string                 { return p.inner.Name() }
+func (p quietProvider) Isolation() sandbox.Isolation { return p.inner.Isolation() }
+func (p quietProvider) Capabilities() sandbox.CapabilitySet {
+	return 0 // forwarding the inner set would claim bridges this wrapper does not provide
+}
+func (p quietProvider) Probe(ctx context.Context) error { return p.inner.Probe(ctx) }
+func (p quietProvider) NewEnvironment(ctx context.Context, spec sandbox.EnvSpec) (sandbox.Environment, error) {
+	return p.inner.NewEnvironment(ctx, spec)
+}
+func (p quietProvider) Close(ctx context.Context) error { return p.inner.Close(ctx) }
 
 // The CLI advertises a vocabulary in its flag help. If the names it prints are not the
 // names the parser accepts, the help text is a defect even when every code path works --

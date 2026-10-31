@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ Added (B5a / D-38：隔离档位改为实测)
+- 新可选接口 **`sandbox.KernelBoundaryQueryable`**（`MeasureKernelBoundary(ctx, boxes)`）：provider 起若干盒、
+  读每盒 `/proc/sys/kernel/random/boot_id` + `/proc/uptime` + `uname -sr`，**由读数**判定档位。
+  四态 `private-kernel` / `shared-kernel` / `unknown` / `unmeasured` 不可混用；`unknown` 不得伪装成健康。
+- docker provider 实现之（复用 create/start/exec/close **同一条生命周期路径**，不另造轻路径）；
+  成本铁律：provider 不支持 ⇒ 类型化错误点名接口且**零启动**；盒数越界 ⇒ `BoundaryBudgetError` 且零启动；
+  镜像缺失先问（承 D-36）；teardown 失败写入 `Fixes` 并指向 `hno sandbox prune`。
+- **核心纠正过度声称**：provider 报 `private-kernel` 而 boot id 相同时，降为 `shared-kernel` 并给原因。
+- `Diagnose` 报告缓存的结论并对照本句柄下限（**绝不主动起盒**）；未测量时不产生该项检查。
+- 新 CLI 动词 **`hno sandbox boundary`**（`--boxes` / `--expect` / `--json`）：`0` 测得且相符、
+  `1` 结论 `unknown` 或不符、`70` 无法测量、`2` 参数错。dispatcher/帮助/未知动词提示改由
+  `sandboxVerbs` 单一列表驱动（原先三处手抄，会互相矛盾）。
+- 现场证据：本机 `docker` 是 Apple containerisation 的 shim（`docker info`），4 盒 4 个不同 boot_id ⇒
+  **每盒一个内核**；真实引擎门 `verdict=private-kernel (2/2 distinct)`，残留 0。
+- 中英 guide 新增「隔离度是实测出来的，不是按名字给的」一节 + 退出码表 `boundary` 行；
+  五道文档门现已**逐语言**运行（此前围栏语法门/方法调用门/裸名门只看英文页——D-37 的洞没堵完）。
+
+### 🐛 Fixed（本轮被自己的测试抓出）
+- `defer` 中修改 `report` 而返回**值拷贝** ⇒ teardown 泄漏信息永远丢失。改为具名返回值，
+  由 `TestBoundaryTeardownFailureIsReportedNotSwallowed` 事先钉住。
+
 ### ✨ Added (B4i：中文 guide + 跨语言文档门禁)
 - 新页 `website/zh/guide/sandbox-runtime.md`，并挂进 zh 侧栏（`沙盒运行时`，与英文页同位置）。
   渲染证据：`dist/zh/guide/sandbox-runtime.html`、zh 侧栏与前后翻页链接均出现、进 sitemap，
