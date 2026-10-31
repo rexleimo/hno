@@ -485,6 +485,53 @@ func (sb *Sandbox) Diagnose(ctx context.Context) (*DiagReport, error) {
 	} else {
 		report.Checks = append(report.Checks, Check{Env: "probe", Want: "ok", Got: "ok", OK: true})
 	}
+	// The image question, separate from the engine question above (D-36). A handle bound
+	// to an image the engine cannot start is not healthy, and "probe: ok" never meant it
+	// was -- the probe deliberately avoids pulling, so an absent image was invisible here
+	// and only surfaced as a failed run.
+	if img := sb.cfg.Image; img != "" && sb.provider != nil {
+		q, canAsk := sb.provider.(ImageQueryable)
+		switch {
+		case !canAsk:
+			report.Checks = append(report.Checks, Check{
+				Env:  "image",
+				Want: "presence answerable by the provider",
+				Got:  fmt.Sprintf("provider %q answers no image query", sb.name),
+				OK:   false,
+				Fix:  fmt.Sprintf("implement sandbox.ImageQueryable on provider %q, or bind WithImage to an image that provider can verify; an unverifiable image is not a passing check", sb.name),
+			})
+			report.Fixes = append(report.Fixes, fmt.Sprintf("provider %q cannot say whether image %q exists, so this report cannot vouch for it", sb.name, img))
+		default:
+			present, err := q.ImageAvailable(ctx, img)
+			switch {
+			case err != nil:
+				report.Checks = append(report.Checks, Check{
+					Env:  "image",
+					Want: "answerable",
+					Got:  "unknown: " + err.Error(),
+					OK:   false,
+					Fix:  fmt.Sprintf("the engine would not answer for image %q; check registry access or credentials, then re-run Diagnose", img),
+				})
+				report.Fixes = append(report.Fixes, fmt.Sprintf("image %q could not be verified: %v", img, err))
+			case !present:
+				report.Checks = append(report.Checks, Check{
+					Env:  "image",
+					Want: "present in the local store",
+					Got:  fmt.Sprintf("absent: %s", img),
+					OK:   false,
+					Fix:  fmt.Sprintf("pull or build %s in this engine, or point WithImage at an image it already has; nothing will start until then", img),
+				})
+				report.Fixes = append(report.Fixes, fmt.Sprintf("image %s is not available in this engine", img))
+			default:
+				report.Checks = append(report.Checks, Check{
+					Env:  "image",
+					Want: "present in the local store",
+					Got:  fmt.Sprintf("present: %s", img),
+					OK:   true,
+				})
+			}
+		}
+	}
 	if sb.cfg.AllowFallback && len(sb.cfg.Observers) == 0 {
 		report.Checks = append(report.Checks, Check{Env: "fallback-observer", Want: "observer registered", Got: "none", OK: false, Fix: "add WithObserver: a downgrade that nobody reports is a silent isolation loss"})
 		report.Fixes = append(report.Fixes, "register an observer before enabling fallback tiers")

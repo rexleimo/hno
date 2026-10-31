@@ -133,6 +133,22 @@ type Cloner interface {
 	Clone(ctx context.Context, env Environment, as string) (Environment, error)
 }
 
+// ImageQueryable is implemented by providers that can answer, in the engine's own
+// vocabulary, whether an image is already available here.
+//
+// It exists because "the engine works" and "this image can start" are two different
+// claims. A probe asks whether the engine can create anything at all and deliberately
+// does not pull, so before this interface a healthy engine produced "all checks passed"
+// next to an image the registry had never heard of, and the first real run was where the
+// operator found out (D-36).
+//
+// The three answers are distinct on purpose: present, absent, and "I asked and the engine
+// would not say". Only the first is a pass; an unanswered question is reported as one
+// rather than rounded up to healthy.
+type ImageQueryable interface {
+	ImageAvailable(ctx context.Context, image string) (bool, error)
+}
+
 // Attacher is implemented by providers declaring CapQueryStatus /
 // CapBackground (§15).
 type Attacher interface {

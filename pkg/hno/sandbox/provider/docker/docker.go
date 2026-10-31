@@ -518,6 +518,22 @@ func refusesCreate(msg string) bool {
 	return false
 }
 
+// ImageAvailable implements sandbox.ImageQueryable: it answers whether the image is
+// already in the engine's local store, which is a different fact from "the engine can
+// create at all" and the one Diagnose needs before promising that a run will start (D-36).
+//
+// The question goes through the dialect rather than a hard-coded `docker inspect`, because
+// the same lookup asked in the wrong vocabulary comes back as a usage error, and a usage
+// error would be reported as an absent image.
+func (p *Provider) ImageAvailable(ctx context.Context, image string) (bool, error) {
+	if image == "" {
+		return false, fmt.Errorf("docker provider: no image configured, so nothing to verify")
+	}
+	ctx, cancel := p.bounded(ctx, 15*time.Second)
+	defer cancel()
+	return p.dial.hasImage(ctx, p.runner, p.bin, image)
+}
+
 // probeImage is the configured image, so the capability question is asked against
 // the environment the caller actually intends to use.
 func (p *Provider) probeImage() string {

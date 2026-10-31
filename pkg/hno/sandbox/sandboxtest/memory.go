@@ -34,6 +34,14 @@ type Provider struct {
 	ProbeErr error
 	// SlowBoot simulates boot latency so timeout behaviour is testable.
 	SlowBoot time.Duration
+	// AbsentImages are the images this double reports as missing from the local store.
+	// Empty means every image is present, which is the honest answer for a double that
+	// will boot an environment from any image it is handed -- a double that lied about
+	// that would make the image check untestable in the other direction.
+	AbsentImages []string
+	// ImageQueryErr simulates an engine that refuses to answer the image question,
+	// which must be reported as unknown rather than rounded up to present.
+	ImageQueryErr error
 }
 
 // ProbedProvider wraps Provider with in-guest readiness answers.
@@ -84,6 +92,22 @@ func (p *Provider) Name() string { return "memory" }
 // Isolation reports syscall-filtered isolation: the highest level an in-memory
 // provider can honestly claim (D-02 asks for the real level, not a hopeful one).
 func (p *Provider) Isolation() sandbox.Isolation { return sandbox.IsolationContainer }
+
+// ImageAvailable implements sandbox.ImageQueryable, so the image half of Diagnose is
+// reachable offline and against a controllable answer.
+func (p *Provider) ImageAvailable(_ context.Context, image string) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ImageQueryErr != nil {
+		return false, p.ImageQueryErr
+	}
+	for _, absent := range p.AbsentImages {
+		if absent == image {
+			return false, nil
+		}
+	}
+	return true, nil
+}
 
 // Capabilities declares everything the contract exercises.
 func (p *Provider) Capabilities() sandbox.CapabilitySet {
