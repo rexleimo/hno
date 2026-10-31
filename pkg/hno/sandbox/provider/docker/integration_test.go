@@ -738,3 +738,79 @@ func TestRealExpiredSessionReclaimsTheContainer(t *testing.T) {
 		t.Fatalf("an expired session reports %s, want lost or released", st)
 	}
 }
+
+// TestRealImageCheckIsNotAFalseGreen closes the measurement that opened D-36: on this
+// machine, a handle bound to an image the registry has never heard of produced
+// "all 8 checks passed" and exit 0 from the CLI, while the very same image through
+// `run` failed with the engine's own 401. The probe question and the image question are
+// different, and the report has to say so against a live engine rather than only against
+// a double.
+//
+//	HNO_SANDBOX_DOCKER=1 go test -run TestRealImageCheck ./pkg/hno/sandbox/provider/docker -v
+func TestRealImageCheckIsNotAFalseGreen(t *testing.T) {
+	ctx := context.Background()
+
+	// The image the engine really has. requireRealEngine owns the skip reason and also
+	// declines when the image is not local, because this gate never pulls.
+	sb := requireRealEngine(t, ctx)
+	diag, err := sb.Diagnose(ctx)
+	if err != nil {
+		t.Fatalf("Diagnose: %v", err)
+	}
+	imgCheck, hit := findCheckNamed(diag, "image")
+	if !hit {
+		t.Fatal(`no "image" check against the real engine`)
+	}
+	if !imgCheck.OK {
+		t.Errorf("the engine has %s, so the image check must not fail: %+v", testImage(t), imgCheck)
+	}
+
+	// A second handle bound to an image that cannot exist here. Open succeeds and the
+	// probe passes -- which is precisely the old false green.
+	bogus := "hno-does-not-exist/d36:0"
+	absent, err := sandbox.Open(ctx,
+		sandbox.WithProvider("docker"),
+		sandbox.WithAllowedProviders("docker"),
+		sandbox.WithImage(bogus),
+		sandbox.WithMinimumIsolation(sandbox.IsolationContainer),
+		sandbox.WithAttrs(map[string]any{"binary": dockerBinary()}),
+	)
+	if err != nil {
+		t.Fatalf("Open with %q: %v", bogus, err)
+	}
+	t.Cleanup(func() { _ = absent.Close() })
+
+	diag2, err := absent.Diagnose(ctx)
+	if err != nil {
+		t.Fatalf("Diagnose (bogus image): %v", err)
+	}
+	c2, hit := findCheckNamed(diag2, "image")
+	if !hit {
+		t.Fatal(`no "image" check for the absent image`)
+	}
+	if c2.OK {
+		t.Errorf("D-36 is back: an image this engine cannot start was reported as healthy while the probe also said ok: %+v", c2)
+	}
+	if probe, ok := findCheckNamed(diag2, "probe"); !ok || !probe.OK {
+		t.Logf("probe check in the same report: %+v (exists=%v)", probe, ok)
+	}
+	if !strings.Contains(c2.Got, bogus) {
+		t.Errorf("the finding must name the image the operator asked for, got %q", c2.Got)
+	}
+	if !strings.Contains(c2.Fix, "pull") && !strings.Contains(c2.Fix, "WithImage") {
+		t.Errorf("the fix must be actionable, got %q", c2.Fix)
+	}
+	// The summary must not read as clean while an image is blocking.
+	if strings.Contains(diag2.Summary, "all") && !strings.Contains(strings.ToLower(diag2.Summary), "fail") {
+		t.Errorf("summary claims everything passed while the image check failed: %q", diag2.Summary)
+	}
+}
+
+func findCheckNamed(diag *sandbox.DiagReport, env string) (sandbox.Check, bool) {
+	for _, c := range diag.Checks {
+		if c.Env == env {
+			return c, true
+		}
+	}
+	return sandbox.Check{}, false
+}

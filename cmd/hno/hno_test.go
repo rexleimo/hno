@@ -201,6 +201,54 @@ func TestDoctorJSONIsTheRuntimeReport(t *testing.T) {
 	}
 }
 
+// D-36 reached the command line: doctor used to print "all checks passed" for an image
+// the engine cannot start, and exit 0. That green light is now a failing verdict, because
+// a health report that promises less than the engine can deliver is worse than no report.
+func TestDoctorFailsOnAnImageTheEngineCannotStart(t *testing.T) {
+	const bogus = "hno-clinic/absent:1"
+	recFixture.absentImages = []string{bogus}
+	t.Cleanup(func() { recFixture.absentImages = nil })
+
+	var stdout, stderr bytes.Buffer
+	code := sandboxMain([]string{"doctor", "--provider", reclaimProviderName, "--image", bogus}, &stdout, &stderr)
+	if code != exitDiagFailed {
+		t.Fatalf("doctor exit = %d, want %d for an image that cannot start; output:\n%s", code, exitDiagFailed, stdout.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "image") || !strings.Contains(out, bogus) {
+		t.Errorf("doctor must name the image it refused:\n%s", out)
+	}
+	if strings.Contains(out, "all ") && strings.Contains(out, "checks passed") {
+		t.Errorf("doctor still reads as clean while an image is blocking:\n%s", out)
+	}
+
+	// And the image verdict alone flips to healthy for an image the engine has. The
+	// overall exit code is not the evidence here: this fixture provider also trips the
+	// capabilities-without-behaviour check, which is that check working correctly.
+	recFixture.absentImages = nil
+	stdout.Reset()
+	stderr.Reset()
+	if code := sandboxMain([]string{"doctor", "--provider", reclaimProviderName, "--image", "present:1", "--json"}, &stdout, &stderr); code != exitOK && code != exitDiagFailed {
+		t.Fatalf("doctor exit = %d: %s", code, stderr.String())
+	}
+	var diag sandbox.DiagReport
+	if err := json.Unmarshal(stdout.Bytes(), &diag); err != nil {
+		t.Fatalf("--json after clearing the absent image: %v\n%s", err, stdout.String())
+	}
+	img, hit := false, false
+	for _, c := range diag.Checks {
+		if c.Env == "image" {
+			hit, img = true, c.OK
+		}
+	}
+	if !hit {
+		t.Fatal("the image check disappeared once the image was available")
+	}
+	if !img {
+		t.Errorf("a present image was still reported as unhealthy:\n%s", stdout.String())
+	}
+}
+
 func TestRunPassesThePayloadStatusThrough(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := sandboxMain([]string{"run", "--provider", "memory", "--isolation", "none", "--shell", "#!exit 3"}, &stdout, &stderr)
@@ -345,7 +393,20 @@ type reclaimStats struct {
 
 type fixtureProvider struct {
 	*sandboxtest.Provider
-	stats *reclaimStats
+	stats        *reclaimStats
+	absentImages []string
+}
+
+// ImageAvailable makes the fixture answer the image question, so the CLI's doctor
+// behaviour on an absent image is exercised offline against the same interface the
+// docker provider implements.
+func (p *fixtureProvider) ImageAvailable(_ context.Context, image string) (bool, error) {
+	for _, absent := range p.absentImages {
+		if absent == image {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (p *fixtureProvider) Sweep(ctx context.Context) ([]string, error) {
