@@ -558,3 +558,20 @@ deadline 及窗口长度，有 stderr 时保留引擎原文，全空时如实说
 **证据。** 离线 `go test -race` 全绿，core 覆盖 69.3%、docker provider 57.5%。
 真实门 6 个，单进程连跑 4/4 全绿（修复前 4 次挂 2 次）；**两个进程并发各 6/6
 PASS、零 SKIP、零 FAIL**，并发后引擎侧 `hno.sandbox.managed` 容器残留为 **0**。
+
+### 17.7 Docker/Container provider 引擎属性（`ProviderConfig.Raw`）
+
+这些是 provider 唯一接受并真正读取的引擎级配置。此前无表格文档，是 `startup_timeout`
+能被写成文档形状却无人读取的原因之一：没有权威的清单，就没有人会去核对。
+
+| 键 | 类型 | 默认 | 语义 |
+|---|---|---|---|
+| `binary` | string | `docker` | 引擎 CLI 名；Apple Containerization 填 `container` |
+| `dialect` | string | 按 binary 推断 | `docker` 或 `apple`；同一 CLI 家族共用 provider，只换参数方言 |
+| `allow_bind_mounts` | bool | `false` | 是否允许把宿主目录 bind 进容器；关闭时工作区走 `cp into container` |
+| `startup_timeout` | duration 字符串或数值 | `60s` | **每个**引擎启动步骤（create、start）各自的窗口，不是整个启动过程的总预算 |
+| `prune_running` | bool | `false` | 是否允许 `Prune` 删除「运行中但不由本进程持有」的容器。仅单租户机器应开启；双进程实验证明开启后互相销毁 workload |
+
+未识别的键在 `NewProvider` 报错，不静默忽略——`Raw` 是引擎特定 passthrough，
+一个拼错或被忽略的键会被读成「配置已生效」，而 provider 其实在用默认值；passthrough
+表不能有这种失败模式。
