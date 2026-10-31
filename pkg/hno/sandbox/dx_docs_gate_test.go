@@ -321,3 +321,78 @@ func TestGuideCodeFencesParse(t *testing.T) {
 		t.Errorf("guide has only %d Go fences; this gate has nothing to say about a page that stopped showing code", n)
 	}
 }
+
+// memberCallRe catches `something.Name(` inside code fences. A fence can be syntactically
+// perfect and still call a method that does not exist -- the guide wrote diag.Summary() and
+// diag.OK() against DiagReport, which is a struct with fields and no methods at all, and
+// neither the syntax gate nor the prose-name gate noticed. The check is deliberately
+// conservative: the name only has to exist as an exported function or as a method of some
+// exported type anywhere in the documented family. That is weaker than type checking, which
+// is honest about what it cannot catch, but it makes "invented method" a failing state.
+var memberCallRe = regexp.MustCompile(`\.([A-Z][A-Za-z0-9]*)\s*\(`)
+
+// stdlibCalls are the packages an example may call without that being a claim about this API.
+// Without the allowance the gate drowns in fmt.Println and people turn it off.
+var stdlibCalls = map[string]bool{
+	"Println": true, "Printf": true, "Print": true, "Sprintf": true, "Fprintf": true,
+	"Fprintln": true, "Fatalf": true, "Fatal": true, "Errorf": true, "New": true,
+	"WithoutCancel": true, "WithCancel": true, "WithTimeout": true, "Is": true, "As": true,
+	"Join": true, "Contains": true, "HasPrefix": true, "TrimSpace": true, "Sleep": true,
+	"Since": true, "Now": true, "Getenv": true, "Exit": true, "Stdout": true,
+}
+
+func TestGuideFencedMethodCallsExist(t *testing.T) {
+	lines := readGuide(t)
+	universe := map[string]bool{}
+	for _, rel := range []string{".", "../tools/run", "./graph", "./provider/docker", "../graph"} {
+		dir := mustAbs(t, rel)
+		if _, err := os.Stat(dir); err != nil {
+			continue
+		}
+		s := surfaceOf(t, dir)
+		for n := range s.names {
+			universe[n] = true
+		}
+		for _, mem := range s.members {
+			for n := range mem {
+				universe[n] = true
+			}
+		}
+	}
+	in := false
+	start := 0
+	checked := 0
+	for i, ln := range lines {
+		trimmed := strings.TrimSpace(ln)
+		if strings.HasPrefix(trimmed, "```") {
+			if !in {
+				in = strings.Contains(trimmed, "go")
+				start = i + 1
+			} else {
+				in = false
+			}
+			continue
+		}
+		if !in {
+			continue
+		}
+		// Skip the import block and comments: a comment may describe a defect being fixed.
+		if strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		for _, m := range memberCallRe.FindAllStringSubmatch(ln, -1) {
+			name := m[1]
+			if stdlibCalls[name] {
+				continue
+			}
+			checked++
+			if !universe[name] {
+				t.Errorf("guide fence near line %d calls .%s(), which no exported symbol in the sandbox family provides (line %d: %q)",
+					start, name, i+1, strings.TrimSpace(ln))
+			}
+		}
+	}
+	if checked < 10 {
+		t.Errorf("fence call gate saw only %d calls; it would silently pass a page with no API usage left in it", checked)
+	}
+}

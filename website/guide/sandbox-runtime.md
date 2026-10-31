@@ -81,7 +81,7 @@ the compatibility adapter refuses to fake.
 
 ```go
 diag, err := sb.Diagnose(ctx)
-fmt.Println(diag.Summary())
+fmt.Println(diag.Summary) // Summary, Reached, Checks and Fixes are fields, not methods
 for _, c := range diag.Checks {
     if !c.OK {
         fmt.Printf("%s: want %s, got %s — %s\n", c.Env, c.Want, c.Got, c.Fix)
@@ -122,14 +122,17 @@ process, and says so: `SkippedPrune()` on the docker provider returns what it de
 A policy that returns `ActRequireApproval` suspends the work inside the same environment:
 
 ```go
-report, err := sb.RunSession(ctx, "build-42", sandbox.Shell("deploy"))
+sess, err := sb.Session(ctx, "build-42", sandbox.WithCreateIfMissing(true))
+if err != nil {
+    log.Fatal(err)
+}
+report, err := sess.Exec(ctx, sandbox.Shell("deploy"))
 var pending *sandbox.ApprovalPendingError
 if errors.As(err, &pending) {
     fmt.Println(pending.ApprovalID, pending.Reason, pending.ExpiresAt)
     fmt.Println(pending.Remediation())
 }
 
-sess, _ := sb.Session(ctx, "build-42")
 for _, p := range sess.Awaiting() {
     fmt.Println(p.ID, p.BoundToEnvironment())
 }
@@ -224,6 +227,45 @@ The adapter refuses rather than silently reinterpreting, and the refusals are ty
 A timeout is payload data (`timed_out` is already in the map); the classification uses only what
 this layer can prove, so a working script is never reported as an outage.
 
+## From a shell: `hno sandbox`
+
+`cmd/hno` exists so that what the runtime already knows can be read without writing a Go
+program. It adds no policy of its own — each verb is a thin shell over one exported call, and
+every flag is named after the option it sets.
+
+```bash
+go build -o hno ./cmd/hno
+
+./hno sandbox doctor                      # why can't this run here?
+./hno sandbox doctor --json               # same verdict, machine-readable
+./hno sandbox prune                       # list what this host left behind (read-only)
+./hno sandbox prune --yes                 # delete them
+./hno sandbox run -- go version           # one command, payload status passed through
+./hno sandbox run --timeout 30s --shell "deploy"
+./hno sandbox run --attr binary=container --image golang:1.26 -- sh -c "exit 5"
+```
+
+| Verb | Runtime call | Exit status |
+| --- | --- | --- |
+| `doctor` | `Sandbox.Diagnose` | `0` all checks passed, `1` a check failed |
+| `prune` | `Sandbox.Reclaimer` | `0`; refuses to delete without `--yes` |
+| `run` | `Sandbox.Run` / `Session.Exec` | the program's own code, `124` timed out, `70` environment unusable, `2` bad command line |
+
+The three `run` outcomes are deliberately not merged. A program that exited 5 is not a
+sandbox that failed, and a sandbox that could not start has no opinion about the program:
+`70` means **the status of your command is unknown**, so a wrapping script must not read it
+as "it ran and failed". `124` follows `timeout(1)`. Same split as
+[Failure visibility in the toolkit](#failure-visibility-in-the-toolkit).
+
+`--attr k=v` is the engine-config channel (`sandbox.WithAttrs`), which is how you point the
+CLI at a different container binary (`--attr binary=container`) or an engine runtime such as
+`runsc`. `--isolation` takes exactly the names `Isolation.String` renders — `none`,
+`container`, `syscall-filtered`, `microvm`, `microvm-hosted` — and a value the parser refuses
+stops the command instead of quietly running below the floor you asked for.
+
+Prune is read-only by default because a reclaim tool that guesses is worse than one that asks,
+and what the engine declined to delete is printed rather than hidden inside a zero count.
+
 ## Recipes
 
 **Pin an image and refuse anything looser than a container:**
@@ -273,9 +315,14 @@ sb, _ := sandbox.Open(ctx,
 
 ```go
 diag, _ := sb.Diagnose(ctx)
-if !diag.OK() {
-    for _, f := range diag.Fixes {
-        fmt.Println(f)
+failed := false
+for _, c := range diag.Checks {
+    if !c.OK {
+        failed = true
+        fmt.Printf("%s: %s\n", c.Env, c.Fix)
     }
+}
+if !failed {
+    fmt.Println("ready")
 }
 ```

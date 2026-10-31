@@ -1,12 +1,14 @@
 package sandbox
 
 import (
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -218,15 +220,78 @@ func TestRemediationTextNamesOnlyExistingOptions(t *testing.T) {
 	}
 }
 
+// cliVerbRe matches a hint that names the shipped command, capturing the verb so it can be
+// checked rather than merely allowed.
+var cliVerbRe = regexp.MustCompile(`\bhno\s+sandbox\s+([a-z][a-z-]*)`)
+
+// TestRemediationTextPointsAtNoMissingCLI is the second half of the rule, now that cmd/hno
+// exists. Before the CLI shipped, any command-shaped hint was a lie, so the gate banned the
+// shape. Lifting that ban wholesale would only trade false positives for false negatives -- a
+// hint could name a verb nobody wrote and pass. So a hint may name the CLI only when the verb
+// is declared in cmd/hno/sandbox.go, and if the CLI disappears again the gate closes.
 func TestRemediationTextPointsAtNoMissingCLI(t *testing.T) {
+	verbs := shippedSandboxVerbs(t)
 	for _, dir := range gateDirs(t) {
 		for _, lit := range stringLiterals(t, dir) {
-			if cliMentionRe.MatchString(lit.text) {
-				t.Errorf("%s: text tells the user to run a shell command, but no sandbox CLI ships in this repository: %q",
+			if !cliMentionRe.MatchString(lit.text) {
+				continue
+			}
+			found := cliVerbRe.FindAllStringSubmatch(lit.text, -1)
+			if len(found) == 0 {
+				t.Errorf("%s: text tells the user to run something shaped like a sandbox command, but not the one command that exists (hno sandbox doctor|prune|run): %q",
 					lit.file, trim(lit.text))
+				continue
+			}
+			if len(verbs) == 0 {
+				t.Errorf("%s: text names a sandbox command but no CLI ships in this repository; delete the hint or ship the verb: %q",
+					lit.file, trim(lit.text))
+				continue
+			}
+			for _, m := range found {
+				if !verbs[m[1]] {
+					t.Errorf("%s: text advertises `hno sandbox %s`, which is not a verb the shipped CLI provides (have %s): %q",
+						lit.file, m[1], verbList(verbs), trim(lit.text))
+				}
 			}
 		}
 	}
+}
+
+// shippedSandboxVerbs reads the verb constants out of cmd/hno/sandbox.go. Parsing beats
+// duplicating: a verb renamed in the CLI changes this set on its own, so the gate cannot
+// drift into blessing a name the binary no longer accepts.
+//
+// The two failure modes are deliberately separated. A missing cmd/hno directory means the
+// CLI does not ship and every command-shaped hint is a lie. A directory that exists but
+// yields no verbs means this gate is broken -- most likely a wrong relative path -- and
+// treating that as "no CLI" silently inverts the check into rejecting real, correct text.
+func shippedSandboxVerbs(t *testing.T) map[string]bool {
+	t.Helper()
+	dir := mustAbs(t, "../../../cmd/hno")
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return map[string]bool{}
+	}
+	src, err := os.ReadFile(filepath.Join(dir, "sandbox.go"))
+	if err != nil {
+		t.Fatalf("cmd/hno exists but sandbox.go cannot be read from %s: %v", dir, err)
+	}
+	verbs := map[string]bool{}
+	for _, m := range regexp.MustCompile(`\bverb[A-Za-z]*\s*=\s*"([a-z][a-z-]*)"`).FindAllStringSubmatch(string(src), -1) {
+		verbs[m[1]] = true
+	}
+	if len(verbs) == 0 {
+		t.Fatalf("no verbs parsed from %s; the CLI verb gate would accept any command name", dir)
+	}
+	return verbs
+}
+
+func verbList(verbs map[string]bool) string {
+	names := make([]string, 0, len(verbs))
+	for v := range verbs {
+		names = append(names, v)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 func TestRemediationQualifiedNamesResolve(t *testing.T) {

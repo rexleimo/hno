@@ -210,7 +210,7 @@ func defaultFixes(best Isolation) []string {
 	// These strings are the only part of a failed selection most callers ever read, so
 	// every name in them has to exist. A test in this package parses the exported surface
 	// and rejects remediation text that points at an option or command nobody shipped.
-	fixes := []string{"run Sandbox.Diagnose(ctx) to see which provider answered, at what isolation, and why each attempt failed"}
+	fixes := []string{"run Sandbox.Diagnose(ctx), or hno sandbox doctor from a shell, to see which provider answered, at what isolation, and why each attempt failed"}
 	if best.Rank() < IsolationMicroVM.Rank() {
 		fixes = append(fixes,
 			"install a micro-VM engine (BoxLite needs /dev/kvm on Linux or Hypervisor.framework on macOS)",
