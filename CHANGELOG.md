@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ Added (B4c 遗留 Executor 兼容适配器)
+- 新文件 `pkg/hno/tools/run/adapter.go`：`NewSandboxExecutor` 用 `pkg/hno/sandbox` 实现冻结的遗留 `Executor` 合同（`Run(ctx, Spec) (Result, error)` + `Close()`）。纯新增，不改 `executor.go/podman.go/e2b.go/local.go/toolkit.go`，也不要求任何调用方迁移。
+- 语义落差一律类型化拒绝而不是静默重解释：`Spec.Workspace`（遗留为宿主读写 bind mount，新模型为快照进出）报 `ErrSandboxUnsupported` 并点名 `RunProject`/`WithWorkspace`；`Spec.MemoryLimit/PidLimit` 与句柄限额不一致报 `ErrSandboxLimitMismatch` 并说明配置点（per-run 内存/PID 上限在新 API 里不可表达）；`podman`/`e2b` 后端明确拒绝而不是偷换 provider。
+- 兼容哨兵与信号保真：引擎缺失映射回 `ErrNoProvider`，未知后端仍是 `ErrUnsupportedBackend`，`validateSpec` 的错误文案原样保留；超时同时给出包装的 `ErrTimeout` 与 `Result.TimedOut`（遗留调用方两种都测），且 provider 不返回 report 时退出码记为 -1 而非谎报成功。
+
+### 🐛 Fixed (B4c)
+- 限额判定改为从已开句柄 `Status()` 读回：首版用构造期记忆值，而调用方 `Options` 追加在后、可覆盖 `WithLimits`，于是拒绝理由里的数字与引擎真实限额分叉（`TestAdapterHonoursConfiguredLimits` 先失败暴露此点）。
+
+### 🧪 Tests (B4c)
+- 14 条适配器测试；`pkg/hno/tools/run` 覆盖率 61.1% → 65.8%。反证四项对旧实现失败：静默忽略 Workspace、静默忽略限额不一致、丢掉 `ErrNoProvider` 映射、丢掉无 report 时的 `TimedOut` 置位。并发 8 路运行与 `Close()` 幂等亦有覆盖。
+
 ### ✨ Added (B4b 图内沙箱节点)
 - 新包 `pkg/hno/sandbox/graph`：把沙箱的人工审批接进控制流图。`Node(name, sess, req, opts...)` 运行一个请求，遇到 `ActRequireApproval` 时把它变成图自己的中断（`Payload` 携带 `Ask{Session,Approval,Lineage,Question}`），人类在图侧的 `Resume` 回答被翻成 `Session.Approve/Deny + Resume`，工作最终落在人被展示的那台环境里。不新增第二套 HITL，也不改 `pkg/hno/graph` 语义。
 - 节点自持稳定运行身份（钉 `Request.ID`）：否则图重入等待节点时每次都是「等价但新的请求」，审批 id 会变，回答指向无人持有的标识。

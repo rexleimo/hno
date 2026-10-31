@@ -107,3 +107,41 @@ ResumeRerun/ResumeHandoff`）与 `Checkpointer/Checkpoint{Kind:EntryInterrupt}`�
    矛盾。后果：声明 `reason?: string` 会让所有省略该字段的回答被 `ErrInvalidResponse` 拒掉。
    绕法（本包内）：默认 schema 只声明决策字段，`reason` 仍接受但不声明（改动在
    `graph.go` 注释中说明）。
+
+## B4c 工作项（本轮执行）
+
+```yaml
+type: planned
+targets:
+  - pkg/hno/tools/run/adapter.go   (new file only)
+  - pkg/hno/tools/run/adapter_test.go (new file only)
+allowedWrites:
+  - pkg/hno/tools/run/adapter.go
+  - pkg/hno/tools/run/adapter_test.go
+failureClass: contract
+explicitIntent: implement
+```
+
+纯新增：遗留 `Executor` 签名冻结（D-10），故适配器实现同一个
+`Run(ctx, Spec) (Result, error)` + `Close() error`，由 `pkg/hno/sandbox` 承接。
+**不改** `executor.go/podman.go/e2b.go/local.go/toolkit.go` 与任何调用方（B4d 需授权）。
+
+已实测的合同落差（适配器必须说实话，不许静默弱化）：
+1. `Spec.Workspace` 遗留是宿主目录**读写 bind mount**；新模型是快照式 stage-in/declared-out，
+   且 docker provider 的 bind mount 需显式 `allow_bind_mounts`。⇒ 拒绝并指向新 API，
+   不偷偷改成快照（宿主目录不再被实时改写是语义变化）。
+2. 内存/PID 限额是**句柄级**（`runoption.go:126`，per-run 只收紧 `OutputMaxBytes`）。
+   ⇒ 适配器以构造期 `sandbox.Limits` 为已知上限，对与之不同的 `Spec.MemoryLimit/PidLimit`
+   返回类型化拒绝并说明配置点，而不是承诺了不执行。
+3. 新 registry 只有 `docker` provider。⇒ `Backend` 为 `podman`/`e2b` 时明确拒绝，
+   不做静默替换 provider；`auto`/`docker` 引擎缺失时映射回遗留 `ErrNoProvider` 哨兵。
+
+## B4c 完成记录（实测）
+
+交付 `pkg/hno/tools/run/adapter.go` + `adapter_test.go`（仅此两文件，既有文件零改动）。
+14 条测试；run 包覆盖率 61.1% → 65.8%；反证 4 项有效；真实门 27s 通过、残留 0。
+
+过程中被自己的测试抓到一处「记录与执行分叉」：拒绝理由引用构造期记忆的限额，而调用方
+`Options` 可覆盖句柄限额 ⇒ 改为从 `sb.Status().Limits` 读回（同 D-20/D-25 的同类缺陷）。
+
+B4d（`toolkit.go:106-115` 双写迁移）**未做**：需授权。
