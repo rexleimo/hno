@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ Added / 🐛 Fixed (D-33：`run_code` 的失败终于可被机器看见)
+- `pkg/hno/tools/run/toolkit.go`：环境故障改为**双写**——既保留调用方一直在读的结果 map（新增 `failure` 摘要键），也返回**非 nil 的包装 error**（`errors.Is(err, ErrNoProvider)` 等哨兵仍可判别）。此前失败被折进 map 并返回 `nil`，agent 的 logger、逐调用 outcome、任何监控与 Policy 全都把这当成一次成功的工具调用。
+- 分类规则只用**本层可证的事实**，不把「用户代码失败」误报成「环境坏了」（遗留 executor 对非 0 退出也返回 error，无脑上抛会制造反向混淆）：哨兵 → `TimedOut` → `ExitCode > 0` → 其余判环境故障。依据是 `exitCodeOf` 对非 `*exec.ExitError` 返回 `-1`、e2b 以 `Result{ExitCode: -1}` 表示「未观测到退出码」，因此正的退出码确实意味着代码跑过。
+- 超时保持为数据（`timed_out` 已在 map 中说明这是调用方自己的预算被超出）。
+- 已知代价（如实记录，不静默）：`agent.executeToolCalls` 在 handler 返回 error 时会**丢弃结果 map**，只把 `"tool execution error: …"` 文本交给模型 —— 因此错误文本自带可执行建议；若要把 map 一并渲染，需改 `pkg/hno/agent`，属另行授权。另一处窄不精确：podman 的「输出捕获故障 + 已观测退出码」组合按规则判为数据，完整错误文本仍留在 map。
+
+### 🧪 Tests (D-33)
+- 新增 5 条分类回归：环境故障必须双写（哨兵可 `errors.Is`、map 仍在、含 `failure` 摘要）、代码非 0 退出必须仍是数据且不得被标为环境故障、超时必须是数据、`ExitCode` 为 -1/0 且带 error 必须判环境故障、后端拒绝哨兵必须保真。反证：前一组对旧实现三条全红（`an environment failure must reach the caller as an error`、`exit code -1 with an error … must not read as success`、`want the sentinel preserved, got <nil>`）。
+- 既有 `TestCodeExecutionToolkitReturnsExecutionOutputOnFailure`（`ExitCode:4` + error）在新规则下仍要求 nil error，未改动即通过 —— 说明迁移没有把代码故障升格为故障。`pkg/hno/tools/run` 覆盖率 65.8% → 66.4%。
+
 ### 🐛 Fixed (D-32：图 HITL 的可选响应字段终于能声明)
 - `pkg/hno/graph`：`validateResponse` 的属性循环对**缺失的键**取 `respMap[n]`（读出 nil），nil 撞任何声明类型都判红——与它自己的注释「缺失的属性只由 required 管，这里跳过」直接矛盾。结果是「声明一个可选字段」等于「强制该字段必须出现」，任何省略它的合法响应都被拒。现改为按双值取键判定缺席并跳过值校验；强制出现只能靠 `required`。
 - 显式 `null` 不算缺席：它是「出现了但不是那个类型」，照旧拒绝（受测钉住）。

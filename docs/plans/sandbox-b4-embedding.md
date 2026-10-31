@@ -159,3 +159,49 @@ B4d（`toolkit.go:106-115` 双写迁移）**未做**：需授权。
 
 
 D-32：第 2 项上游缺陷（`pkg/hno/graph` 可选属性误校验）已按授权修复，`sandboxgraph` 默认 schema 声明回可选 `reason`。
+
+## B4d 工作项（本轮执行，已获授权）
+
+```yaml
+type: planned
+targets:
+  - pkg/hno/tools/run/toolkit.go          # 既有：106-115 双写迁移
+  - pkg/hno/tools/run/toolkit_test.go     # 既有：补分类回归
+allowedWrites:
+  - pkg/hno/tools/run/toolkit.go
+  - pkg/hno/tools/run/toolkit_test.go
+failureClass: contract
+```
+
+设计依据（§216/§815）：今天把 provider 错误塞进 map 并 `return ..., nil` ⇒ 模型、监控、Policy
+三方都看不见失败；要改成**双写**（真 error + map 内 `failure` 摘要）。
+
+已实测的前置事实（决定分类规则，不是拍脑袋）：
+1. `agent.executeToolCalls` 恒返回 nil ⇒ handler error **不会中断整轮**；模型仍收到
+   `"tool execution error: …"` 消息，但 **map 在 error 分支被丢弃** ⇒ error 文本必须自足。
+2. `podman.go/local.go` 的 `exitCodeOf` 对非 `*exec.ExitError` 返回 **-1**；e2b 用
+   `Result{ExitCode: -1}` 作「未观测到退出码」哨兵 ⇒ `ExitCode > 0` 可安全表示「用户代码自己退的」。
+3. 遗留 executor 对「用户代码非 0 退出」**也返回 error** ⇒ 无脑上抛会把代码故障说成
+   环境故障，正是设计禁止的混淆方向。
+
+分类顺序（先哨兵、再超时、再退出码）：
+`err==nil` → 数据；`ErrNoProvider/ErrUnsupportedBackend/适配器拒绝/*sandbox 类型化错误` → 环境故障；
+`TimedOut` → 数据（map 已有 timed_out）；`ExitCode > 0` → 数据；其余（-1/0 带 error）→ 环境故障。
+
+已知不精确处（如实记下，不为此扩范围去改 executor）：podman 的「输出捕获失败 + 代码非 0 退出」
+组合会判为数据，但完整错误文本仍留在 map 的 `error` 键里，类型化信号缺失仅此窄组合。
+
+## B4d 完成记录（实测）
+
+`toolkit.go` 改双写：环境故障 → map（含 `failure` 摘要）+ 非 nil 包装 error；用户代码非 0 退出 /
+超时 → 仍为数据。分类顺序：哨兵 → `TimedOut` → `ExitCode > 0` → 其余为环境故障。
+
+未改动 `executor.go/local.go/podman.go/e2b.go` 与 `adapter.go`（仅读它们的错误形状来定规则）。
+既有测试 `TestCodeExecutionToolkitReturnsExecutionOutputOnFailure` 在新规则下仍要求 nil，未改即通过。
+
+验证：5 条新分类测试（3 条对旧实现红）；`-race` 含 `pkg/hno/agent`（使用方）全绿；
+真实门 25.2s、残留 0；`run` 包覆盖 65.8% → 66.4%。台账 D-33。
+
+后续可选项（需另行授权，不在本轮范围）：
+1. 让 `pkg/hno/agent` 在 handler error 分支也渲染结果 map（目前 map 被丢弃）。
+2. 给 podman 的「输出捕获故障」加哨兵，消除 D-33 那条窄不精确。
