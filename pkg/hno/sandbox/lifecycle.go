@@ -532,6 +532,28 @@ func (sb *Sandbox) Diagnose(ctx context.Context) (*DiagReport, error) {
 			}
 		}
 	}
+	// The kernel boundary, reported only when somebody actually measured it. This
+	// check never boots a box, because producing the answer is the expensive thing
+	// this package does; Diagnose reads back the last measurement instead.
+	//
+	// An unmeasured handle gets no check rather than a passing one: a green line that
+	// means "nobody checked" is the defect D-36 was written about, and the isolation
+	// tier is exactly the claim most likely to be asserted from a provider's name.
+	if b, ok := sb.KernelBoundary(); ok {
+		wantPrivate := sb.cfg.MinIsolation >= IsolationMicroVM
+		want := "consistent with the requested floor"
+		if wantPrivate {
+			want = "private-kernel"
+		}
+		got := fmt.Sprintf("%s (%d of %d boxes answered, %d distinct kernel readings)", b.Verdict, len(b.BootIDs), b.Boxes, b.Distinct())
+		consistent := b.Verdict == BoundaryPrivateKernel || !wantPrivate
+		check := Check{Env: "kernel-boundary", Want: want, Got: got, OK: consistent}
+		if !consistent {
+			check.Fix = "this engine shares a kernel between boxes, so it cannot satisfy a micro-VM floor: measure with hno sandbox boundary against the engine you meant, or lower WithMinimumIsolation deliberately and record why"
+			report.Fixes = append(report.Fixes, fmt.Sprintf("the kernel boundary was measured as %s but the floor is %s", b.Verdict, sb.cfg.MinIsolation))
+		}
+		report.Checks = append(report.Checks, check)
+	}
 	if sb.cfg.AllowFallback && len(sb.cfg.Observers) == 0 {
 		report.Checks = append(report.Checks, Check{Env: "fallback-observer", Want: "observer registered", Got: "none", OK: false, Fix: "add WithObserver: a downgrade that nobody reports is a silent isolation loss"})
 		report.Fixes = append(report.Fixes, "register an observer before enabling fallback tiers")

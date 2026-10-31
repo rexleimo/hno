@@ -39,6 +39,20 @@ type Provider struct {
 	// will boot an environment from any image it is handed -- a double that lied about
 	// that would make the image check untestable in the other direction.
 	AbsentImages []string
+	// BoundaryReport is what this double returns from MeasureKernelBoundary, verbatim.
+	// It is a whole report rather than a verdict on purpose: the core reconciles a
+	// verdict against its readings, so a test that hands over "private-kernel" with no
+	// boot ids would prove nothing about that check.
+	BoundaryReport *sandbox.KernelBoundaryReport
+	// BoundaryErr simulates an engine that cannot carry out a measurement.
+	BoundaryErr error
+	// LastBoundaryBoxes is the box count the last measurement asked for, so a test can
+	// prove the default resolved rather than trusting a constant.
+	LastBoundaryBoxes int
+	// BoundaryCalls counts measurements taken, so a test can prove a refusal
+	// provisioned nothing (D-36: implemented is not the same as reachable, and a
+	// refusal that still boots boxes is a cost lie).
+	BoundaryCalls int
 	// ImageQueryErr simulates an engine that refuses to answer the image question,
 	// which must be reported as unknown rather than rounded up to present.
 	ImageQueryErr error
@@ -95,6 +109,39 @@ func (p *Provider) Isolation() sandbox.Isolation { return sandbox.IsolationConta
 
 // ImageAvailable implements sandbox.ImageQueryable, so the image half of Diagnose is
 // reachable offline and against a controllable answer.
+// MeasureKernelBoundary answers the boundary question the way this double can
+// honestly answer it: every environment it hands out lives in this same process, so
+// they genuinely share one kernel and the default verdict is shared-kernel with one
+// repeated reading. Tests that need the other states set BoundaryReport or
+// BoundaryErr explicitly, which keeps the double from ever agreeing with an
+// over-claiming provider by accident.
+func (p *Provider) MeasureKernelBoundary(_ context.Context, boxes int) (sandbox.KernelBoundaryReport, error) {
+	p.mu.Lock()
+	p.BoundaryCalls++
+	p.LastBoundaryBoxes = boxes
+	if p.BoundaryReport != nil {
+		out := *p.BoundaryReport
+		p.mu.Unlock()
+		return out, p.BoundaryErr
+	}
+	err := p.BoundaryErr
+	p.mu.Unlock()
+	if err != nil {
+		return sandbox.KernelBoundaryReport{Boxes: boxes, Verdict: sandbox.BoundaryUnknown}, err
+	}
+	ids := make([]string, boxes)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("memory-provider-same-process")
+	}
+	return sandbox.KernelBoundaryReport{
+		Boxes:       boxes,
+		Verdict:     sandbox.BoundarySharedKernel,
+		BootIDs:     ids,
+		GuestKernel: "shared with the test process",
+		Evidence:    []string{"every environment this double creates lives in this process, so they share its kernel"},
+	}, nil
+}
+
 func (p *Provider) ImageAvailable(_ context.Context, image string) (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

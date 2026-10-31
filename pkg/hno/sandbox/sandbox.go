@@ -32,8 +32,12 @@ type Sandbox struct {
 	approvals *approvalBook
 	// snapMarks records how far each snapshot's spec had been satisfied.
 	snapMarks map[string]snapshotMark
-	createdAt time.Time
-	closed    bool
+	// lastBoundary caches the most recent kernel-boundary measurement so Diagnose
+	// can report it without booting anything. Guarded by mu: producing one is
+	// expensive, reading it back is not.
+	lastBoundary *KernelBoundaryReport
+	createdAt    time.Time
+	closed       bool
 
 	probeAt    time.Time
 	probeErr   error

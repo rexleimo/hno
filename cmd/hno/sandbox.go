@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -20,10 +21,17 @@ import (
 // hint that drifts from the shipped command fails a test instead of sending an operator
 // after a subcommand that was never written.
 const (
-	verbDoctor = "doctor"
-	verbPrune  = "prune"
-	verbRun    = "run"
+	verbDoctor   = "doctor"
+	verbPrune    = "prune"
+	verbRun      = "run"
+	verbBoundary = "boundary"
 )
+
+// sandboxVerbs is the one list the dispatcher, the usage text, and the unknown-verb
+// message all read. It used to be three hand-copied strings in three places, so adding a
+// verb meant the help text and the error message could silently disagree with what the
+// command actually accepts.
+var sandboxVerbs = []string{verbDoctor, verbPrune, verbRun, verbBoundary}
 
 // defaultImage is what the runtime's own examples use, not a requirement of the engine.
 const defaultImage = "golang:1.26"
@@ -35,12 +43,13 @@ func sandboxMain(argv []string, stdout, stderr io.Writer) int {
   hno sandbox doctor   Why can't this run here?
   hno sandbox prune    Show or reclaim owned environments.
   hno sandbox run      Run one command inside a sandbox.
+  hno sandbox boundary Is the isolation a measurement or a name?
 `)
 		return exitUsage
 	}
 	verb := argv[0]
-	if verb != verbDoctor && verb != verbPrune && verb != verbRun {
-		fmt.Fprintf(stderr, "hno sandbox: unknown verb %q (have doctor, prune, run)\n", verb)
+	if !slices.Contains(sandboxVerbs, verb) {
+		fmt.Fprintf(stderr, "hno sandbox: unknown verb %q (have %s)\n", verb, strings.Join(sandboxVerbs, ", "))
 		return exitUsage
 	}
 
@@ -51,7 +60,9 @@ func sandboxMain(argv []string, stdout, stderr io.Writer) int {
 	session := fs.String("session", "", "reuse this session id, creating it if absent (run)")
 	timeout := fs.Duration("timeout", 0, "per-run execution budget, e.g. 30s; 0 keeps the runtime default (run)")
 	yes := fs.Bool("yes", false, "actually delete, rather than only report (prune)")
-	asJSON := fs.Bool("json", false, "machine-readable output (doctor)")
+	asJSON := fs.Bool("json", false, "machine-readable output (doctor, boundary)")
+	boxes := fs.Int("boxes", 0, fmt.Sprintf("how many boxes the boundary measurement starts (%d-%d); 0 uses the runtime default %d (boundary)", 2, sandbox.MaxBoundaryBoxes, sandbox.DefaultBoundaryBoxes))
+	expect := fs.String("expect", "", "fail unless the measured boundary is this: shared-kernel or private-kernel (boundary)")
 	fs.Usage = func() { usageSandbox(fs, stderr, verb) }
 	if err := fs.Parse(argv[1:]); err != nil {
 		return exitUsage
@@ -65,6 +76,8 @@ func sandboxMain(argv []string, stdout, stderr io.Writer) int {
 		return pruneCmd(ctx, cfg, *yes, stdout, stderr)
 	case verbRun:
 		return runCmd(ctx, cfg, *session, *shell, *timeout, fs.Args(), stdout, stderr)
+	case verbBoundary:
+		return boundaryCmd(ctx, cfg, *boxes, *expect, *asJSON, stdout, stderr)
 	}
 	return exitUsage
 }
@@ -160,6 +173,88 @@ func openHandle(ctx context.Context, opts ...sandbox.Option) (*sandbox.Sandbox, 
 		return nil, fmt.Errorf("register docker provider: %w", err)
 	}
 	return sandbox.Open(ctx, opts...)
+}
+
+// boundaryCmd answers the question the isolation ladder has always assumed: how much
+// kernel do two boxes actually share. It is not a health check and it is not free -- it
+// provisions real boxes -- so it is a verb the operator chooses rather than something the
+// runtime does behind a doctor run.
+//
+// Exit codes follow the same split as "run", because the two failures mean different
+// things: 1 means the measurement completed and you did not like the answer, 70 means no
+// answer exists. A script that treats "could not measure" as "isolation is fine" is the
+// false green light D-36 was about.
+func boundaryCmd(ctx context.Context, cfg *sandboxConfig, boxes int, expect string, asJSON bool, stdout, stderr io.Writer) int {
+	opts, err := cfg.options()
+	if err != nil {
+		fmt.Fprintf(stderr, "hno sandbox boundary: %v\n", err)
+		return exitUsage
+	}
+	want := sandbox.BoundaryUnmeasured
+	if expect != "" {
+		parsed, perr := sandbox.ParseKernelBoundary(expect)
+		if perr != nil {
+			fmt.Fprintf(stderr, "hno sandbox boundary: %v\n", perr)
+			return exitUsage
+		}
+		want = parsed
+	}
+	sb, err := openHandle(ctx, opts...)
+	if err != nil {
+		fmt.Fprintf(stderr, "hno sandbox boundary: cannot open a handle: %v\n", err)
+		return exitEnvFailure
+	}
+	defer sb.Close()
+
+	report, err := sb.MeasureKernelBoundary(ctx, boxes)
+	if err != nil {
+		var budget *sandbox.BoundaryBudgetError
+		if errors.As(err, &budget) {
+			fmt.Fprintf(stderr, "hno sandbox boundary: %v\n%s\n", err, budget.Remediation())
+			return exitUsage
+		}
+		var unsupported *sandbox.BoundaryUnsupportedError
+		if errors.As(err, &unsupported) {
+			// 70, not 2: nothing about the command line was wrong, the engine simply
+			// cannot answer this question. Calling that a usage error would tell the
+			// operator to fix flags that are already correct.
+			fmt.Fprintf(stderr, "hno sandbox boundary: %v\n%s\n", err, unsupported.Remediation())
+			return exitEnvFailure
+		}
+		fmt.Fprintf(stderr, "hno sandbox boundary: the measurement could not run: %v\n", err)
+		return exitEnvFailure
+	}
+
+	if asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(report); err != nil {
+			fmt.Fprintf(stderr, "hno sandbox boundary: %v\n", err)
+			return exitEnvFailure
+		}
+	} else {
+		fmt.Fprintf(stdout, "kernel boundary: %s\n", report.Verdict)
+		fmt.Fprintf(stdout, "  boxes: %d, distinct kernel readings: %d\n", report.Boxes, report.Distinct())
+		if report.GuestKernel != "" {
+			fmt.Fprintf(stdout, "  guest kernel: %s (host: %s)\n", report.GuestKernel, report.HostKernel)
+		}
+		for _, e := range report.Evidence {
+			fmt.Fprintf(stdout, "  - %s\n", e)
+		}
+		for _, f := range report.Fixes {
+			fmt.Fprintf(stdout, "  fix: %s\n", f)
+		}
+	}
+
+	if report.Verdict == sandbox.BoundaryUnknown {
+		fmt.Fprintln(stderr, "hno sandbox boundary: the engine gave no readings worth believing; no isolation tier may be inferred from that")
+		return exitDiagFailed
+	}
+	if expect != "" && report.Verdict != want {
+		fmt.Fprintf(stderr, "hno sandbox boundary: measured %s, expected %s\n", report.Verdict, want)
+		return exitDiagFailed
+	}
+	return exitOK
 }
 
 func doctorCmd(ctx context.Context, cfg *sandboxConfig, asJSON bool, stdout, stderr io.Writer) int {
