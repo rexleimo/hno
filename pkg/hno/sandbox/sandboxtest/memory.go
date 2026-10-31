@@ -160,6 +160,56 @@ func (p *Provider) DeleteSession(ctx context.Context, id string) error {
 }
 
 // CreateSnapshot implements sandbox.Snapshotter.
+// InstalledIn reports whether one environment actually recorded an installation
+// matching the given text. It answers a question History cannot: History tells a test
+// what was run, while this tells it what the box ended up containing — the difference
+// between "the step was replayed" and "the step was cached and skipped".
+func (p *Provider) InstalledIn(sessionID, want string) bool {
+	p.mu.Lock()
+	env := p.envs[sessionID]
+	p.mu.Unlock()
+	if env == nil {
+		return false
+	}
+	env.mu.Lock()
+	defer env.mu.Unlock()
+	for k := range env.installed {
+		if strings.Contains(k, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// History returns the argv lines one environment executed, oldest first. Tests need
+// it to tell "the recorded steps were replayed into this fresh box" from "the box is
+// empty and claims to be ready", which is otherwise invisible from the outside.
+func (p *Provider) History(sessionID string) []string {
+	p.mu.Lock()
+	env := p.envs[sessionID]
+	p.mu.Unlock()
+	if env == nil {
+		return nil
+	}
+	return env.History()
+}
+
+// History returns what this environment has run.
+func (e *Env) History() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.history))
+	copy(out, e.history)
+	return out
+}
+
+// Steps returns the spec recorded on this environment.
+func (e *Env) Steps() []sandbox.Step {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]sandbox.Step(nil), e.spec.Steps...)
+}
+
 func (p *Provider) Snapshot(ctx context.Context, env sandbox.Environment, name string) (sandbox.SnapshotHandle, error) {
 	e, ok := env.(*Env)
 	if !ok {
@@ -381,6 +431,17 @@ func (e *Env) interpret(ctx context.Context, spec sandbox.RunSpec, sink sandbox.
 	}
 
 	code := strings.TrimSpace(req.Code)
+	// Every request leaves a trace in history, not just argv installs. Recorded before
+	// the dispatch below and not as one of its cases: a Go switch runs the first
+	// matching branch only, so a catch-all case here would swallow #!echo handling and
+	// the double would silently stop executing payloads it is supposed to interpret.
+	// A double that
+	// records only one shape of command cannot tell "the step was skipped" from "the
+	// step ran and the double wrote nothing down", and that distinction is the whole
+	// content of a replay assertion.
+	if code != "" {
+		e.history = append(e.history, req.Runtime+" "+code)
+	}
 	switch {
 	case code == "":
 		// argv-style run: installs are recorded into the replayable spec so
@@ -827,3 +888,70 @@ func (p *ProbedProvider) ProbeReady(ctx context.Context, env sandbox.Environment
 }
 
 var _ sandbox.ReadinessProber = (*ProbedProvider)(nil)
+
+// Records is an in-memory sandbox.SessionStore kept separate from the provider's live
+// environments.
+//
+// The provider doubles as a SessionStore only incidentally: its LoadSession reads from
+// the environment map, so deleting the box deletes the record too. That makes the one
+// situation persistence exists for — the environment is gone but the session record
+// survived — impossible to construct in a test.
+type Records struct {
+	mu   sync.Mutex
+	recs map[string]sandbox.SessionRecord
+}
+
+// NewRecords returns an empty record store.
+func NewRecords() *Records { return &Records{recs: map[string]sandbox.SessionRecord{}} }
+
+// SaveSession implements sandbox.SessionStore.
+func (r *Records) SaveSession(_ context.Context, rec sandbox.SessionRecord) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cp := rec
+	cp.Spec = rec.Spec.Clone()
+	r.recs[rec.ID] = cp
+	return nil
+}
+
+// LoadSession implements sandbox.SessionStore.
+func (r *Records) LoadSession(_ context.Context, id string) (sandbox.SessionRecord, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.recs[id]
+	if !ok {
+		return sandbox.SessionRecord{}, false, nil
+	}
+	rec.Spec = rec.Spec.Clone()
+	return rec, true, nil
+}
+
+// DropEnvironment removes a live environment from the provider without touching any
+// record store. It is how a test simulates the box being lost while the session
+// definition survives.
+func (p *Provider) DropEnvironment(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.envs, id)
+}
+
+// DeleteSession implements sandbox.SessionStore.
+func (r *Records) DeleteSession(_ context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.recs, id)
+	return nil
+}
+
+// IDs lists the records held, for assertions about retention.
+func (r *Records) IDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.recs))
+	for k := range r.recs {
+		out = append(out, k)
+	}
+	return out
+}
+
+var _ sandbox.SessionStore = (*Records)(nil)

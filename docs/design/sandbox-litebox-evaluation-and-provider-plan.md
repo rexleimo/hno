@@ -646,3 +646,64 @@ ExposeConflictError）；`CapBackground` 注明 ReadyProbe 在 detached run 上�
 **证据。** `go test -count=1 -race ./pkg/hno/sandbox/...` 全绿；core 覆盖 69.8%
 （↑自 69.3%），docker provider 57.5%。真实门 6/6 `ok 16.6s`（create 通路因
 EnvSpec 变更而受影响，故必须重跑）。新增 13 个测试，其中 2 个在修复前为红。
+
+### 17.9 SB-B2e：恢复路径不重放步骤（已修）+ 步骤缓存语义待决（D-20）
+
+延续「被校验但从不被读」的审计，这次的对象是**恢复与重建**。
+
+**（一）已修：session 获取路径从不重放已记录步骤。**
+`replayStep()` 此前只有一个调用点（`rebuild()` 内）。`Session()` 从记录里新建环境后
+直接 `adopt`，于是「环境没了但记录还在」这一 session store 存在的**唯一理由**下，
+新盒子是空的，而 session 状态显示 `Ready`。工作流记录的每个 `Install`/`Setup` 都丢失，
+第一个失败被归因为 `ClassUserCode`——沙箱把自己的跳过算成调用方的代码错误。
+
+修法：抽出**唯一的所有者** `replayRecorded()`，`rebuild()` 与 `Session()` 共用；恢复时
+若重放失败，关闭新环境、状态置 `Lost`、返回 `StepReplayError`（不是静默 Ready）。
+证据：`TestRecordedStepsReplayIntoAResumedEnvironment` 先观察为红（`history=[]`），
+修复后为绿。
+
+过程学到一个必须写下来的教训：**测试双两度差点让判断失真**。
+1. 双只为 argv 命令写 history，不为 shell 步骤写；于是「Setup 没重放」和「Setup 重放
+   了但双没记录」无法区分。补上「任何请求都留痕」后，恢复测试其实是通过的——
+   我原本要报的第二个缺陷是**假的**。
+2. 补 history 时我把它写成 `switch` 的一个 `case code != "":`，Go 的 switch 只执行
+   第一个匹配分支，于是吞掉了 `#!echo` 等所有解释分支，弄坏 5 个既有测试。
+   记录必须在 dispatch **之前**，不是当作一个分支。
+3. 双的 `NewEnvironment` 有 `if existing { return existing }`：`MarkLost` 只置
+   `sess.env = nil` 不 Close，于是「重建」拿回的是同一个容器，代际边界被隐藏。
+   测任何跨代际语义必须显式 `DropEnvironment`。为此给双加了 `InstalledIn()`
+   ——回答「盒子里到底有什么」，而不是「跑过什么」。
+
+**（二）待决（D-20）：步骤缓存命中被当成关于容器的证据。**
+测量结果（真实摘除盒子后）：
+
+```
+同 session：cached=1 replayed=0 history=[]   （工作流自己的依赖消失）
+跨 session：cached=1 replayed=0 history=[]   （B 因 A 跑过同内容步骤而被跳过）
+```
+
+三个事实叠加导致：
+- `StepCache` **默认开启**，且用进程内存 journal：
+  `if c.StepCache == nil { c.StepCache = newMemoryJournal() }`
+  —— 而紧邻的注释对 `Journal` 说的是「进程内存里的幂等承诺跨重启就是个谎，所以核心
+  拒绝这个承诺」。同一函数内自相矛盾。
+- `Step.Key()` 只哈希步骤内容：无 session、无镜像、无环境代际。
+- `RebuildFromSpec` 从 `spec.Base` 新建盒子，**不恢复任何快照**，所以新盒子可证明从未
+  运行过该步骤；跳过它就是把「A 进程里某处做过」当成「这个容器里有」。
+
+现有 `TestStepCacheSkipsReplay` 把这一行为当作正确语义钉住了，因此这不是可以顺手改的
+局部问题：它会改变 D-11 默认重试模式的成本结构。两个可选解：
+
+- **B：从零新建的盒子一律重放**，缓存只对「继承状态的重建」生效。正确且最小；
+  代价是 rebuild 恢复为「重装一切」，即 D-11 字面含义的成本。
+- **C：`RebuildFromSpec` 在存在快照时先恢复最新快照**，只允许跳过该快照之前的步骤。
+  保住成本收益且语义自洽（盒子里确实有），需要定义 D-11/D-12 的交互与代际标识。
+
+新增 `TestStepCacheIsNotEvidenceAboutAFreshBox` 作为**决策验收件**：缺陷仍在时以
+`D-20 OPEN` 显式 skip 并打印测量值；一旦选定方案并落地，它会自动变为通过或硬失败。
+
+**（三）provider 侧不可达的重放代码。** `EnvSpec.ReplayFrom` / `CachedSteps` 在核心
+**从未被赋值**（零赋值点），而 docker provider 的 `replay()` 遍历 `ReplayFrom`，注释
+写着「核心会把剩下的放进 ReplayFrom，所以本 provider 不自创重试策略」——该注释为假，
+代码路径不可达。核心重放已是唯一所有者且 provider 无关，故这段死代码与假注释应随
+D-20 一并清理（避免下一个谎报者据此声称实现了重放）。

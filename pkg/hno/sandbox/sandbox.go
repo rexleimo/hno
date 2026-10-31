@@ -334,6 +334,23 @@ func (sb *Sandbox) Session(ctx context.Context, id string, opts ...SessionOption
 		return nil, err
 	}
 	sess := sb.adopt(id, env, spec)
+	// A record with steps means this environment is a reconstruction, not the box that
+	// ran them. Replaying is the difference between "resumed" and "empty and claiming
+	// to be ready": without it every install and setup a workflow recorded is gone, and
+	// the first failure gets attributed to the caller's code.
+	if rec != nil && len(spec.Steps) > 0 {
+		rep := &RebuildReport{SessionID: id}
+		if rerr := sb.replayRecorded(ctx, env, spec, rep); rerr != nil {
+			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sb.cfg.Timeouts.Cleanup)
+			_ = env.Close(cctx)
+			cancel()
+			sess.mu.Lock()
+			sess.state = StateLost
+			sess.mu.Unlock()
+			return nil, rerr
+		}
+		sb.emit(ctx, Event{Kind: EventRebuilt, SessionID: id, Provider: sb.name, Detail: map[string]any{"replayed": len(rep.Replayed), "cached": rep.Cached, "resume": true}})
+	}
 	return sess, nil
 }
 

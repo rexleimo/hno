@@ -145,6 +145,39 @@ bit is a provider's assertion about itself, and nothing enforced it.
   managed, foreign container is reported by `Sweep` and refused by `Prune`. Verified
   under two concurrent gate processes: 6/6 pass each, zero skips, and zero
   `hno.sandbox.managed` residue left in the engine afterwards.
+### 🐛 Fixed (SB-B2e: a resumed session replayed nothing)
+- **`Session()` never replayed the steps a session recorded.** `replayStep()` had exactly
+  one call site, inside `rebuild()`, so the acquisition path created a fresh environment
+  from the persisted spec and adopted it un-replayed. A resumed workflow — the one
+  situation a session store exists for — got an empty box reported as `Ready`: every
+  recorded `Install` and `Setup` was gone, and the first failure was classified
+  `ClassUserCode`, blaming the caller for the sandbox's own omission. Replay now has a
+  single owner (`replayRecorded`), shared by rebuild and resume; a resume whose replay
+  fails closes the half-built environment, marks the session `Lost`, and returns
+  `StepReplayError` instead of pretending readiness.
+- **The in-memory double could not express a lost box.** Its `NewEnvironment` returns an
+  existing environment for the same session id, `MarkLost` only unlinks the session, and
+  history recorded argv commands but not shell steps — so "the step was skipped" and "the
+  step ran and nobody wrote it down" were indistinguishable. Added `DropEnvironment` and
+  `InstalledIn`, and every executed request now leaves a trace, recorded before the
+  interpret dispatch rather than as a `case` in it (a Go switch runs only the first
+  matching branch, and a catch-all case there silently stops the double interpreting
+  payloads).
+
+### ⚠️ Known issues
+- **D-20: a step-cache hit is treated as evidence about a container that never ran the
+  step.** `StepCache` is on by default with a process-memory journal, `Step.Key()` hashes
+  step content only (no session, no image, no environment generation), and
+  `RebuildFromSpec` builds a fresh box from the base image without restoring a snapshot.
+  Measured after dropping the box so the loss is real: a same-session rebuild and a
+  cross-session rebuild both report `cached=1 replayed=0` and the new box has nothing
+  installed. Failures then surface as `ClassUserCode`, so the sandbox blames the caller
+  for a skip the sandbox performed. Fixing it changes the cost shape of the default retry
+  mode and the meaning of an existing contract test, so it needs a decision: replay
+  always for scratch boxes, or have rebuild restore the latest snapshot and skip only
+  steps predating it. `TestStepCacheIsNotEvidenceAboutAFreshBox` states the acceptance
+  criterion and skips with the measured values until then.
+
 ### 🐛 Fixed (SB-B2d: silent no-ops on the request surface)
 - **`Request.ReadyProbe` was decorative.** `clone()` deep-copied it, `Validate()`
   rejected an empty one, and no code ever read `URL`, `Port`, `Pattern`, or `Deadline`,

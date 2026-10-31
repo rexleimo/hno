@@ -45,23 +45,12 @@ func (sb *Sandbox) rebuild(ctx context.Context, sess *Session) (*RebuildReport, 
 	sb.setSessionWorkspace(sess, workspace)
 
 	rep := &RebuildReport{SessionID: sess.id, Duration: time.Since(started)}
-	for _, step := range spec.Steps {
-		res := StepResult{Step: step}
-		if cached, ok := sb.stepCached(step); ok && cached {
-			res.Cached = true
-			rep.Cached++
-			continue
-		}
-		stepStart := time.Now()
-		if err := sb.replayStep(ctx, env, step); err != nil {
-			res.Err = err
-			rep.Replayed = append(rep.Replayed, res)
-			_ = env.Close(ctx)
-			return rep, &StepReplayError{Step: step, Cause: err, Replayed: len(rep.Replayed), Cached: rep.Cached}
-		}
-		res.Elapsed = time.Since(stepStart)
-		rep.Replayed = append(rep.Replayed, res)
-		sb.rememberStep(step)
+	if err := sb.replayRecorded(ctx, env, spec, rep); err != nil {
+		_ = env.Close(ctx)
+		sess.mu.Lock()
+		sess.state = StateLost
+		sess.mu.Unlock()
+		return rep, err
 	}
 	if dr := sb.detectDrift(ctx, env, spec); len(dr) > 0 {
 		rep.Drift = dr
@@ -78,6 +67,35 @@ func (sb *Sandbox) rebuild(ctx context.Context, sess *Session) (*RebuildReport, 
 	rep.Duration = time.Since(started)
 	sb.emit(ctx, Event{Kind: EventRebuilt, SessionID: sess.id, Detail: map[string]any{"replayed": len(rep.Replayed), "cached": rep.Cached, "dropped": rep.Dropped}})
 	return rep, nil
+}
+
+// replayRecorded re-applies the steps a session recorded onto a freshly created
+// environment.
+//
+// This is the single owner of replay. It exists because the acquisition path and the
+// rebuild path both need it, and because duplicating it inside a provider is how the
+// work ends up done twice or, worse, never: EnvSpec.ReplayFrom was documented as the
+// channel for it, the core never filled the field, and a provider loop over it was
+// therefore unreachable while the resumed session still reported itself Ready.
+func (sb *Sandbox) replayRecorded(ctx context.Context, env Environment, spec SessionSpec, rep *RebuildReport) error {
+	for _, step := range spec.Steps {
+		res := StepResult{Step: step}
+		if cached, ok := sb.stepCached(step); ok && cached {
+			res.Cached = true
+			rep.Cached++
+			continue
+		}
+		stepStart := time.Now()
+		if err := sb.replayStep(ctx, env, step); err != nil {
+			res.Err = err
+			rep.Replayed = append(rep.Replayed, res)
+			return &StepReplayError{Step: step, Cause: err, Replayed: len(rep.Replayed), Cached: rep.Cached}
+		}
+		res.Elapsed = time.Since(stepStart)
+		rep.Replayed = append(rep.Replayed, res)
+		sb.rememberStep(step)
+	}
+	return nil
 }
 
 // replayStep executes one recorded step against a live environment.
