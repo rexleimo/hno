@@ -449,3 +449,63 @@ func TestResponseShapeTolerance(t *testing.T) {
 		time.Sleep(0)
 	}
 }
+
+// TestMalformedReasonIsNowRejected records the side of D-32 that tightens. Before, "reason"
+// was not declared at all, so any value under that key was accepted unchecked and silently
+// dropped by readResponse when it was not a string. Declaring it means the graph validates it:
+// a non-string reason is refused instead of quietly disappearing, and the question stays open.
+func TestMalformedReasonIsNowRejected(t *testing.T) {
+	ctx := context.Background()
+	sb := openSandbox(t, sandbox.WithPolicy(policyOn("deploy")))
+	sess := session(t, sb, "g-reason-type")
+
+	g := build(sgraph.Node("work", sess, sandbox.Shell("export deploy=1")))
+	_, err := g.Run(ctx, nil)
+	var susp *coregraph.Suspension
+	if !errors.As(err, &susp) {
+		t.Fatalf("want suspension, got %v", err)
+	}
+	id := susp.Interrupts[0].Interrupt.InterruptID
+
+	if _, err := g.Resume(ctx, map[string]any{id: map[string]any{
+		"approved": true, "reason": 42,
+	}}); !errors.Is(err, coregraph.ErrInvalidResponse) {
+		t.Fatalf("a non-string reason must now be refused, got %v", err)
+	}
+	// The bad answer did not spend the approval: it can still be answered correctly.
+	if left := sess.Awaiting(); len(left) != 1 {
+		t.Fatalf("a rejected answer must leave the question open, got %d left", len(left))
+	}
+	res, err := g.Resume(ctx, map[string]any{id: map[string]any{
+		"approved": true, "reason": "window opened",
+	}})
+	if err != nil {
+		t.Fatalf("corrected answer: %v", err)
+	}
+	if out := res.Output().(*sgraph.Result); !out.Ran() {
+		t.Fatalf("the corrected answer must run the work, got %+v", out)
+	}
+}
+
+// TestAnswerWithoutReasonIsAccepted is the other half of the same fix: an optional reason may
+// be left out entirely, which is what the node promises a caller who only wants yes or no.
+func TestAnswerWithoutReasonIsAccepted(t *testing.T) {
+	ctx := context.Background()
+	sb := openSandbox(t, sandbox.WithPolicy(policyOn("deploy")))
+	sess := session(t, sb, "g-no-reason")
+
+	g := build(sgraph.Node("work", sess, sandbox.Shell("export deploy=1")))
+	_, err := g.Run(ctx, nil)
+	var susp *coregraph.Suspension
+	if !errors.As(err, &susp) {
+		t.Fatalf("want suspension, got %v", err)
+	}
+	id := susp.Interrupts[0].Interrupt.InterruptID
+	res, err := g.Resume(ctx, map[string]any{id: map[string]any{"approved": true}})
+	if err != nil {
+		t.Fatalf("an answer with only the decision must be accepted: %v", err)
+	}
+	if out := res.Output().(*sgraph.Result); !out.Ran() {
+		t.Fatalf("want the work to run, got %+v", out)
+	}
+}

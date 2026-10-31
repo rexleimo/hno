@@ -138,17 +138,21 @@ func (c *nodeConfig) normalise(name string) {
 		c.approver = "graph"
 	}
 	if c.schema == nil {
-		// Only the decision field is declared. A reason is accepted when present, but
-		// declaring it as a property would make pkg/hno/graph reject every answer that
-		// omits it: checkShape validates each schema property against respMap[name], and a
-		// key the caller never sent reads back as nil, so an optional field cannot be
-		// declared optional today. Documented in the plan as an upstream finding rather
-		// than papered over here.
+		// The decision is required; a reason is optional. readResponse already accepts a
+		// reason string when present and uses it as the recorded deny reason, so the schema
+		// now says what the node actually reads instead of under-declaring it.
+		//
+		// This was not possible before: pkg/hno/graph validated every declared property
+		// against the response map, so a key nobody sent read back as nil and failed its
+		// declared type -- declaring "reason" would have forced every answer to include it.
+		// That defect is fixed (D-32), and the fix is only trusted because this is a real
+		// consumer of it rather than a test kept honest by hand.
 		c.schema = map[string]any{
 			"type":     "object",
 			"required": []string{c.field},
 			"properties": map[string]any{
-				c.field: map[string]any{"type": "boolean"},
+				c.field:  map[string]any{"type": "boolean"},
+				"reason": map[string]any{"type": "string"},
 			},
 		}
 	}
