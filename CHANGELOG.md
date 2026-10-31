@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ Added (B4a HITL 审批闭环)
+- `sandbox/approval.go`：把「要求人工批准」从一条错误变成一条完整回路。`Session.Awaiting()` 让调用方在不装 Observer 的情况下看到被挂起的请求（工作流要么汇报卡住、要么只会卡住）；`Approve/Deny/Resume` 落人类裁决并按原请求原文重跑，重跑仍走完整策略/钩子/审计路径，权限不靠绕过维持。
+- 审批记录绑定环境：`PendingApproval.BoundToEnvironment()` 明示这次授权是否关于某台具体盒子（策略先于开机跑，新会话首次挂起本就没有盒子可绑）。已授予的批准免除自身义务，否则再提交会无限挂起。
+- 过期窗口真正生效：`Approval.Expires` 与 `Timeouts.ApprovalHold` 取短者，过期后 Approve/Resume 返回可补救的 `ApprovalExpiredError`。
+- 新类型化错误：`UnknownApprovalError`、`ApprovalAnsweredError`、`ApprovalExpiredError`、`ApprovalRefusedError`、`ApprovalEnvironmentChangedError`、`ApprovalNotDischargedError`；`ApprovalPendingError` 增补 `SessionID/Hold/ExpiresAt/Remediation`。
+- 新事件：`EventApprovalRequested/Granted/Refused/Expired`；`Diagnose` 增 `approvals` 检查（有挂起未答即报不健康并指向 `Awaiting()`）。
+
+### 🐛 Fixed (B4a)
+- **锁序死锁**：在持 session 锁时 emit，与 `Close`（先取 handle 锁再 `Release` 取 session 锁）构成 ABBA；nil 审批簿 panic 展开时还会留下未释放的 handle 锁，症状是永不返回而非失败。现由 `sb.mu` 独占审批簿、先收集后解锁再 emit、book 方法 nil-safe、Open 即建簿。
+- **文档承诺的重建路径不可达**：`Resumable()` 声称 Exec 可按 spec 重建、`environmentFor` 也实现了，但 `reserve()` 更早对 `StateLost/StateSuspended` 直接返回 `StaleSessionError`，使该分支零调用者，默认 `RebuildFromSpec`（D-11）在 session 路径上从不生效。现两处共用单一谓词 `canRebuild()`，拒绝时把原因写进 `Cause`。
+- **懒建/重建丢 provenance**：`provision` 用了 `newEnvironment` 返回的 provenance 做重放却丢弃它，session 上留着 `adoptWorkspace` 的占位 lineage，同时使 D-20 步骤缓存水位门在该路径失效、审批无法绑定环境。现写回 provenance。
+
+### 🧪 Tests (B4a)
+- `approval_test.go` 12 条：挂起→批准→恢复全回路、拒绝后不跑、窗口过期、per-approval 短窗口生效、审批不循环、换盒拒绝且授权不被消耗、未知 id 双补救、二次裁决拒绝、事件落观察者、Diagnose 可见挂起、并发 answer/Resume/Diagnose/Close 不死锁。
+- 反证：撤销 provenance 落库 ⇒ 换盒拒绝测试 FAIL；`expired()` 失效 ⇒ 两条过期测试 FAIL；禁用免除义务 ⇒ 循环测试 FAIL（报 `ApprovalNotDischargedError`）。真实门 8 PASS + 1 可见 SKIP，引擎残留 0，核心覆盖 72.6% → 73.0%。
+
+
 ### ✨ Added (B2 真引擎收尾：CapRebuild / ReadyProbe / TTL / runsc 档位)
 - **`sandbox/provider/docker`：`Config.Runtime` 与 `ProviderConfig.Raw["runtime"]`** —— 把 gVisor 的 syscall-filtered 档位做成 provider 属性（`create --runtime`），而不是第二个 provider；`Probe` 带同一 runtime，避免「探默认档、跑另一档」把不可用配置报成健康。新增 `ContainerRunning` 导出查询（与 `ImagePresent` 同先例：Apple CLI 的 `inspect` 无 `--format`）。
 - **`sandbox.Diagnose`：readiness 档位如实上报** —— provider 无 `CapBackground` 时说明 `Request.ReadyProbe` 会被拒绝；有后台但非 `ReadinessProber` 时说明只有 `Pattern` 可答。选择时可见，而不是等依赖探针的服务起不来。
