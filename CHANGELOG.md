@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ Added (B4i：中文 guide + 跨语言文档门禁)
+- 新页 `website/zh/guide/sandbox-runtime.md`，并挂进 zh 侧栏（`沙盒运行时`，与英文页同位置）。
+  渲染证据：`dist/zh/guide/sandbox-runtime.html`、zh 侧栏与前后翻页链接均出现、进 sitemap，
+  页内两条锚链的 id 与渲染器产出**逐字相同**。
+- 文档门禁升级为**多语言**：`guidePages` 显式列出各页，**缺页 = 失败**（原来 `t.Skipf` ⇒ 删掉 guide
+  会让五道门全绿，正与本批一直在修的「不会失败的门禁」同类）；`TestGuideAPINamesResolve` 另加
+  **各页限定名集合相等**检查，翻译漏掉一个选项会被点名。
+- 新测试 `TestGuideSlugMatchesTheRenderer`：复刻渲染器的锚点规则（NFKD 兼容折叠 → 特殊集
+  （含 `- _ .`）折成连字符 → 其余原样保留 → 合并去边 → 小写），7 例取自**真实构建产物**。
+  过程中被实测纠正两次：全角 `，` 变 `-`，而顿号 `、` 因无兼容分解**原样保留**——同页两向，靠推定必错。
+- 中英各 12 条标题与 dist 逐条比对：**零偏差**。
+
 ### ✨ Added (B4h：站点链接门禁 + 一次真实 docs:build)
 - `docs:build` 第一次被真实跑过（`npm ci` 装依赖，127 包 / 5s，构建 22.1s exit 0），并**渲染验证**新页：
   `website/.vitepress/dist/guide/sandbox-runtime.html` 115 KB、11 个 h2、侧栏项 "Sandbox Runtime" 与

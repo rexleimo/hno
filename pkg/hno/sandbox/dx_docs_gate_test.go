@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 )
 
 // The documentation half of the DX gate (design §P5: guide numbers must match what the runtime
@@ -26,23 +28,62 @@ import (
 //  2. every qualified API name in the guide resolves to an exported symbol of the package it
 //     claims it belongs to, including names used only inside prose or code fences.
 
-const guideRel = "../../../website/guide/sandbox-runtime.md"
+// guidePages lists every page that documents this runtime, in each locale the site
+// publishes. The list is deliberately explicit and a missing page is a failure rather
+// than a skip: with t.Skipf, deleting the guide would have turned all five doc gates green,
+// which is the same "gate that cannot fail" defect this batch keeps finding. Adding a locale
+// here is part of adding that locale's page.
+var guidePages = []string{
+	"../../../website/guide/sandbox-runtime.md",
+	"../../../website/zh/guide/sandbox-runtime.md",
+}
 
-func guidePath(t *testing.T) string {
+func guidePath(t *testing.T, rel string) string {
 	t.Helper()
-	p, err := filepath.Abs(guideRel)
+	p, err := filepath.Abs(rel)
 	if err != nil {
 		t.Fatalf("resolve guide path: %v", err)
 	}
 	if _, err := os.Stat(p); err != nil {
-		t.Skipf("guide page not present at %s: %v", p, err)
+		t.Errorf("documented guide page %s is missing (%v); delete it from guidePages only as part of removing the page from the site", p, err)
 	}
 	return p
 }
 
+// forEachGuide runs fn once per documented page, with the page name in the subtest.
+func forEachGuide(t *testing.T, fn func(t *testing.T, lines []string, page string)) {
+	t.Helper()
+	for _, rel := range guidePages {
+		rel := rel
+		t.Run(strings.ReplaceAll(rel, "../", ""), func(t *testing.T) {
+			p := guidePath(t, rel)
+			b, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatalf("read guide %s: %v", p, err)
+			}
+			fn(t, strings.Split(string(b), "\n"), p)
+		})
+	}
+}
+
+// forEachGuideLine visits every line of every documented page.
+func forEachGuideLine(t *testing.T, fn func(page string, lineNo int, line string)) {
+	t.Helper()
+	for _, rel := range guidePages {
+		p := guidePath(t, rel)
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read guide %s: %v", p, err)
+		}
+		for i, ln := range strings.Split(string(b), "\n") {
+			fn(rel, i+1, ln)
+		}
+	}
+}
+
 func readGuide(t *testing.T) []string {
 	t.Helper()
-	b, err := os.ReadFile(guidePath(t))
+	b, err := os.ReadFile(guidePath(t, guidePages[0]))
 	if err != nil {
 		t.Fatalf("read guide: %v", err)
 	}
@@ -72,39 +113,40 @@ func docValue(v any) string {
 }
 
 func TestGuideNumbersMatchResolvedDefaults(t *testing.T) {
-	lines := readGuide(t)
-	rows := map[string]string{}
-	for _, ln := range lines {
-		if !strings.HasPrefix(ln, "| ") {
-			continue
-		}
-		cells := strings.Split(strings.Trim(ln, "|"), "|")
-		if len(cells) < 2 {
-			continue
-		}
-		key := strings.Trim(strings.TrimSpace(cells[0]), "`")
-		rows[key] = strings.TrimSpace(cells[1])
-	}
-
-	check := func(structName string, sample any) {
-		v := reflect.ValueOf(sample)
-		tp := v.Type()
-		for i := 0; i < tp.NumField(); i++ {
-			field := tp.Field(i)
-			want := docValue(v.Field(i).Interface())
-			got, ok := rows[field.Name]
-			if !ok {
-				t.Errorf("%s: guide does not document %s.%s at all", structName, structName, field.Name)
+	forEachGuide(t, func(t *testing.T, lines []string, page string) {
+		rows := map[string]string{}
+		for _, ln := range lines {
+			if !strings.HasPrefix(ln, "| ") {
 				continue
 			}
-			// The guide may add a qualifier after the value ("0 means the engine decides").
-			if !strings.HasPrefix(got, want) {
-				t.Errorf("%s: guide says %s.%s = %q, the code says %q", structName, structName, field.Name, got, want)
+			cells := strings.Split(strings.Trim(ln, "|"), "|")
+			if len(cells) < 2 {
+				continue
+			}
+			key := strings.Trim(strings.TrimSpace(cells[0]), "`")
+			rows[key] = strings.TrimSpace(cells[1])
+		}
+
+		check := func(structName string, sample any) {
+			v := reflect.ValueOf(sample)
+			tp := v.Type()
+			for i := 0; i < tp.NumField(); i++ {
+				field := tp.Field(i)
+				want := docValue(v.Field(i).Interface())
+				got, ok := rows[field.Name]
+				if !ok {
+					t.Errorf("%s: guide does not document %s.%s at all", structName, structName, field.Name)
+					continue
+				}
+				// The guide may add a qualifier after the value ("0 means the engine decides").
+				if !strings.HasPrefix(got, want) {
+					t.Errorf("%s: guide says %s.%s = %q, the code says %q", structName, structName, field.Name, got, want)
+				}
 			}
 		}
-	}
-	check("Limits", DefaultLimits())
-	check("Timeouts", DefaultTimeouts())
+		check("Limits", DefaultLimits())
+		check("Timeouts", DefaultTimeouts())
+	})
 }
 
 // pkgSurface is the exported surface of one package, for names the guide references.
@@ -196,8 +238,12 @@ func TestGuideAPINamesResolve(t *testing.T) {
 		surfaces[alias] = surfaceOf(t, dir)
 	}
 
-	seen := map[string]bool{}
-	for i, ln := range readGuide(t) {
+	seenPerPage := map[string]map[string]bool{}
+	for _, rel := range guidePages {
+		seenPerPage[rel] = map[string]bool{}
+	}
+	forEachGuideLine(t, func(page string, lineNo int, ln string) {
+		seen := seenPerPage[page]
 		for _, m := range qualifiedRe.FindAllStringSubmatch(ln, -1) {
 			alias, name := m[1], m[2]
 			key := alias + "." + name
@@ -222,11 +268,37 @@ func TestGuideAPINamesResolve(t *testing.T) {
 			if found {
 				continue
 			}
-			t.Errorf("guide line %d references %s, which is not exported by the %s package", i+1, key, alias)
+			t.Errorf("guide %s line %d references %s, which is not exported by the %s package", page, lineNo, key, alias)
+		}
+	})
+	for page, seen := range seenPerPage {
+		if len(seen) < 25 {
+			t.Errorf("guide %s audits only %d qualified names; a rewrite that drops API references would silently empty this gate", page, len(seen))
 		}
 	}
-	if len(seen) < 25 {
-		t.Errorf("guide audits only %d qualified names; a rewrite that drops API references would silently empty this gate", len(seen))
+	// Locales must not drift in API coverage: a translated page that quietly drops an
+	// option leaves readers of that locale with an incomplete contract.
+	if len(guidePages) > 1 {
+		base := seenPerPage[guidePages[0]]
+		for _, rel := range guidePages[1:] {
+			other := seenPerPage[rel]
+			var onlyBase, onlyOther []string
+			for k := range base {
+				if !other[k] {
+					onlyBase = append(onlyBase, k)
+				}
+			}
+			for k := range other {
+				if !base[k] {
+					onlyOther = append(onlyOther, k)
+				}
+			}
+			if len(onlyBase) > 0 || len(onlyOther) > 0 {
+				sort.Strings(onlyBase)
+				sort.Strings(onlyOther)
+				t.Errorf("guide locales disagree on API references: %s lacks %v; %s lacks %v", rel, capList(onlyBase), rel, capList(onlyOther))
+			}
+		}
 	}
 }
 
@@ -267,6 +339,13 @@ func TestGuideBareAPINamesResolve(t *testing.T) {
 		}
 		t.Errorf("guide prose uses %q, which looks like an API name from a fixed prefix family but is exported by neither pkg/hno/sandbox, pkg/hno/tools/run, nor pkg/hno/sandbox/graph", name)
 	}
+}
+
+func capList(s []string) []string {
+	if len(s) > 8 {
+		return append(s[:8:8], "...")
+	}
+	return s
 }
 
 func mustAbs(t *testing.T, rel string) string {
@@ -408,22 +487,96 @@ var headingRe = regexp.MustCompile("(?m)^#{1,6}\\s+(.+?)\\s*$")
 // point at pages that were never written. Measured: a deliberately dead /guide/does-not-exist
 // link built clean in 68 seconds with exit 0. A green site build is therefore not evidence
 // about links, and the check has to live where the rest of the guide contract is enforced.
+// guideSlug reproduces the anchor slug the VitePress renderer produces, and it was derived by
+// comparing against the built HTML for both locales rather than by reading the docs and hoping:
+//
+//  1. compatibility folding (NFKD) -- full-width forms U+FF01-U+FF5E fold to their ASCII
+//     equivalents and U+3000 to a space, so "，" lands on the same path as ",";
+//  2. every run of markup/punctuation in the renderer's special set becomes one hyphen (note
+//     that this set includes "-", "_" and ".");
+//  3. characters with no decomposition and no special meaning are kept verbatim -- which is why
+//     the ideographic comma in "项目、文件与输出" survives into the id intact while a full-width
+//     comma in the same page becomes a hyphen;
+//  4. collapse repeated hyphens, trim the ends, lowercase.
+//
+// Combining marks (U+0300-U+036F) and C0 controls are stripped by the renderer too; no heading
+// here uses them, so the gap is documented rather than silently wrong.
+func guideSlug(text string) string {
+	folded := make([]rune, 0, len(text))
+	for _, r := range text {
+		switch {
+		case r >= 0xFF01 && r <= 0xFF5E:
+			folded = append(folded, rune(int(r)-0xFEE0))
+		case r == 0x3000:
+			folded = append(folded, ' ')
+		default:
+			folded = append(folded, r)
+		}
+	}
+	special := func(r rune) bool {
+		// The renderer's "special" set, transcribed rather than approximated. It includes "-"
+		// and "_" and ".", which is why "P1_2" slugs to "p1-2".
+		switch r {
+		case ' ', '\t', '\n', '\r', '~', '`', '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '-', '_',
+			'+', '=', '[', ']', '{', '}', '|', '\\', ';', ':', '"', '\'', '“', '”', '‘', '’',
+			'<', '>', ',', '.', '?', '/':
+			return true
+		}
+		return false
+	}
+	var b strings.Builder
+	lastDash := false
+	for _, r := range folded {
+		if special(r) {
+			if !lastDash {
+				b.WriteRune('-')
+				lastDash = true
+			}
+			continue
+		}
+		b.WriteRune(unicode.ToLower(r))
+		lastDash = false
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// TestGuideSlugMatchesTheRenderer pins the derivation against ids taken from the built page. The
+// two ideographic-punctuation cases are the ones a naive rule gets wrong in opposite directions:
+// one keeps the character, the other folds it into a separator.
+func TestGuideSlugMatchesTheRenderer(t *testing.T) {
+	cases := []struct {
+		heading string
+		want    string
+	}{
+		{"From a shell: `hno sandbox`", "from-a-shell-hno-sandbox"},
+		{"Failure visibility in the toolkit", "failure-visibility-in-the-toolkit"},
+		{"Defaults you are actually getting", "defaults-you-are-actually-getting"},
+		{"项目、文件与输出", "项目、文件与输出"},
+		{"排查一次运行之前，先问句柄", "排查一次运行之前-先问句柄"},
+		{"从遗留 Executor 迁移", "从遗留-executor-迁移"},
+		{"P1_2 and sub--two", "p1-2-and-sub-two"},
+	}
+	for _, c := range cases {
+		if got := guideSlug(c.heading); got != c.want {
+			t.Errorf("guideSlug(%q) = %q, the renderer produces %q", c.heading, got, c.want)
+		}
+	}
+}
+
 func TestGuideLinksResolve(t *testing.T) {
-	lines := readGuide(t)
+	forEachGuide(t, guideLinksResolve)
+}
+
+func guideLinksResolve(t *testing.T, lines []string, page string) {
 	body := strings.Join(lines, "\n")
 
 	// Slugs are derived the way the renderer does it: lowercase, drop markup punctuation,
 	// spaces to hyphens. Verified against the built page, which produced
 	// "from-a-shell-hno-sandbox" for "From a shell: `hno sandbox`".
-	slugify := func(s string) string {
-		s = strings.ToLower(strings.TrimSpace(s))
-		s = strings.NewReplacer("`", "", "*", "", ":", "", "—", "-", "–", "-").Replace(s)
-		words := strings.Fields(s)
-		return strings.Join(words, "-")
-	}
 	anchors := map[string]bool{}
+
 	for _, m := range headingRe.FindAllStringSubmatch(body, -1) {
-		anchors[slugify(m[1])] = true
+		anchors[guideSlug(m[1])] = true
 	}
 
 	// Third depth from a nested package to the repo root, and the second time this exact
@@ -449,7 +602,7 @@ func TestGuideLinksResolve(t *testing.T) {
 		path, frag, _ := strings.Cut(target, "#")
 
 		if frag != "" && path == "" {
-			if !anchors[slugify(frag)] {
+			if !anchors[guideSlug(frag)] {
 				t.Errorf("guide link %q points at an anchor this page does not produce; headings present: %d", target, len(anchors))
 			}
 			continue
@@ -470,12 +623,16 @@ func TestGuideLinksResolve(t *testing.T) {
 		}
 
 		// Relative link: resolve against this page's directory.
-		rel := filepath.Join(filepath.Dir(guidePath(t)), path)
+		abs, err := filepath.Abs(page)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", page, err)
+		}
+		rel := filepath.Join(filepath.Dir(abs), path)
 		if _, err := os.Stat(rel); err != nil {
 			t.Errorf("guide link %q does not resolve to a file (%s)", target, rel)
 		}
 	}
 	if checked == 0 {
-		t.Errorf("the guide contains no local links at all; the link gate would be silently vacuous")
+		t.Errorf("%s contains no local links at all; the link gate would be silently vacuous", page)
 	}
 }
