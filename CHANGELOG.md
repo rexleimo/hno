@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 🐛 Fixed (B4g / D-36：`Diagnose` 不再对镜像给假绿灯)
+- 真实引擎实测的症状：`hno sandbox doctor --image no-such-image-hno:0` 报 **“all 8 checks passed” / exit 0**，而同一镜像走 `run` 是 exit 70 并带引擎原文（registry 401）。`Diagnose` 里没有镜像项，`Probe` 又刻意不 pull 并把「缺镜像」当无关信息吞掉。现在同一命令报 **exit 1**、点名镜像、给出可执行修复，summary 变为 “1 of 9 checks failed”。
+- 新可选接口 `sandbox.ImageQueryable`（`ImageAvailable(ctx, image)`）：provider 经 **dialect** 用自己的词汇表回答（docker 用 `image inspect`，Apple 解析 `image list`——用错形状会把 usage error 误报成「镜像不存在」）。`docker.ImagePresent` 此前能力已实现、已测，但生产路径调用者为 0；现在核心健康报告真正走它。
+- 检查四态，只有 present 是绿的：absent ⇒ 不 OK + 修复建议；问了但引擎不肯答 ⇒ 不 OK 且 `Got: "unknown: <引擎原因>"`（沿用 D-31「无法验证即拒绝」，不向上取整成健康）；provider 不提供查询 ⇒ 不 OK 并点名要实现的接口（与 `capabilities-without-behaviour` 同一家规）。
+- `sandboxtest` double 增加 `AbsentImages` / `ImageQueryErr` 两个模拟旋钮（沿用其既有 `ProbeErr` / `SlowBoot` 风格），默认回答「present」——因为该 double 确实能用任意镜像起环境，答 absent 就是朝反方向撒谎。
+
+### 🧪 Tests (B4g)
+- 五条镜像态测试在**旧实现下 5/5 全红**（抽掉 `Diagnose` 的检查即复现旧行为），恢复后全绿。
+- provider 层：两种 dialect 各两条（present/absent）+ 空镜像不得被答成「absent」+ 引擎故障必须以 error 上抛而非伪装成缺失 + `*docker.Provider` 确实满足 `sandbox.ImageQueryable`。docker provider 覆盖率 59.6% → **62.2%**。
+- 真实引擎闭环 `TestRealImageCheckIsNotAFalseGreen`：本地镜像 ⇒ 检查 OK；不存在的镜像 ⇒ 不 OK、点名镜像、修复可执行，并断言 summary 不得在镜像阻塞时读成 clean。真实门 **10 PASS / 0 FAIL / 残留 0**。
+- 测试反证了我自己的两个错误假设：① `WithImage("")` 不是「无镜像态」，它解析到 `sandbox.DefaultImage`（`agent-runner:1`），故该测试改为钉住「留空不得豁免验证」；② 委托壳若转发 double 的全能力集，会在 bind 时被核心以过度声明拒绝——壳返回空集合才是诚实的。
+- 收紧行为的半径实测：非测试 `Diagnose` 调用点只有 `cmd/hno`；七包全绿（含 `pkg/hno/agent`），核心覆盖率 73.2% → 73.3%，`-race` 全绿。
+
 ### ✨ Added (B4f：`hno sandbox` CLI)
 - 新命令 `cmd/hno`：runtime 自报的东西以前只有写 Go 才听得到，而修复文案长期指向一个不存在的命令。三个动词，每个对一个导出调用，零新增策略：
   - `hno sandbox doctor` → `Sandbox.Diagnose`，人读逐项 want/got/fix，`--json` 出机读报告；有检查失败则非 0 退出，可直接当 CI 门禁。
@@ -22,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Isolation 词汇往返被钉住：`String()` 输出必须能被 `ParseIsolation` 解析回来，且 `--isolation` 帮助文本必须列出全部档位、不得出现解析器拒绝的词（我第一版写的 `micro-vm` 就是被这条抓的）。
 - 真实引擎证据（非 double）：`doctor` 8 项全过 exit 0；坏引擎二进制 exit 70 并给出可执行说明；`run -- go version` 返回 `go version go1.26.9 linux/arm64`；`run -- sh -c "exit 5"` 透传 5；`prune` 零删除、残留 0。`-race` 全绿，真实门 26.0s，核心覆盖率 73.2% 不变。
 
-### 🐛 Known gap（记录未改，见台账 D-36）
+### 🐛 Known gap（已由 B4g 修复，见上方 D-36 条目）
 - `hno sandbox doctor --image <不存在的镜像>` 报 **“all 8 checks passed” / exit 0**，而同一镜像走 `run` 是 exit 70 并带引擎原文。`Diagnose` 没有镜像项，`Probe` 又刻意不 pull 并吞掉缺镜像；而 `docker.ImagePresent`（两种 dialect 都已实现）唯一的调用者是集成测试。修法是加一项 image 检查，但它会改动检查集合、可能把 CI 里的 doctor 从绿翻红 ⇒ 需要授权，未在本轮范围内。
 
 ### 🐛 Fixed (B4e：可执行文案不再指向不存在的东西)

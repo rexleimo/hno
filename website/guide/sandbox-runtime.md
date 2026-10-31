@@ -93,8 +93,17 @@ for _, f := range diag.Fixes {
 ```
 
 `Diagnose` reports the provider that answered, the isolation floor versus the isolation you got,
-capabilities the provider claims but the core cannot act on, whether `ReadyProbe` and `Expose`
-will be honoured here, live session counts, outstanding approvals, and leaked environments.
+capabilities the provider claims but the core cannot act on, whether the image the handle is bound
+to can actually start here, whether `ReadyProbe` and `Expose` will be honoured here, live session
+counts, outstanding approvals, and leaked environments.
+
+The image check is separate from the probe on purpose. The probe asks whether the engine can
+create anything at all and deliberately never pulls; an engine that answers that happily can still
+be holding no copy of your image. Providers that can answer implement `sandbox.ImageQueryable`, and
+the three possible answers map to three different report lines — present, absent, and *"the engine
+would not say"* — of which only the first is a pass. An unanswerable image question is reported as
+a failure rather than rounded up to healthy, because a green light that means "nobody checked" is
+the reason this check exists.
 
 Every remediation string is checked by a test against the package's exported surface, so a hint
 cannot tell you to call an option that does not exist or to run a CLI that was never shipped.

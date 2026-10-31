@@ -271,3 +271,47 @@ D-34 的收尾承诺：CLI 存在后，门禁必须校验文案里 `hno sandbox 
 **D-36 待授权**：doctor 对缺失镜像给假绿灯（exit 0 "all 8 checks passed"），同镜像 run 是 exit 70；
 `ImagePresent` 能力已实现已测但生产路径唯一调用者是集成测试。需一次 Diagnose image 检查，
 代价是检查集合与 CI 绿灯语义变化，故只记录。
+
+## B4g 工作项 — 修 D-36：`Diagnose` 必须回答「这个镜像在这里能起吗」
+
+```yaml
+type: planned
+targets:
+  - pkg/hno/sandbox/provider.go            (new interface ImageQueryable)
+  - pkg/hno/sandbox/lifecycle.go           (Diagnose gains the "image" check)
+  - pkg/hno/sandbox/sandboxtest/memory.go  (double answers honestly via the attrs channel)
+  - pkg/hno/sandbox/provider/docker/docker.go (delegates to the existing dialect path)
+  - pkg/hno/sandbox/image_check_test.go    (new)
+  - pkg/hno/sandbox/provider/docker/integration_test.go (opt-in real-engine assertion)
+  - cmd/hno/hno_test.go                    (doctor exit 1 on an absent image)
+  - website/guide/sandbox-runtime.md       (check list gains image)
+allowedWrites: 同上；不改 execute/provision 路径，不改 Probe 的「不 pull」范围
+failureClass: contract
+```
+
+已测事实（决定语义，不是猜）：
+- `Diagnose` 当前 8 项里没有镜像项；`Probe` 只在 `refusesCreate` 命中时升级 ⇒ 缺镜像被吞。
+- `docker.ImagePresent` 已在两种 dialect 实现并有测试，但**非测试调用者为 0**。
+- 非测试 `Diagnose` 调用点只有 `cmd/hno`；核心测试里对 checks 的断言均按 `Env` 名定位 ⇒ 新增一项不破坏它们。
+- 9 个测试文件给 memory double 设了非空 `WithImage` ⇒ double 默认必须答「present」，否则反向撒谎。
+- 同族先例：`capabilities-without-behaviour` 检查就是「声明了却接不上 ⇒ 不算 OK」。
+
+语义（四态，只有第三种是绿的）：present ⇒ OK；absent ⇒ 不 OK 并给可执行修复；
+问了但引擎答不出 ⇒ 不 OK，`Got: "unknown: …"`（D-31「无法验证即拒绝」）；
+provider 根本不提供镜像查询 ⇒ 不 OK 并明说（不是假绿，也不是把诚实的 double 判死——double 会答）。
+
+## B4g 完成记录（D-36 已修，实测）
+
+真实引擎复现同一命令的前后对比：
+- 修复前：`hno sandbox doctor --image no-such-image-hno:0` ⇒ exit 0，"all 8 checks passed"
+- 修复后：⇒ exit 1，`FAIL image … got=absent: no-such-image-hno:0` + 可执行修复，summary "1 of 9 checks failed"
+
+交付：`sandbox.ImageQueryable`（provider 经 dialect 回答）、`Diagnose` 镜像检查四态、
+double 的 `AbsentImages`/`ImageQueryErr` 旋钮、provider 离线 4 组测试、真实引擎闭环测试、
+CLI 离线钉桩、guide 说明镜像项与「无法验证不算通过」。
+
+计划里预写的语义被实测细化：`WithImage("")` 不是无镜像态（解析到 DefaultImage），
+因此「不 OK 只发生在能问到答案却非 present / 问不出结果 / provider 不实现」这三类，
+而"无镜像"这一态在解析后的 handle 上不存在——测试已改为钉住「留空不得豁免验证」。
+
+半径实测：非测试调用点 1 处；七包（含 agent）零破坏；覆盖 73.2%→73.3%，docker 59.6%→62.2%。
