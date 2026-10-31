@@ -380,3 +380,59 @@ D-09 30m/5m、D-10 冻结 `run.Executor`、D-12 `CopySnapshot`、D-17 产物按 
 **可逆性**：批次只是提交切分，不改 API；若 B1 后发现需要一次全落，直接合并提交即可，无回滚成本。
 
 不变前提：**P0 实测门不许跳** —— 拿不到 §11 的 boot/拉镜像/单盒内存真实数字，就不接 BoxLite。
+
+## 17. B2 开工：工作项声明与本机可用性（实测）
+
+### 17.1 工作项（显式声明，不由文本推断）
+
+| 字段 | 值 |
+|---|---|
+| id | `SB-B2a` |
+| type | `planned`（多步、需真实引擎证据） |
+| targets | `pkg/hno/sandbox/provider/docker/`（新增包）、本节 |
+| allowedWrites | 仅上述新增路径；**不改** `pkg/hno/tools/run/**`、不改 `cmd/**` |
+| failureClass | `additive-only`：新包若失败，只影响自身测试；现有 caller 零暴露面 |
+| completion gate | §12.2 B2 门：`FromDir` 进 → `RunProject` → 取回 `ArtifactSet`；注入 `ClassLost` 后 `Rebuild` 恢复且依赖仍在 |
+| side-effect policy | 默认零网络拉取、零新成本、零外部发布；真实容器往返仅在显式 `HNO_SANDBOX_DOCKER=1` 下运行 |
+
+### 17.2 本机可用性实测（改变 B2/B3 路径判断）
+
+```
+docker CLI            PRESENT
+docker daemon         server=0.9.4  os=Apple Containerization  driver=apple-container
+podman                absent
+runsc                 absent
+boxlite               absent
+qemu / firecracker    absent
+/dev/kvm              absent   (Darwin arm64)
+golangci-lint         ABSENT   → §12.2「每批过 make lint」当前无法满足，需另行批准安装
+本地已有镜像           golang:1.26 (305MB), redis:7-alpine, postgres:16/17-alpine
+```
+
+结论（三条，都影响计划）：
+
+1. **macOS 上容器档不需要 `/dev/kvm`**：`apple-container` 走 Apple 的 VFKit/HVF
+   虚拟化栈，容器本身已在一台独立 VM 内。因此 §12.2 的 B2 门在本机**可在
+   不拉镜像、不联网**的前提下用已存在的 `golang:1.26` 真实跑通，而
+   不是只能靠 stub 声称。
+2. **B2 的真实 provider 入口是容器档，不是 BoxLite**：BoxLite 仍受 D 系列的
+   P0 实测门约束（无 `/dev/kvm`、无 boxlite 二进制 → 不接）。这把「B3 才有
+   真引擎」修正为「B2 就有可验证的真引擎」，B3 只补 micro-VM 档。
+3. **`make lint` 门当前不可达**：`golangci-lint` 未安装，安装属网络动作，
+   需单独批准。在获得批准前，B2 的验证证据为 `gofmt -s`、`go vet`、
+   `go test -race`，并明确记录 lint 未跑，而不是声称过了门。
+
+### 17.3 SB-B2a 设计决定
+
+- **命令边界可注入**：provider 通过 `commandRunner`（argv → stdout/stderr/exit）
+  与 docker CLI 交谈。真实实现 `exec.CommandContext`，测试实现为 fake，于是
+  契约测试与故障注入（`ClassLost`、孤儿清扫、产物超限）**离线可跑**，不需要
+  守护进程；真实往返只在显式 opt-in 时发生，`make test` 永不隐式起容器。
+- **能力位只声明已实现的**：容器档声明 `CapSession`/`CapFileBridge`/
+  `CapStreaming`/`CapQueryStatus`/`CapRebuild`/`CapAudit`；**不**声明
+  `CapEgressAllowlist`（docker 只有 `--network=none` 的全关/全开，白名单是
+  BoxLite MITM 或代理的事），因此对白名单请求返回 `*CapabilityError` 而不是
+  假装生效——这正是 D-05 要消灭的静默降级。
+- **孤儿回收用 label，不用进程表**：所有容器打
+  `hno.sandbox.session=<id>`，`Sweep` 以 label 查询引擎侧残留。进程重启后
+  「谁是孤儿」必须有权威事实源，而这个事实源只能在引擎侧（§15 / D-19 的 P8a）。
