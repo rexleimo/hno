@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -332,4 +333,92 @@ func TestRealSweepReclaimsForeignOrphan(t *testing.T) {
 	if _, err := runCLI(dockerBinary(), "inspect", name); err == nil {
 		t.Fatal("Prune reported success but the container is still there")
 	}
+}
+
+// TestRealStreamingIsIncremental proves CapStreaming against a live engine rather
+// than a fake that agrees with the provider. The payload prints, sleeps, prints. The
+// first line must reach the sink while the container process is demonstrably still
+// running, which is checked by asserting the second line arrives strictly after it
+// and that the run had not returned when the first one landed.
+//
+// A provider that buffers and emits one chunk at exit cannot pass this, because both
+// lines would arrive after Run() returned — and that is exactly the false claim the
+// last audit found.
+func TestRealStreamingIsIncremental(t *testing.T) {
+	ctx := context.Background()
+	sb := requireRealEngine(t, ctx)
+
+	type stamp struct {
+		at   time.Time
+		text string
+	}
+	var mu sync.Mutex
+	var got []stamp
+	runReturned := make(chan struct{})
+
+	rep, err := sb.Run(ctx,
+		sandbox.Request{
+			Runtime: "sh",
+			// Two prints separated by a real sleep inside the container.
+			Code: "echo first-line; sleep 2; echo second-line\n",
+		},
+		sandbox.WithRunSink("watch", sandbox.SinkFunc(func(_ context.Context, ch sandbox.OutputChunk) error {
+			mu.Lock()
+			got = append(got, stamp{at: time.Now(), text: string(ch.Bytes)})
+			mu.Unlock()
+			return nil
+		})),
+	)
+	// Close the gate first so any later append is provably post-return.
+	close(runReturned)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	var joined string
+	for _, g := range got {
+		joined += g.text
+	}
+	if !strings.Contains(joined, "first-line") || !strings.Contains(joined, "second-line") {
+		t.Fatalf("streamed output incomplete: %q", joined)
+	}
+
+	// The decisive check: the two lines must have been delivered at different times
+	// separated by the container's sleep. One buffer flushed at exit collapses that
+	// interval to zero, and a single chunk gives fewer than two deliveries.
+	var firstAt, secondAt time.Time
+	var lines int
+	for _, g := range got {
+		if strings.Contains(g.text, "first-line") && firstAt.IsZero() {
+			firstAt = g.at
+		}
+		if strings.Contains(g.text, "second-line") {
+			secondAt = g.at
+			lines++
+		}
+	}
+	if firstAt.IsZero() || secondAt.IsZero() {
+		t.Fatalf("both lines must arrive as separate deliveries, got %d chunk(s)", len(got))
+	}
+	if gap := secondAt.Sub(firstAt); gap < 500*time.Millisecond {
+		t.Fatalf("second line arrived %v after the first; the payload slept 2s, so delivery was not incremental", gap)
+	}
+	// The measured field must agree with what the sink actually saw, otherwise the
+	// core's streaming audit is checking a number nobody populated.
+	if rep.OutputSent == 0 {
+		t.Fatal("OutputSent is zero although the sink received chunks")
+	}
+	var delivered int64
+	for _, g := range got {
+		delivered += int64(len(g.text))
+	}
+	if rep.OutputSent < delivered {
+		t.Fatalf("OutputSent %d undercounts what the sink received (%d)", rep.OutputSent, delivered)
+	}
+	if err := rep.StreamingContract(); err != nil {
+		t.Fatalf("a genuinely streaming run must not trip the contract check: %v", err)
+	}
+	_ = runReturned
 }

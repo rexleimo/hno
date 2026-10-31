@@ -432,6 +432,10 @@ type fanout struct {
 	seq    int64
 	sinks  []SinkBinding
 	closed bool
+	// delivered counts what the provider actually pushed while the run was alive,
+	// per stream. It exists so "this provider streams" is a measured fact rather
+	// than a capability bit the provider asserted about itself.
+	delivered map[Stream]int64
 }
 
 // defaultSinkBuffer is the per-sink queue depth when a binding does not state
@@ -452,7 +456,7 @@ func (sb *Sandbox) newFanout(runID string, extra ...SinkBinding) *fanout {
 			sinks[i].OnOverflow = sb.cfg.Limits.Overflow
 		}
 	}
-	return &fanout{sb: sb, runID: runID, sinks: sinks}
+	return &fanout{sb: sb, runID: runID, sinks: sinks, delivered: map[Stream]int64{}}
 }
 
 // enabled reports whether anybody is listening.
@@ -480,6 +484,12 @@ func (f *fanout) Report(chunk OutputChunk) error {
 	f.mu.Unlock()
 	chunk.RunID = f.runID
 	chunk.Sequence = seq
+	f.mu.Lock()
+	if f.delivered == nil {
+		f.delivered = map[Stream]int64{}
+	}
+	f.delivered[chunk.Stream] += int64(len(chunk.Bytes))
+	f.mu.Unlock()
 	if chunk.At.IsZero() {
 		chunk.At = time.Now().UTC()
 	}
@@ -520,4 +530,20 @@ func callSink(s Sink, chunk OutputChunk) (err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	return s.Emit(ctx, chunk)
+}
+
+// deliveredBytes reports what the provider pushed per stream, and the total.
+func (f *fanout) deliveredBytes() (map[Stream]int64, int64) {
+	if f == nil {
+		return nil, 0
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[Stream]int64, len(f.delivered))
+	var total int64
+	for st, n := range f.delivered {
+		out[st] = n
+		total += n
+	}
+	return out, total
 }

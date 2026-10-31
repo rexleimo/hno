@@ -93,8 +93,52 @@ func (e *Environment) Exec(ctx context.Context, rs sandbox.RunSpec, sink sandbox
 	if payload := payloadFor(rs.Request); payload != "" {
 		cmd.Stdin = []byte(payload)
 	}
+	// sinkErr is hoisted out of the closure so a consumer fault recorded mid-run
+	// survives to the reporting point after the command returns.
+	var sinkErr error
+	if sink != nil {
+		// Live delivery: every byte the engine prints goes to the sink as it
+		// arrives, tagged with its own stream. CapStreaming promises "incrementally
+		// instead of only at exit", and a single chunk after the process ended was
+		// both false to that sentence and silent about stderr — a build that only
+		// talks on stderr streamed nothing at all.
+		//
+		// The core stamps RunID/Sequence at the fanout, so the provider supplies the
+		// stream, bytes, and timestamp only.
+		var seq int64
+		cmd.OnChunk = func(st sandbox.Stream, data []byte) {
+			if sinkErr != nil {
+				return // a faulted consumer is not spammed for the rest of the run
+			}
+			seq++
+			if err := sink.Report(sandbox.OutputChunk{
+				RunID:    rs.RunID,
+				Stream:   st,
+				Bytes:    data,
+				Sequence: seq,
+				At:       time.Now().UTC(),
+			}); err != nil && !errors.Is(err, context.Canceled) {
+				// The core returns an error here on purpose: a Sink bound with
+				// OverflowFault is saying "my consumer rejected this chunk, treat it
+				// as a fault". Dropping it would be the silent no-op the ledger
+				// forbids, so the first fault is kept and reported after the run.
+				sinkErr = err
+			}
+		}
+	}
 
 	res, runErr := e.provider.runner.Run(ctx, cmd)
+	if sinkErr != nil && runErr == nil && res.Exit == 0 {
+		// The payload succeeded; the consumer did not. Report the sink fault as the
+		// run's error while keeping the captured output, so a host can tell "my code
+		// worked and nobody was listening" from "the code failed".
+		rep.Stdout = res.Stdout
+		rep.Stderr = res.Stderr
+		rep.ExitCode = res.Exit
+		rep.Duration = time.Since(started)
+		rep.Failure = sandbox.AsFailure(sinkErr)
+		return rep, sinkErr
+	}
 	rep.Stdout = res.Stdout
 	rep.Stderr = res.Stderr
 	rep.ExitCode = res.Exit
@@ -116,16 +160,6 @@ func (e *Environment) Exec(ctx context.Context, rs sandbox.RunSpec, sink sandbox
 		return rep, err
 	}
 
-	if sink != nil && rep.Stdout != "" {
-		// Streaming is declared, so a sink that asked for chunks has to receive
-		// them. Emitting one whole buffer is honest for a provider that only gets
-		// output at exit; pretending incremental delivery would be worse than
-		// declaring no streaming at all.
-		if err := sink.Report(sandbox.OutputChunk{RunID: rs.RunID, Stream: sandbox.StreamStdout, Bytes: []byte(rep.Stdout), At: time.Now().UTC()}); err != nil && !errors.Is(err, context.Canceled) {
-			rep.Failure = sandbox.AsFailure(err)
-			return rep, err
-		}
-	}
 	if rep.ExitCode != 0 {
 		// A nonzero exit is the payload speaking, not the sandbox breaking. It
 		// returns as a populated report with a user-code failure and a nil error,

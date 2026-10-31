@@ -103,6 +103,45 @@ agrees with your assumptions cannot find any of these:
   could not stage any directory input; a non-positive ceiling now means
   "unbounded here", consistent with the rest of `Limits`.
 
+### 🔒 Contract enforcement (SB-B2b)
+The audit's real lesson was not nine bugs but one missing mechanism: a capability
+bit is a provider's assertion about itself, and nothing enforced it.
+
+- **`CapStreaming` was false.** The contract reads "delivers output incrementally
+  instead of only at exit"; the provider emitted one stdout chunk *after* the
+  process exited and never emitted stderr. The visible consequence is not
+  performance: a build that only talks on stderr presented a live watcher an
+  entirely dead pane while the capability bit stayed lit. Both streams now tap the
+  CLI pipes and deliver as bytes arrive.
+- **`Report.OutputSent`/`OutputSkipped` were documented and written by nobody** —
+  same class as an unset artefact size. The core now measures them at the fanout,
+  so they are a measurement and not a promise.
+- **A false claim is observable without configuring an Observer**, via
+  `Report.StreamingContract()` (`*StreamingContractError` with `Remediation()`,
+  derived mechanically from output and delivery counts) plus an Observer fault
+  event. A fault only a pre-configured observer could see would recreate the very
+  silent no-op this work removes.
+- **The violation does not flip the run's result.** Writing it into
+  `Report.Failure` was tried first and immediately broke a passing project test:
+  `Failure` answers "why did my payload not produce its result", and dishonest
+  telemetry does not change what the code did.
+- **`WithOverflow(OverflowFault)` is reachable again.** The provider discarded the
+  reporter's return value (`_ = sink.Report(...)`), so a binding whose documented
+  policy is "stop the run with a `HookFaultError`" behaved exactly like one that
+  accepted everything. The first non-cancellation fault is now reported after the
+  run while the captured output is preserved.
+- **Test doubles were fixed with the provider, not after it.** The fake Runner never
+  invoked the streaming channel, so every streaming assertion had been validating
+  the double rather than the code. `TestStderrStreamsToo` and
+  `TestChunksArriveBeforeExit` were confirmed to fail against the previous
+  implementation before being kept.
+
+### 🧪 Tests
+- New real-engine gate `TestRealStreamingIsIncremental`: the container runs
+  `echo; sleep 2; echo`, and the two lines must arrive as separate deliveries at
+  least 500ms apart with `Report.OutputSent` agreeing with the sink's byte count.
+  A buffered provider cannot pass. Real gates now stand at 5/5.
+
 ## [3.0.0] - 2026-09-29
 
 The v3 program: a lock-free control-flow graph engine with policies,

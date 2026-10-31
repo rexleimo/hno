@@ -37,7 +37,7 @@ func (f *fakeRunner) Run(_ context.Context, cmd Command) (Outcome, error) {
 	}
 	f.mu.Unlock()
 	if out, ok := f.simulate(cmd); ok {
-		return out, nil
+		return streamOut(cmd, out), nil
 	}
 	if f.failFor != nil {
 		if err := f.failFor(cmd); err != nil {
@@ -46,10 +46,10 @@ func (f *fakeRunner) Run(_ context.Context, cmd Command) (Outcome, error) {
 	}
 	if f.respond != nil {
 		if out, ok := f.respond(cmd); ok {
-			return out, nil
+			return streamOut(cmd, out), nil
 		}
 	}
-	return defaultResponse(cmd), nil
+	return streamOut(cmd, defaultResponse(cmd)), nil
 }
 
 // simulate answers the two exec shapes the file service uses: a write-through
@@ -144,6 +144,24 @@ func hasArgPrefix(args, prefix []string) bool {
 
 // defaultResponse answers the docker surface this provider uses in a way that
 // keeps a happy-path test readable.
+// streamOut replays an outcome's output through Command.OnChunk, so a fake Runner
+// honours the streaming channel the way execRunner does. A fake that ignores OnChunk
+// makes every streaming assertion test the fake instead of the provider, which is
+// how a false CapStreaming survived: the test double and the provider were lying in
+// the same direction.
+func streamOut(cmd Command, out Outcome) Outcome {
+	if cmd.OnChunk != nil {
+		if out.Stdout != "" {
+			cmd.OnChunk(sandbox.StreamStdout, []byte(out.Stdout))
+		}
+		if out.Stderr != "" {
+			cmd.OnChunk(sandbox.StreamStderr, []byte(out.Stderr))
+		}
+	}
+	out.Streamed = int64(len(out.Stdout) + len(out.Stderr))
+	return out
+}
+
 func defaultResponse(cmd Command) Outcome {
 	joined := strings.Join(cmd.Args, " ")
 	switch {
@@ -1110,7 +1128,7 @@ func (r *recRunner) Run(_ context.Context, c Command) (Outcome, error) {
 	r.mu.Lock()
 	r.seen = append(r.seen, c)
 	r.mu.Unlock()
-	return Outcome{}, nil
+	return streamOut(c, Outcome{}), nil
 }
 
 func (r *recRunner) commands() []Command {
@@ -1119,4 +1137,129 @@ func (r *recRunner) commands() []Command {
 	out := make([]Command, len(r.seen))
 	copy(out, r.seen)
 	return out
+}
+
+// TestStderrStreamsToo guards the path that was 100% silent before: the provider
+// emitted one stdout chunk after exit and nothing for stderr, so a build whose only
+// output is compiler errors streamed nothing at all while CapStreaming stayed
+// declared. A caller watching a build saw a dead pane.
+func TestStderrStreamsToo(t *testing.T) {
+	fr := &fakeRunner{respond: func(c Command) (Outcome, bool) {
+		if len(c.Args) > 0 && c.Args[0] == "exec" {
+			return Outcome{Stderr: "undefined: foo\n", Exit: 1}, true
+		}
+		return defaultResponse(c), true
+	}}
+	sb := openHandle(t, fr)
+	var got map[sandbox.Stream]string
+	got = map[sandbox.Stream]string{}
+	rep, err := sb.Run(context.Background(),
+		sandbox.Request{Runtime: "sh", Code: "#!fail 1 undefined: foo"},
+		sandbox.WithRunSink("watch", sandbox.SinkFunc(func(_ context.Context, ch sandbox.OutputChunk) error {
+			got[ch.Stream] += string(ch.Bytes)
+			return nil
+		})))
+	if err != nil {
+		t.Fatalf("a nonzero exit is data, not an error: %v", err)
+	}
+	if !strings.Contains(got[sandbox.StreamStderr], "undefined: foo") {
+		t.Fatalf("stderr never streamed; sink saw %v, report stderr %q, exit %d", got, rep.Stderr, rep.ExitCode)
+	}
+}
+
+// TestChunksArriveBeforeExit is the falsifiable form of "incrementally instead of
+// only at exit". It is deliberately ordering-deterministic rather than time-based:
+// the fake refuses to finish the command until a chunk has been observed, so if the
+// provider could only deliver at exit the run would deadlock and the test would fail
+// on its own timeout instead of passing on a flaky flag.
+func TestChunksArriveBeforeExit(t *testing.T) {
+	chunkSeen := make(chan string, 4)
+	release := make(chan struct{})
+	fr := &fakeRunner{respond: func(c Command) (Outcome, bool) {
+		if len(c.Args) > 0 && c.Args[0] == "exec" {
+			// Emit from inside the run, exactly where execRunner's tap fires.
+			if c.OnChunk != nil {
+				c.OnChunk(sandbox.StreamStdout, []byte("mid-run\n"))
+			}
+			<-release // the command is still executing here by construction
+			return Outcome{Stdout: "mid-run\n"}, true
+		}
+		return defaultResponse(c), true
+	}}
+	sb := openHandle(t, fr)
+	var mu sync.Mutex
+	var order []string
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := sb.Run(context.Background(),
+			sandbox.Request{Runtime: "sh", Code: "#!echo x"},
+			sandbox.WithRunSink("watch", sandbox.SinkFunc(func(_ context.Context, ch sandbox.OutputChunk) error {
+				mu.Lock()
+				order = append(order, string(ch.Bytes))
+				mu.Unlock()
+				select {
+				case chunkSeen <- string(ch.Bytes):
+				default:
+				}
+				return nil
+			}))); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	select {
+	case got := <-chunkSeen:
+		if got != "mid-run\n" {
+			t.Fatalf("chunk = %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sink never received a chunk while the command was still executing")
+	}
+	// Reaching here means a chunk arrived while respond() was still blocked inside
+	// the run. Nothing about the run has returned yet, so delivery was incremental.
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the command was released")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) == 0 || order[0] != "mid-run\n" {
+		t.Fatalf("chunk order = %v", order)
+	}
+}
+
+// TestSinkFaultIsNotSwallowed pins that a Sink bound with OverflowFault (available
+// through WithOverflow) reaches the caller. The provider used to ignore the
+// reporter's return value entirely, which made that policy unreachable in practice:
+// a consumer that rejected chunks looked identical to one that received them.
+func TestSinkFaultIsNotSwallowed(t *testing.T) {
+	fr := &fakeRunner{respond: func(c Command) (Outcome, bool) {
+		if len(c.Args) > 0 && c.Args[0] == "exec" {
+			if c.OnChunk != nil {
+				c.OnChunk(sandbox.StreamStdout, []byte("noisy\n"))
+			}
+			return Outcome{Stdout: "noisy\n", Exit: 0}, true
+		}
+		return defaultResponse(c), true
+	}}
+	sb := openHandle(t, fr)
+	rep, err := sb.Run(context.Background(),
+		sandbox.Request{Runtime: "sh", Code: "#!echo x"},
+		sandbox.WithRunSink("strict", sandbox.SinkFunc(func(context.Context, sandbox.OutputChunk) error {
+			return errors.New("consumer rejected the chunk")
+		}), sandbox.WithOverflow(sandbox.OverflowFault)))
+	if err == nil {
+		t.Fatal("OverflowFault must reach the caller")
+	}
+	var hf *sandbox.HookFaultError
+	if !errors.As(err, &hf) {
+		t.Fatalf("want *HookFaultError, got %T: %v", err, err)
+	}
+	// The payload's own output survives the consumer's problem.
+	if rep != nil && !strings.Contains(rep.Stdout, "noisy") {
+		t.Fatalf("captured output must survive a sink fault: %q", rep.Stdout)
+	}
 }

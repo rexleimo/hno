@@ -126,6 +126,7 @@ func (sb *Sandbox) execute(ctx context.Context, sess *Session, req Request, ro r
 		}()
 	}
 	rep = sb.normalizeReport(rep, runErr, rc, start)
+	sb.accountStreaming(rep, fan)
 
 	// 7. Artefacts are collected even when a phase failed, so "the build broke
 	// but the test report is the point" is expressible (§13.3).
@@ -597,4 +598,58 @@ func policyLabel(generated, explicit string) string {
 		return explicit
 	}
 	return generated
+}
+
+// accountStreaming records what the provider actually delivered live, and turns a
+// false streaming claim into an observable contract error.
+//
+// The capability bit is the provider's own assertion about itself, and the last
+// engine audit found that assertion unreliable in both directions. So the core
+// measures instead of trusting: if the payload produced output on a stream and no
+// chunk for that stream ever arrived while the run was alive, the claim was false.
+//
+// It does not fail the run. The payload's result is real, and destroying a good run
+// because the provider's telemetry was dishonest would make the bug harder to see,
+// not easier. The caller learns it three ways: the populated counts, the typed error
+// from Report.StreamingContract, and an Observer event.
+func (sb *Sandbox) accountStreaming(rep *Report, fan *fanout) {
+	if rep == nil {
+		return
+	}
+	sent, _ := fan.deliveredBytes()
+	var total int64
+	for _, n := range sent {
+		total += n
+	}
+	rep.OutputSent = total
+	if !sb.caps.Has(CapStreaming) {
+		// No claim was made, so receiving a whole buffer at exit is not a violation.
+		return
+	}
+	var silent []string
+	if len(rep.Stdout) > 0 && sent[StreamStdout] == 0 {
+		silent = append(silent, StreamStdout.String())
+	}
+	if len(rep.Stderr) > 0 && sent[StreamStderr] == 0 {
+		silent = append(silent, StreamStderr.String())
+	}
+	if len(silent) == 0 {
+		return
+	}
+	violation := &StreamingContractError{
+		Provider:      sb.name,
+		Streams:       silent,
+		DeclaredBytes: int64(len(rep.Stdout) + len(rep.Stderr)),
+	}
+	// The violation is deliberately kept out of Report.Failure. Failure answers
+	// "why did the payload not produce its result", and a provider whose telemetry
+	// lied has not changed what the code did: the run still exits 0, the artefacts
+	// are still real. Turning an honest payload into a failed report was tried here
+	// and immediately broke a passing project test — that is the same category error
+	// as stamping a nonzero exit as success, only in the other direction.
+	//
+	// The claim is falsifiable through Report.StreamingContract() (data the caller
+	// can check without configuring anything) and through this event (for hosts that
+	// do observe).
+	sb.reportFault(context.Background(), "streaming", sb.name, violation)
 }

@@ -465,3 +465,107 @@ func TestCollectedArtifactReportsItsSize(t *testing.T) {
 		t.Fatalf("Size %d disagrees with the bytes actually readable: %d", a.Size, len(data))
 	}
 }
+
+// --- streaming contract --------------------------------------------------
+
+// lyingEnv captures the whole buffer and reports it at exit, streaming nothing —
+// the exact behaviour CapStreaming forbids ("delivers output incrementally instead
+// of only at exit").
+type lyingEnv struct{ out string }
+
+func (e *lyingEnv) ID() string                  { return "env-lie" }
+func (e *lyingEnv) Close(context.Context) error { return nil }
+
+// Exec ignores the sink entirely: the payload's output is real and complete, but
+// nothing is pushed while the run is alive.
+func (e *lyingEnv) Exec(_ context.Context, _ sandbox.RunSpec, _ sandbox.ChunkReporter) (*sandbox.Report, error) {
+	return &sandbox.Report{Stdout: e.out, ExitCode: 0, Provider: "liar"}, nil
+}
+
+// lyingProvider claims streaming so the core has something to disprove.
+type lyingProvider struct{ out string }
+
+func (p *lyingProvider) Name() string                 { return "liar" }
+func (p *lyingProvider) Isolation() sandbox.Isolation { return sandbox.IsolationNone }
+func (p *lyingProvider) Capabilities() sandbox.CapabilitySet {
+	return sandbox.Capabilities(sandbox.CapStreaming)
+}
+func (p *lyingProvider) Probe(context.Context) error { return nil }
+func (p *lyingProvider) Close(context.Context) error { return nil }
+func (p *lyingProvider) NewEnvironment(_ context.Context, _ sandbox.EnvSpec) (sandbox.Environment, error) {
+	return &lyingEnv{out: p.out}, nil
+}
+
+// TestFalseStreamingClaimIsObservable is the class guard the last audit needed.
+// The provider's capability bit is an assertion about itself, and both the docker
+// provider and its own test double were making that assertion falsely in the same
+// direction — so no offline test could ever have caught it. Measuring delivery at
+// the fanout makes the claim falsifiable.
+func TestFalseStreamingClaimIsObservable(t *testing.T) {
+	ctx := context.Background()
+	if err := sandbox.RegisterProvider("liar", func(sandbox.ProviderConfig) (sandbox.Provider, error) {
+		return &lyingProvider{out: strings.Repeat("y", 4096)}, nil
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { sandbox.UnregisterProvider("liar") })
+
+	sb, err := sandbox.Open(ctx,
+		sandbox.WithProvider("liar"),
+		sandbox.WithAllowedProviders("liar"),
+		sandbox.WithMinimumIsolation(sandbox.IsolationNone),
+	)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer sb.Close()
+
+	var streamed int
+	rep, err := sb.Run(ctx, sandbox.Request{Runtime: "sh", Code: "echo y"},
+		sandbox.WithRunSink("watcher", sandbox.SinkFunc(func(_ context.Context, ch sandbox.OutputChunk) error {
+			streamed += len(ch.Bytes)
+			return nil
+		})))
+	if err != nil {
+		t.Fatalf("the payload's result must survive a dishonest provider: %v", err)
+	}
+	if rep.Stdout == "" {
+		t.Fatal("captured output must still be reported")
+	}
+	if streamed != 0 {
+		t.Fatalf("test setup wrong: expected no live chunks, got %d bytes", streamed)
+	}
+	// Checkable without configuring an Observer, because a fault only an
+	// already-configured observer can see is the same silent no-op in a new place.
+	contractErr := rep.StreamingContract()
+	if contractErr == nil {
+		t.Fatal("declared streaming with zero delivered chunks must be reportable")
+	}
+	var sce *sandbox.StreamingContractError
+	if !errors.As(contractErr, &sce) {
+		t.Fatalf("want *StreamingContractError, got %T", contractErr)
+	}
+	if len(sce.Remediation()) == 0 {
+		t.Fatal("a contract violation with no remedy is only a complaint")
+	}
+	if rep.OutputSent != 0 {
+		t.Fatalf("OutputSent = %d, want 0 — it is a measurement, not a promise", rep.OutputSent)
+	}
+}
+
+// A silent payload is not a delivery failure; the two must not share a signal.
+func TestQuietRunIsNotAStreamingViolation(t *testing.T) {
+	rep := &sandbox.Report{Provider: "quiet"}
+	if err := rep.StreamingContract(); err != nil {
+		t.Fatalf("empty output is not a violation: %v", err)
+	}
+}
+
+// TestStreamingContractPassesWhenOutputArrived closes the other side: a provider
+// that genuinely streamed must not be flagged.
+func TestStreamingContractPassesWhenOutputArrived(t *testing.T) {
+	rep := &sandbox.Report{Provider: "honest", Stdout: "progress", OutputSent: 8}
+	if err := rep.StreamingContract(); err != nil {
+		t.Fatalf("genuine streaming flagged as a violation: %v", err)
+	}
+}

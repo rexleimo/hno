@@ -24,11 +24,20 @@ type Report struct {
 	ExitCode int
 	Stdout   string
 	Stderr   string
+	// OutputSent is the number of output bytes the provider delivered *while the
+	// run was still executing*, counted per chunk at the sink boundary. It is zero
+	// for a provider that only hands over a finished buffer.
+	//
+	// This used to be a documented field nothing ever wrote, which made "I received
+	// the output" and "the sink was configured but got nothing" indistinguishable to
+	// the caller — the same silent-no-op class as an unset artefact size (§13.4, D-05).
+	OutputSent int64
+	// OutputSkipped counts bytes withheld from sinks by a limit or an overflow
+	// policy, so a quiet sink is explainable as deliberate rather than broken.
+	OutputSkipped int64
 	// Truncated says output hit the limit and the tail may be missing, so an
 	// empty stderr does not prove the code was quiet.
-	Truncated     bool
-	OutputSent    int64
-	OutputSkipped int64
+	Truncated bool
 	// TimedOut distinguishes "the code was slow" from "the code failed".
 	TimedOut bool
 	// Lost says the environment died mid-run (§15).
@@ -136,6 +145,60 @@ var ErrArtifactUnreadable = errors.New("sandbox: artefact content is no longer r
 
 // Content returns the collected bytes.
 func (a Artifact) Content() []byte { return a.data }
+
+// StreamingContractError reports that a provider claimed incremental output
+// delivery and then delivered none.
+type StreamingContractError struct {
+	Provider string
+	// Streams names the streams that produced output but received no chunk.
+	Streams []string
+	// DeclaredBytes is the output the payload produced.
+	DeclaredBytes int64
+}
+
+func (e *StreamingContractError) Error() string {
+	return fmt.Sprintf("sandbox: provider %q declares streaming but delivered no chunks for %s (%d bytes of output arrived only at exit)",
+		e.Provider, strings.Join(e.Streams, ", "), e.DeclaredBytes)
+}
+
+// StreamingContract reports whether streaming actually happened.
+//
+// The question is mechanical: if this run produced output and zero bytes reached a
+// sink while the run was alive, whatever the provider advertised, delivery was at
+// exit. Callers that render progress for a human should ask this instead of trusting
+// a CapabilitySet, because a sink that is configured and silent is otherwise
+// indistinguishable from a payload that printed nothing.
+//
+// It returns nil when the run asked for nothing, produced nothing, or genuinely
+// streamed.
+func (r *Report) StreamingContract() error {
+	if r == nil || r.OutputSent > 0 {
+		return nil
+	}
+	var silent []string
+	if len(r.Stdout) > 0 {
+		silent = append(silent, StreamStdout.String())
+	}
+	if len(r.Stderr) > 0 {
+		silent = append(silent, StreamStderr.String())
+	}
+	if len(silent) == 0 {
+		return nil
+	}
+	return &StreamingContractError{
+		Provider:      r.Provider,
+		Streams:       silent,
+		DeclaredBytes: int64(len(r.Stdout) + len(r.Stderr)),
+	}
+}
+
+// Remediation explains what to do about a false capability claim.
+func (e *StreamingContractError) Remediation() []string {
+	return []string{
+		"treat the output as post-exact: read Report.Stdout/Stderr instead of a Sink",
+		"or use a provider that streams genuinely (see CapabilitySet.Has(CapStreaming))",
+	}
+}
 
 // Reader streams the artefact. The caller must close it.
 func (a Artifact) Reader(_ context.Context) (io.ReadCloser, error) {

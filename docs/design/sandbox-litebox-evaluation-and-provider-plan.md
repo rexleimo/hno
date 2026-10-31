@@ -428,11 +428,70 @@ golangci-lint         ABSENT   → §12.2「每批过 make lint」当前无法�
   与 docker CLI 交谈。真实实现 `exec.CommandContext`，测试实现为 fake，于是
   契约测试与故障注入（`ClassLost`、孤儿清扫、产物超限）**离线可跑**，不需要
   守护进程；真实往返只在显式 opt-in 时发生，`make test` 永不隐式起容器。
-- **能力位只声明已实现的**：容器档声明 `CapSession`/`CapFileBridge`/
-  `CapStreaming`/`CapQueryStatus`/`CapRebuild`/`CapAudit`；**不**声明
-  `CapEgressAllowlist`（docker 只有 `--network=none` 的全关/全开，白名单是
-  BoxLite MITM 或代理的事），因此对白名单请求返回 `*CapabilityError` 而不是
-  假装生效——这正是 D-05 要消灭的静默降级。
+- **能力位只声明已实现的**：容器档实际声明 `CapSession`/`CapFileBridge`/
+  `CapStreaming`/`CapRebuild`（以 `provider/docker` 的 `Capabilities()` 为准）；
+  **不**声明 `CapEgressAllowlist`（docker 只有 `--network=none` 的全关/全开，
+  白名单是 BoxLite MITM 或代理的事），也不声明 `CapQueryStatus`/`CapSnapshot`，
+  因此对相应请求返回 `*CapabilityError` 而不是假装生效——这正是 D-05 要消灭的
+  静默降级。
+  （本条原文多写了 `CapQueryStatus`/`CapAudit`，属文档漂移，已按代码修正。）
 - **孤儿回收用 label，不用进程表**：所有容器打
   `hno.sandbox.session=<id>`，`Sweep` 以 label 查询引擎侧残留。进程重启后
   「谁是孤儿」必须有权威事实源，而这个事实源只能在引擎侧（§15 / D-19 的 P8a）。
+
+
+### 17.4 SB-B2a 执行结果（真实引擎，已提交 6e6d6ef）
+
+门命令：
+
+```
+HNO_SANDBOX_DOCKER=1 HNO_SANDBOX_BINARY=container HNO_SANDBOX_IMAGE=golang:1.26 \
+  go test -count=1 -timeout 600s -run "TestReal" ./pkg/hno/sandbox/provider/docker/
+```
+
+真实事实：Apple `container` 在 Darwin/arm64 上跑 Linux aarch64 容器，**不需要
+`/dev/kvm`**、不需要拉镜像、不需要联网。清扫后引擎侧带 `hno.sandbox.managed`
+标的容器数为 0——回收真实性以引擎为证，不以进程内 map 为证。
+
+真实引擎暴露 9 个缺陷（probe 说谎、`ProviderConfig.Raw` 从不填充、`alive()` 写死
+docker `inspect` 导致健康容器被判 `ClassLost`、CLI 捕获无界、失败阶段被盖章
+succeeded、`PhaseReport` 不带输出、核心校验 `Workspace.SourceDir` 却从不投递、
+`statProbe` 引号不配对导致每个 `Stat` 谎报文件不存在、`Artifact.Size`/`Digest`
+从不赋值 + 惰性句柄指向已关闭环境），另加 `WorkspaceMaxBytes: 0` 拒掉每个文件。
+逐条修复并各带测试。
+
+### 17.5 SB-B2b：能力声明必须可测量（本轮）
+
+B2a 的教训不是「docker provider 有 9 个 bug」，而是**能力位是 provider 对自己
+的断言，而这份断言没有任何执行机制**。于是 B2b 不补一个 bug，补这一类：
+
+- **`CapStreaming` 被谎报**。契约原文是「delivers output incrementally instead
+  of only at exit」，而 provider 的实现是**命令退出后发一整块 stdout、stderr
+  一个字节都不发**。后果不是性能：一个只在 stderr 说话的构建，对流式监听者呈现
+  为完全静默的画面，而能力位仍然亮着。
+- **测试替身与 provider 朝同一方向撒谎**，所以这条路径离线永远测不出来：假
+  runner 从不调用流式通道，断言只是在校验假象本身。修复必须同时改两侧，并把
+  「假行为下测试必须失败」当作验证步骤（本轮已实测：旧实现下
+  `TestStderrStreamsToo` 与 `TestChunksArriveBeforeExit` 双双 FAIL）。
+- **`Report.OutputSent`/`OutputSkipped` 有文档、全代码库无人赋值**，与
+  `Artifact.Size` 同类。现由核心在 fanout 处按流测量后填充：它是**测量值**，不是
+  provider 的承诺。
+- **违约必须不依赖调用方配置 Observer 就能被发现**。否则「没配 Observer ⇒ 静默」
+  这个我本轮正在修的缺陷会在新位置复现。因此提供 `Report.StreamingContract()`：
+  由数据机械推导（有输出而零 chunk ⇒ `*StreamingContractError`，带
+  `Remediation()`），同时发一条 fault 事件供观察者消费。
+- **违约不翻转运行结果**。第一版把违约写进 `Report.Failure`，立刻打挂一个通过的
+  工程测试——这与「把非零退出盖章 succeeded」是同一类错误的反方向：`Failure`
+  只回答「我的 payload 为什么没产出」，provider 遥测不诚实没有改变代码做了什么。
+- **Sink 错误曾被 provider 吞掉**。`fanout.Report` 在 `OverflowFault` 绑定下返回
+  `*HookFaultError`，而实现里写的是 `_ = sink.Report(...)`，等于让
+  `WithOverflow(OverflowFault)` 这一公开策略在实践中不可达。现捕获首个非取消错误
+  并在运行结束后上报，同时保留已捕获输出：区分「我的代码成功了但没人接收」与
+  「代码失败」。（曾误判「没有选项能选 OverflowFault」，核对 `WithOverflow` 后
+  撤回，未动 API。）
+- **真实门新增** `TestRealStreamingIsIncremental`：容器内 `echo; sleep 2; echo`，
+  断言两行作为**不同时刻的独立投递**到达且间隔 ≥500ms，并校验
+  `Report.OutputSent` 与 sink 实际收到的字节一致。惰性/缓冲式投递不可能通过。
+
+离线：`go test -race ./pkg/hno/sandbox/...` 全绿，core 覆盖率 68.7%。
+真实：5/5（工程往返、实时输出、`ClassLost` 注入、引擎侧孤儿清扫、增量流式）。

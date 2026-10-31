@@ -35,6 +35,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rexleimo/agno-go/pkg/hno/sandbox"
@@ -101,6 +102,11 @@ type Command struct {
 	// Env is an optional environment for the CLI process itself, never for the
 	// sandboxed payload.
 	Env []string
+	// OnChunk, when set, receives stdout and stderr as they arrive, before the
+	// command exits. A Runner that cannot stream simply leaves Outcome.Streamed at
+	// zero, and the core's streaming audit reports the gap instead of trusting the
+	// provider's capability bit.
+	OnChunk func(stream sandbox.Stream, data []byte)
 }
 
 // Outcome is what a completed command produced.
@@ -108,6 +114,9 @@ type Outcome struct {
 	Stdout string
 	Stderr string
 	Exit   int
+	// Streamed counts bytes handed to Command.OnChunk while the command ran. It is
+	// how "this provider streams" becomes a measured fact.
+	Streamed int64
 	// Canceled reports that the context ended the process. A canceled run is
 	// not a failed run, and conflating them turns a user cancel into a retryable
 	// provider error.
@@ -166,11 +175,21 @@ func (r execRunner) Run(ctx context.Context, cmd Command) (Outcome, error) {
 	var stdout, stderr boundedBuffer
 	stdout.limit = maxCLICapture
 	stderr.limit = maxCLICapture
-	c.Stdout = &stdout
-	c.Stderr = &stderr
+	var streamed int64
+	var streamMu sync.Mutex
+	emit := func(st sandbox.Stream, data []byte) {
+		streamMu.Lock()
+		streamed += int64(len(data))
+		streamMu.Unlock()
+		if cmd.OnChunk != nil {
+			cmd.OnChunk(st, data)
+		}
+	}
+	c.Stdout = &tappedWriter{buf: &stdout, onNext: emit, stream: sandbox.StreamStdout}
+	c.Stderr = &tappedWriter{buf: &stderr, onNext: emit, stream: sandbox.StreamStderr}
 
 	err := c.Run()
-	res := Outcome{Stdout: stdout.String(), Stderr: stderr.String()}
+	res := Outcome{Stdout: stdout.String(), Stderr: stderr.String(), Streamed: streamed}
 	if ctx.Err() != nil {
 		res.Canceled = true
 	}
@@ -201,6 +220,24 @@ type boundedBuffer struct {
 	buf     strings.Builder
 	limit   int
 	dropped int
+}
+
+// tap forwards each write before the bound is applied, so a caller sees output the
+// moment the engine produces it while the retained copy stays bounded.
+type tappedWriter struct {
+	buf    *boundedBuffer
+	onNext func(stream sandbox.Stream, data []byte)
+	stream sandbox.Stream
+}
+
+func (t *tappedWriter) Write(p []byte) (int, error) {
+	n, err := t.buf.Write(p)
+	if t.onNext != nil && n > 0 {
+		// Forward exactly what was written, including the portion the bound kept, so
+		// the streamed view and the captured view cannot disagree about ordering.
+		t.onNext(t.stream, p[:n])
+	}
+	return n, err
 }
 
 func (b *boundedBuffer) Write(p []byte) (int, error) {
