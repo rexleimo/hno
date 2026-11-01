@@ -358,3 +358,19 @@ Diagnose 缓存报告 + `hno sandbox boundary` 动词 + 真实引擎门 private-
 
 A2（准入门生效）**未授权未做**：本机 `WithMinimumIsolation(microvm)` 现在失败，A2 后会成功，
 属闸门有意放宽，等决策。留白：Docker Desktop 共享 VM 的说法在本机未实测，实现不含任何按名字的结论。
+
+## B5b 完成记录（D-39 / A2 生效）
+
+A2 = 让实测出的私有内核满足 IsolationMicroVM 准入。实现要点：放宽必须有来源（provider 名）、
+宿主（HostKernel）、时效（BoundaryFresh）三证；反向证据恒收紧。Status.Isolation 保留声称，
+证据放 Status.Boundary；Diagnose 与准入一致。
+
+真机：`hno sandbox run --isolation microvm` 修前 exit 70（并已给出去处：--measure-boundary），
+加 `--measure-boundary` 后 exit 0 且真跑出 `go version go1.26.9 linux/arm64`；残留 0。
+真实引擎门 12 PASS / 0 FAIL（47.3s）。
+
+本轮被自己的测试抓出 4 处：① 证据不成立时丢原因（把人送进重测循环）；② BoundaryFresh 负值与文档相反；
+③ 真机测试漏注册/漏 Attr（抽出 realOptions 共用）；④ CLI 测试自建 FlagSet 断言自己写的空 usage（空转）。
+反证：分别拆掉「收紧半边」与「放宽半边」，对应测试各自精确变红。
+
+覆盖 core 74.1%、cmd/hno 78.4%、docker 64.0%；-race 四包绿；docs:build 17.9s，中英各 14/14 slug 一致。

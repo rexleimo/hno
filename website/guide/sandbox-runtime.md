@@ -72,6 +72,7 @@ tried, why, and what would change the answer. It never falls back to a host proc
 | `SessionTTL` | 30m0s | Hard session lifetime |
 | `Cleanup` | 10s | Engine cleanup step |
 | `ApprovalHold` | 5m0s | How long a suspended approval stays answerable |
+| `BoundaryFresh` | 30m0s | How long a kernel-boundary measurement may be used to admit a provider below the floor; 0 means the default, negative means measure per Open |
 
 Byte caps are per handle; only `WithOutputLimit` tightens a single run. Per-run CPU and memory
 ceilings do not exist in this API — they are set on the handle with `WithLimits`, which is what
@@ -337,6 +338,53 @@ reports `private-kernel` while handing back two identical boot ids is corrected 
 This batch reports the measurement; the micro-VM **floor** is still admitted on the
 provider's claim. Making admission use the measurement is a deliberate widening of a
 gate, so it is a decision rather than a side effect — see `hno sandbox boundary` below.
+
+### Letting the measurement decide admission
+
+The section above reports. This one lets the report change what is allowed, and it is the
+only place in the runtime where evidence can **widen** a gate rather than close one — so it
+is opt-in twice: the measurement must exist, and it must be handed in.
+
+```go
+report, err := probe.MeasureKernelBoundary(ctx, sandbox.DefaultBoundaryBoxes)
+if err != nil {
+    log.Fatal(err)
+}
+sb, err := sandbox.Open(ctx,
+    sandbox.WithProvider("docker"),
+    sandbox.WithImage("golang:1.26"),
+    sandbox.WithMinimumIsolation(sandbox.IsolationMicroVM),
+    sandbox.WithBoundaryMeasurement(*report),
+)
+```
+
+Two directions, only one of them new:
+
+- A `private-kernel` measurement admits a provider whose claim is **below** the floor. On
+  the host this page describes that is the difference between `IsolationMicroVM` being
+  refused and being honoured: the engine puts every box in its own VM but reports container
+  isolation, so the claim alone can never satisfy it.
+- A `shared-kernel` measurement **refuses** a provider that claims the VM tier. The claim
+  alone would have passed; the measurement is the only thing that can stop it. That
+  direction is a tightening and is always honoured.
+
+`Status` keeps reporting the provider's own claim in `Isolation` and carries the evidence in
+`Boundary`, because rewriting the claim would tell every downstream reader that an engine
+changed its nature. `Diagnose` agrees with whatever admission did and says so in the
+isolation line rather than contradicting the handle it describes.
+
+Evidence is spent, not swallowed. A report is refused as a reason to lift when it came from
+a different provider, was taken on a different host, or is older than
+`Timeouts.BoundaryFresh` — and the refusal says which of the three, because the alternative
+is an operator re-measuring an engine that already measured fine. An `unknown` verdict moves
+nothing in either direction.
+
+From a shell the flag is `--measure-boundary`, and it is not free: it starts boxes before the
+run does.
+
+```bash
+hno sandbox run --isolation microvm --measure-boundary -- go version
+```
 
 ## Recipes
 

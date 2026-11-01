@@ -71,6 +71,7 @@ fmt.Println(report.ExitCode, report.Stdout)
 | `SessionTTL` | 30m0s | 会话硬性存活期 |
 | `Cleanup` | 10s | 引擎清理步骤 |
 | `ApprovalHold` | 5m0s | 挂起的批准可被答复的时长 |
+| `BoundaryFresh` | 30m0s | 一份内核边界测量可用于放行「低于下限的 provider」的有效期；0 表示取默认，负数表示每次 Open 都要重测 |
 
 字节上限是**每句柄**的；只有 `WithOutputLimit` 能收紧单次运行。这套 API 不存在逐次运行的
 CPU 与内存上限——它们在句柄上用 `WithLimits` 设置，也正是兼容适配器拒绝伪造的东西。
@@ -315,6 +316,46 @@ for _, line := range report.Evidence {
 本批次落地的是「报告测量结果」；micro-VM **下限**目前仍按 provider 的声称准入。让准入改用
 测量结果，是一道闸门的**有意放宽**，所以它是你的决策，而不是顺手产生的副作用——见下面的
 `hno sandbox boundary`。
+
+### 让测量结果决定准入
+
+上一节只是报告。这一节让报告改变**允许什么**，也是整套运行时里唯一一处「证据可以**放宽**闸门」
+而不是只能收紧的地方——所以它要**两道**自愿：测量必须存在，而且必须被显式交进来。
+
+```go
+report, err := probe.MeasureKernelBoundary(ctx, sandbox.DefaultBoundaryBoxes)
+if err != nil {
+    log.Fatal(err)
+}
+sb, err := sandbox.Open(ctx,
+    sandbox.WithProvider("docker"),
+    sandbox.WithImage("golang:1.26"),
+    sandbox.WithMinimumIsolation(sandbox.IsolationMicroVM),
+    sandbox.WithBoundaryMeasurement(*report),
+)
+```
+
+两个方向，只有一个是新的：
+
+- `private-kernel` 的测量会放行**声称低于下限**的 provider。在本页描述的那台主机上，这就是
+  `IsolationMicroVM` 被拒与被兑现的差别：引擎把每个盒放进自己的 VM，却声称容器隔离，于是单靠声称
+  永远满足不了它。
+- `shared-kernel` 的测量会**拒绝**声称 VM 档的 provider。单靠声称本会通过，测量是唯一能拦住它的
+  东西。这个方向是收紧，永远被采纳。
+
+`Status` 在 `Isolation` 里仍然报 provider 自己的声称，并把证据放在 `Boundary` 里，因为改写声称
+等于告诉所有下游读者「这个引擎换了性质」。`Diagnose` 与准入结论一致，并在 isolation 那一行里
+说明，不会自相矛盾。
+
+证据是会被花掉的，而不是被吞掉。来自**别的 provider**、在**别的宿主**上测的、或比
+`Timeouts.BoundaryFresh` 更旧的报告，都不构成放行的理由——而拒绝会指明是这三种里的哪一种，
+否则结果就是让人去重测一台本来就测得好好的引擎。`unknown` 结论对两个方向都不起作用。
+
+从命令行走，flag 是 `--measure-boundary`，它不免费：它会在运行之前先起盒。
+
+```bash
+hno sandbox run --isolation microvm --measure-boundary -- go version
+```
 
 ## 配方
 
