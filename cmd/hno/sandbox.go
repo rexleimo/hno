@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rexleimo/agno-go/pkg/hno/sandbox"
+	"github.com/rexleimo/agno-go/pkg/hno/sandbox/provider/boxlite"
 	"github.com/rexleimo/agno-go/pkg/hno/sandbox/provider/docker"
 )
 
@@ -221,6 +222,9 @@ func measureForAdmission(ctx context.Context, cfg *sandboxConfig, stderr io.Writ
 func openHandle(ctx context.Context, opts ...sandbox.Option) (*sandbox.Sandbox, error) {
 	if err := docker.Register(); err != nil {
 		return nil, fmt.Errorf("register docker provider: %w", err)
+	}
+	if err := boxlite.Register(); err != nil {
+		return nil, fmt.Errorf("register boxlite provider: %w", err)
 	}
 	return sandbox.Open(ctx, opts...)
 }
