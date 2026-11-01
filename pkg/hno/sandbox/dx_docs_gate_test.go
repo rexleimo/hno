@@ -708,3 +708,62 @@ func guideLinksResolve(t *testing.T, lines []string, page string) {
 		t.Errorf("%s contains no local links at all; the link gate would be silently vacuous", page)
 	}
 }
+
+// TestGuideLocaleLanguageMatchesPath guards the assumption every pairing gate in this file
+// now depends on: guidePages lists the two locales of one page consecutively, English first.
+//
+// It exists because a walkthrough page was written in Chinese and published at the English
+// path, and every gate stayed green: the API-name gates compare names (identical in both
+// languages, since code names do not translate) and the defaults gate compares numbers. A
+// page in the wrong language is invisible to all of them - the reader sees it immediately,
+// the build does not.
+func TestGuideLocaleLanguageMatchesPath(t *testing.T) {
+	if len(guidePages)%2 != 0 {
+		t.Fatalf("guidePages must come in English-then-Chinese pairs, got %d entries", len(guidePages))
+	}
+	for i := 0; i+1 < len(guidePages); i += 2 {
+		en, zh := guidePages[i], guidePages[i+1]
+		if strings.Contains(en, "/zh/") || !strings.Contains(zh, "/zh/") {
+			t.Errorf("guidePages[%d] must be the English page and [%d] the /zh/ page, got %q then %q", i, i+1, en, zh)
+		}
+		enCJK, enLines := countCJK(t, en)
+		zhCJK, zhLines := countCJK(t, zh)
+		// Prose lines are the ones outside code fences, tables of API names, and quotes.
+		if enLines == 0 || zhLines == 0 {
+			t.Fatalf("guide %s or %s has no prose lines to judge", en, zh)
+		}
+		if ratio := float64(enCJK) / float64(enLines); ratio > 0.02 {
+			t.Errorf("English guide %s is %.1f%% CJK prose lines (%d/%d): the English locale is not in English", en, ratio*100, enCJK, enLines)
+		}
+		if ratio := float64(zhCJK) / float64(zhLines); ratio < 0.20 {
+			t.Errorf("Chinese guide %s is only %.1f%% CJK prose lines (%d/%d): the /zh/ locale looks untranslated", zh, ratio*100, zhCJK, zhLines)
+		}
+	}
+}
+
+func countCJK(t *testing.T, rel string) (cjk, total int) {
+	t.Helper()
+	b, err := os.ReadFile(guidePath(t, rel))
+	if err != nil {
+		t.Fatalf("read guide %s: %v", rel, err)
+	}
+	inFence := false
+	for _, ln := range strings.Split(string(b), "\n") {
+		trimmed := strings.TrimSpace(ln)
+		if strings.HasPrefix(trimmed, "```") {
+			inFence = !inFence
+			continue
+		}
+		if inFence || trimmed == "" || strings.HasPrefix(trimmed, "|") || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		total++
+		for _, r := range trimmed {
+			if r >= 0x4E00 && r <= 0x9FFF {
+				cjk++
+				break
+			}
+		}
+	}
+	return cjk, total
+}

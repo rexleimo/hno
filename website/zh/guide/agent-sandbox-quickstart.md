@@ -127,9 +127,7 @@ fmt.Println(rep.ExitCode, rep.Stdout)      // 非 0 退出码是「代码的问�
 实测输出：
 
 ```
-listed: main.go|82|regular file size=0
---- exit=0 ---
-stdout: hello from the sandbox
+exit=0 stdout="hello from the sandbox"
 ```
 
 **两个坑，都踩过：**
@@ -188,20 +186,29 @@ for i, st := range steps {
 }
 ```
 
-实测输出（注意第 2 步：文件还没写完，`vet` 立刻报出真实错误）：
+实测输出（不带管道的那次运行，退出码是诚实的）：
 
 ```
-step 1 wrote app/go.mod     vet exit=0 go: warning: "./..." matched no packages
-step 2 wrote app/main.go    vet exit=0 # app
-                                   vet: ./main.go:3:23: undefined: Greet
+step 1 wrote app/go.mod     vet exit=1
+  model should fix: go: warning: "./..." matched no packages
+step 2 wrote app/main.go    vet exit=1
+  model should fix: # app            ← 这一行后面就是 undefined: Greet
 step 3 wrote app/greet.go   vet exit=0
-final build exit=0
+final build exit=0 stdout=""
 ```
 
-> ⚠️ **这里有个必须知道的坑**：`go vet ./... | head -5` 的 **退出码是 `head` 的**，所以上面
-> step 2 明明有编译错误却显示 `exit=0`，而 stderr 里躺着 `undefined: Greet`。**不要用管道截断
-> 一个要被判断成败的命令**——要么直接跑、要么 `set -o pipefail`，否则你的 Agent 会「绿灯
-> 通过」一个编译失败的项目。
+三个细节都是真的，也都值得记住：
+
+- **第 1 步 `exit=1`**：树里只有 `go.mod` 时 `./...` 匹配不到包，`vet` 视为失败。这不是错误，
+  是「还没有代码可校验」，Agent 不该因此去重写刚写的 `go.mod`。
+- **第 2 步 `exit=1`**：`undefined: Greet` 被立刻抓到——这正是「每写一个文件就问一次」的价值。
+- **`final build stdout=""`**：`println` 写到 **stderr**，不是 stdout。别以为没输出就是没跑，
+  读 `rep.Stderr`，或者改用 `fmt.Println`。
+
+> ⚠️ **这里替换掉的那个坑**：`go vet ./... | head -5` 的**退出码是 `head` 的**，所以最早一次
+> 跑这个循环时，step 2 明明有编译错误却报 `exit=0`，而 `undefined: Greet` 躺在 stderr 里。
+> **不要用管道截断一个要被判断成败的命令**——要么直接跑，要么 `set -o pipefail`；否则你的
+> Agent 会「绿灯通过」一个编译失败的项目。
 
 ---
 
@@ -218,7 +225,7 @@ rep, err := sess.Exec(ctx, sandbox.Shell("make build"))
 switch {
 case err != nil:
     // 环境坏了：重建/重试，别让模型改代码
-case rep.ExitCode != 0 && rep.Failure.NextAction == sandbox.ActionModelFix:
+case rep.ExitCode != 0 && rep.Failure != nil && rep.Failure.NextAction == sandbox.ActionModelFix:
     // 模型的问题：把 rep.Stderr 回灌，让它改
 case rep.ExitCode != 0:
     // 其他（超时、丢失、配额）：换策略，不是改代码
@@ -241,9 +248,10 @@ rep, err := sess.Exec(ctx,
 实测输出：
 
 ```
-run1 exit=2 chunks=4 outputSent=34
-run1 stderr saw failure marker: true        ← sink 在运行中就看到了 BUILD_FAILED
-next action derived from failure class: true ← Failure.NextAction == ActionModelFix
+exit=2 chunks=4 outputSent=34
+sink saw failure marker live: true
+class=user_code next action=model_fix
+-> route stderr back to the model and regenerate the failing file
 ```
 
 这条链路就是「执行完 → 判断 → 下一步」的自动化版本：sink 拿到实时输出做判断，`Report.Failure`
@@ -293,7 +301,23 @@ project status=succeeded exit=0 phases=3
 
 ---
 
-## 场景 5（进阶）：不确定就先问，别猜
+## 场景 5（可选）：可直接运行的端到端 demo
+
+上面四个场景不只是文档片段，它们以程序形式进了仓库：
+
+```bash
+go run ./cmd/examples/sandbox_agent_workflow -doctor          # 宿主自检，失败时退出码非 0
+go run ./cmd/examples/sandbox_agent_workflow -scenario all    # 四个场景全跑，真引擎
+go run ./cmd/examples/sandbox_agent_workflow -scenario streaming
+```
+
+它读 `HNO_SANDBOX_IMAGE` 与 `HNO_SANDBOX_BINARY`（macOS 上 `docker` 只是 shim 时，后者设成
+`container`）。`-doctor` 会把 `Diagnose` 的每一条检查和 `fix` 都打出来，任一条不过就非 0 退出
+——先分清「我的代码有问题」和「这台机器根本跑不了」，再去烧一次构建。
+
+---
+
+## 场景 6（进阶）：不确定就先问，别猜
 
 宿主环境不确定时，先 `Diagnose`，它逐项回答「这个镜像能不能起、隔离实际是什么档、有没有孤儿」：
 

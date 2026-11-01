@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 🧪 Example (端到端可运行的沙盒工作流示例)
+
+`cmd/examples/sandbox_agent_workflow/`：教程里四个场景的**可执行版本**，真引擎、无 mock。
+
+```bash
+go run ./cmd/examples/sandbox_agent_workflow -doctor        # 9 项宿主检查，含 fix 文案
+go run ./cmd/examples/sandbox_agent_workflow -scenario all  # write-then-run / incremental /
+                                                            # streaming / project / inline-inputs
+```
+
+实测（`HNO_SANDBOX_BINARY=container`，`golang:1.26`）全部通过：`exit=0 stdout="hello from the
+sandbox"`；`class=user_code next action=model_fix`；`artifact out.txt 2 bytes: "5\n"`；
+`-doctor` 在镜像不存在时**真实退出码 1**（用不分管道的方式测得——正是本条要防的错）。
+
+### 🐛 Fixed (英文教程页实际是中文；并且没有门禁能看出来)
+
+上一批把 `/guide/agent-sandbox-quickstart.html` 发布成了**中文正文挂在英文路径**。原因是门禁的
+盲区：语言对照只比 API 名字集合（代码名字不翻译，两边天然相同），默认值表只比数字。加了一个
+新门禁 `TestGuideLocaleLanguageMatchesPath`：断言 `guidePages` 必须是「英文页紧邻其 `/zh/` 页」
+的配对（这同时是配对类门禁依赖的前提），并按**围栏外正文行**统计 CJK 占比——英文页 >2% 判红，
+`/zh/` 页 <20% 判红。两个方向都做过反证：把中文正文塞到英文路径 ⇒ `89.0% CJK … not in English`；
+把英文参考页塞到 `/zh/` ⇒ `0.0% CJK … looks untranslated`。
+
+同时更正教程里两处**测量错误**（英文版重写、中文版同步）：
+
+- 场景 2 的 `vet` 退出码。早前那次用了 `cmd | head -5`，退出码来自 `head`，于是文档写成
+  `exit=0`；去掉管道后真实值是 **step1 exit=1**（`matched no packages`）、**step2 exit=1**
+  （`undefined: Greet`）、**step3 exit=0**。文档现在把「带管道的那次读数不可信」写成显式警告。
+- `println` 写 **stderr**，所以 `final build stdout=""` 不代表没跑；补进两处细节说明。
+- 补上「三种写入通道」的可运行示例引用与 CLI 等价命令（`doctor/boundary/run`）+ 退出码表。
+
+
 ### 📖 Docs (新增任务型教程，并修掉三处门禁自身的盲点)
 
 用户反馈文档说不清两件事：Agent 生成过程中怎么写入、写完之后怎么驱动下一步；以及「装了依赖

@@ -1,25 +1,27 @@
-# 从零到 Agent 边写边跑
+# From zero to an agent that writes and runs
 
-这一页只有一个目标：**照着做，能让 Agent 生成的代码在沙盒里真的跑起来**。上一页
-[Sandbox runtime](/guide/sandbox-runtime) 讲的是契约和默认值，这一页讲操作顺序。
+One goal: **follow this and the code your agent generates will actually run in the sandbox**.
+The [Sandbox runtime](/guide/sandbox-runtime) page states the contract and the defaults; this
+page gives the order of operations.
 
-四个场景，都在 `golang:1.26` 镜像上真实跑过（文末附实测输出）：
+Every scenario below was executed against a real engine on the `golang:1.26` image, and the
+quoted output is the measured output.
 
-1. 先把文件写进去，再跑命令（最常见，也最容易踩坑）
-2. 边生成边验证（Agent 每写一个文件就问一次沙盒）
-3. 跑完了让结果自己驱动下一步（不用人盯着）
-4. 一整棵项目树 + 多个阶段 + 收集产物
+1. write files first, then run them (the most common shape, and the easiest to get wrong)
+2. verify as you generate (the agent asks the sandbox after every file)
+3. let the result drive the next step (nobody watches the run)
+4. a whole project tree, ordered phases, collected artefacts
 
 ---
 
-## 第 0 步：装了什么就能用？（这一节回答「还要不要额外配置」）
+## Step 0: what do I have to configure? (the "is installing the dependency enough?" question)
 
-**装了 Go 依赖还不够。** 有三件事必须自己明确做，否则第一次 `Open` 就会失败——下面每条都是
-实测报错，不是推测。
+**No — adding the Go dependency is not enough.** Four things must be true or the first `Open`
+fails. Each item below quotes the real error that was produced on this machine, not a guess.
 
-### (1) provider 必须显式注册，不会自动发现
+### (1) A provider is registered explicitly — never discovered
 
-不 import provider 包时，`Open` 直接拒绝：
+Without importing a provider package, `Open` refuses:
 
 ```
 no sandbox provider can meet this request (isolation floor container): no provider
@@ -27,13 +29,13 @@ could be used for "docker"; fallback is disabled (FailFast per D-13)
   - docker: not registered (fix: import a provider package, ...)
 ```
 
-`D-03` 是刻意的：不做 `init()` 扫 PATH。所以二选一：
+That is deliberate (D-03: no `init()` PATH scanning), so choose one of the two:
 
 ```go
-import _ "github.com/rexleimo/agno-go/pkg/hno/sandbox/provider/docker" // 只要副作用
+import _ "github.com/rexleimo/agno-go/pkg/hno/sandbox/provider/docker" // side effect only
 ```
 
-或者显式注册（推荐，错误能自己处理）：
+Or register explicitly — preferred, because you get to handle the error:
 
 ```go
 // Register each provider once, in whichever package wires them up (main is fine).
@@ -45,58 +47,62 @@ if err := docker.Register(); err != nil {
 //   if err := boxlite.Register(); err != nil { log.Fatal(err) }
 ```
 
-### (2) 宿主机要有引擎，而且要用对二进制名
+### (2) The host needs an engine, under the right binary name
 
-| provider | 需要宿主具备 | 常见坑 |
+| provider | host requirement | usual trap |
 |---|---|---|
-| `docker` | `docker`（或 `podman`）可执行，daemon 在跑 | macOS 上 `docker` 可能只是 Apple containerisation 的 shim；用 `WithAttrs{"binary": "container"}` 直连 |
-| `boxlite` | `boxlite` 可执行 + **硬件虚拟化可用** | 容器里跑不了（无 `/dev/kvm`），见下方说明 |
+| `docker` | a `docker` (or `podman`) executable with a running daemon | on macOS `docker` may be a shim for Apple containerisation; point at it with `WithAttrs{"binary": "container"}` |
+| `boxlite` | a `boxlite` executable **and working hardware virtualisation** | cannot run inside a container (no `/dev/kvm`) — see below |
 
-`boxlite` 的可用性**不按操作系统猜**，而是问引擎：`boxlite info` 报
-`virtualization: available` 才通过；报 `unavailable` 或干脆不回答，`Probe` 都会拒绝并给出去处。
+BoxLite availability is **not guessed from the operating system**; the engine is asked.
+`boxlite info` must report `virtualization: available`. If it reports `unavailable`, or does not
+answer at all, `Probe` refuses and says where to go.
 
-> **实测**：在 Apple containerisation 的 guest 里（arm64 与 amd64 都试过）`/dev/kvm` 不存在、
-> CPU 无 `vmx/svm`，所以**容器里跑不了 BoxLite**。它需要真实 Linux 宿主 + KVM 可访问。
+> **Measured**: inside an Apple containerisation guest (both arm64 and amd64 were tried)
+> `/dev/kvm` is absent and the CPU flags contain no `vmx/svm`, so **BoxLite cannot run inside a
+> container**. It needs a real Linux host with KVM accessible.
 
-### (3) 会话恢复需要额外开关
+### (3) Resuming a session needs an explicit switch
 
-`sess := sb.Session(ctx, "my-id")` 对一个**还没存在的 id** 会失败：
+`sb.Session(ctx, "my-id")` fails for an id that does not exist yet:
 
 ```
 session "my-id" no longer has a live environment: this handle has no session store,
 so an unknown id cannot be verified as a resumption; use WithCreateIfMissing to start fresh
 ```
 
-第一次创建必须加：
+The first creation must say so:
 
 ```go
 sess, err := sb.Session(ctx, "my-id", sandbox.WithCreateIfMissing(true))
 ```
 
-想要跨进程/跨重启复用同一个 id，再配 `sandbox.WithSessionStore(...)`；否则 id 只在本进程有效。
+To keep using the same id across processes or restarts, also configure
+`sandbox.WithSessionStore(...)`; otherwise the id only means something inside this process.
 
-### (4) 镜像要先在本地存在
+### (4) The image must already be in the local store
 
-`doctor` 会如实告诉你缺哪个镜像，并给出拉取指引：
+`doctor` reports the missing image and how to get it:
 
 ```
 FAIL image  want=present in the local store got=absent: golang:1.26
      fix: pull or build golang:1.26 in this engine, or point WithImage at an image it already has
 ```
 
-先自检，再跑业务：
+Check the host before running any workload:
 
 ```bash
 hno sandbox doctor --provider docker --image golang:1.26
-# 或者 Go 里： sb.Diagnose(ctx)
+# or in Go: sb.Diagnose(ctx)
 ```
 
 ---
 
-## 场景 1：先写文件，再跑命令
+## Scenario 1: write files, then run them
 
-这是「Agent 输出代码 → 执行」的最小闭环。关键点：**写和跑是两个不同的契约**——
-`Files()` 负责写入，`Session.Exec()` 负责执行，前者成功后不代表后者能跑。
+The minimal "agent emits code → it executes" loop. The key point: **writing and running are
+separate contracts** — `Files()` writes, `Session.Exec()` runs, and a successful write proves
+nothing about whether the payload compiles.
 
 ```go
 sb, err := sandbox.Open(ctx,
@@ -111,38 +117,39 @@ sess, err := sb.Session(ctx, "agent-writes-then-builds", sandbox.WithCreateIfMis
 if err != nil { log.Fatal(err) }
 defer sess.Release(ctx)
 
-// 写入通道
+// the write channel
 files, err := sess.Files()
-if err != nil { log.Fatal(err) }          // 没有 FileBridge 能力时会返回 *CapabilityError
+if err != nil { log.Fatal(err) }          // *CapabilityError when there is no file bridge
 if err := files.MkdirAll(ctx, "hello", 0o755); err != nil { log.Fatal(err) }
 if err := files.Write(ctx, "hello/main.go", src, 0o644); err != nil { log.Fatal(err) }
 if err := files.Write(ctx, "hello/go.mod", []byte("module hello\n\ngo 1.26\n"), 0o644); err != nil { log.Fatal(err) }
 
-// 执行通道：工作目录是 /workspace，写进去的相对路径就在这下面
+// the run channel: the working directory is /workspace, so relative paths land under it
 rep, err := sess.Exec(ctx, sandbox.Shell("cd hello && GOFLAGS=-mod=mod go build -o /tmp/app . && /tmp/app"))
-if err != nil { log.Fatal(err) }           // 引擎坏了才是 error
-fmt.Println(rep.ExitCode, rep.Stdout)      // 非 0 退出码是「代码的问题」，不是 error
+if err != nil { log.Fatal(err) }           // a non-nil error means the engine broke
+fmt.Println(rep.ExitCode, rep.Stdout)      // a non-zero exit code means the code is wrong
 ```
 
-实测输出：
+Measured output:
 
 ```
-listed: main.go|82|regular file size=0
---- exit=0 ---
-stdout: hello from the sandbox
+exit=0 stdout="hello from the sandbox"
 ```
 
-**两个坑，都踩过：**
+**Two traps, both actually hit:**
 
-- **没 `go.mod` 就没有模块上下文**：报 `go: go.mod file not found in current directory or any
-  parent directory`。Agent 只写 `main.go` 时一定要同时给 `go.mod`。
-- **`List` 报 `size=0`** 是目录条目的常见表现，不代表文件是空的——用 `Read` 或 `Stat` 确认内容。
+- **no `go.mod`, no module context**: `go: go.mod file not found in current directory or any
+  parent directory`. When the agent writes only `main.go`, write the `go.mod` too.
+- **`List` reporting `size=0`** is normal for directory entries and does not mean the file is
+  empty — confirm content with `Read` or `Stat`.
 
-### 两种写入通道，别混用
+### Three write channels — do not mix them up
 
-**通道 A：`sess.Files()`** —— 适合「边写边验」，因为写完立刻能读、能 List、能在下一次 `Exec` 里看到。
+**Channel A: `sess.Files()`** — best for "verify while generating", because a write is instantly
+readable, listable, and visible to the next `Exec`.
 
-**通道 B：请求内联输入** —— 适合「一次性把文件交给这次运行」，不需要先建会话文件句柄：
+**Channel B: inputs inline in the request** — best when the files belong to one run only, with no
+file handle involved:
 
 ```go
 rep, err := sess.Exec(ctx, sandbox.Request{
@@ -152,23 +159,28 @@ rep, err := sess.Exec(ctx, sandbox.Request{
 })
 ```
 
-实测：`inline exit=0 stdout="print('inline input ran')\ninline input ran\n"` —— 文件在命令执行前已经落盘。
+Measured: `exit=0 stdout="print('inline input ran')\ninline input ran"` — the file was on disk
+before the command started.
 
-**通道 C：整个工作区来自宿主** —— 不用一个个写文件：
+**Channel C: the whole workspace comes from the host** — when writing files one by one is not the
+shape you want:
 
-- `sandbox.FromDir("...")`：把宿主机目录作为工作区来源
+- `sandbox.FromDir("...")` — a host directory becomes the workspace source
 - `sandbox.FromArchive(reader)` / `sandbox.FromGit(url, ref)` / `sandbox.FromImage(image)` / `sandbox.FromArtifacts(set, sub)`
-- 这些返回 `*sandbox.WorkspaceSource`，通过 `sandbox.WithWorkspace(...)` 或 `sandbox.Project.From` 使用
+- each returns a `*sandbox.WorkspaceSource`, used via `sandbox.WithWorkspace(...)` or
+  `sandbox.Project.From`
 
-想让它「重建之后还在」，用 `sess.RecordInput(ctx, in)` 把输入登记进 spec —— 没登记的写入不会
-在重建时重现，这是「能跑一次」和「可复现」的区别。
+To make a write survive a rebuild, register it with `sess.RecordInput(ctx, in)`. Unregistered
+writes do not reappear after a rebuild — that is the difference between "it ran once" and
+"it is reproducible".
 
 ---
 
-## 场景 2：边生成边验证（Agent 边写边跑）
+## Scenario 2: verify as you generate
 
-这才是「Agent 生成过程中写入」的正解：**每写一个文件就跑一次轻量校验**，把沙盒当反馈回路，
-而不是等全部写完再一次性构建。
+This is the real answer to "how does the agent write while it is generating": **run a cheap
+check after each file** and treat the sandbox as a per-step feedback loop rather than a final
+gate.
 
 ```go
 steps := []struct{ path, body string }{
@@ -182,79 +194,95 @@ for i, st := range steps {
     rep, err := sess.Exec(ctx, sandbox.Shell("cd app && GOFLAGS=-mod=mod go vet ./..."))
     if err != nil { log.Fatal(err) }
     if rep.ExitCode != 0 {
-        // 把 stderr 交回给模型，让它重写这一个文件，而不是重写整棵树
+        // hand this one error back to the model, not the whole tree
         fmt.Printf("step %d failed: %s\n", i+1, rep.Stderr)
     }
 }
 ```
 
-实测输出（注意第 2 步：文件还没写完，`vet` 立刻报出真实错误）：
+Measured output (the run **without** a pipe, where the exit codes are honest):
 
 ```
-step 1 wrote app/go.mod     vet exit=0 go: warning: "./..." matched no packages
-step 2 wrote app/main.go    vet exit=0 # app
-                                   vet: ./main.go:3:23: undefined: Greet
+step 1 wrote app/go.mod     vet exit=1
+  model should fix: go: warning: "./..." matched no packages
+step 2 wrote app/main.go    vet exit=1
+  model should fix: # app            ← undefined: Greet follows this line
 step 3 wrote app/greet.go   vet exit=0
-final build exit=0
+final build exit=0 stdout=""
 ```
 
-> ⚠️ **这里有个必须知道的坑**：`go vet ./... | head -5` 的 **退出码是 `head` 的**，所以上面
-> step 2 明明有编译错误却显示 `exit=0`，而 stderr 里躺着 `undefined: Greet`。**不要用管道截断
-> 一个要被判断成败的命令**——要么直接跑、要么 `set -o pipefail`，否则你的 Agent 会「绿灯
-> 通过」一个编译失败的项目。
+All three details are real, and all three matter:
+
+- **Step 1 `exit=1`**: with only `go.mod` in the tree, `./...` matches no packages and `vet`
+  treats that as failure. It is not a defect — there is simply nothing to check yet, and the
+  agent should not "fix" the go.mod it just wrote.
+- **Step 2 `exit=1`**: `undefined: Greet` is caught immediately. That is the whole point of
+  asking after each file instead of once at the end.
+- **`final build stdout=""`**: `println` writes to **stderr**, not stdout. Empty stdout does not
+  mean nothing ran — read `rep.Stderr`, or use `fmt.Println`.
+
+> ⚠️ **The trap this measurement replaced**: `go vet ./... | head -5` exits with **`head`'s**
+> status, so an earlier run of exactly this loop reported `exit=0` for step 2 while
+> `undefined: Greet` sat in stderr. **Never pipe a command whose exit code you are going to
+> judge** — run it directly, or `set -o pipefail`. Otherwise your agent green-lights a project
+> that does not compile.
 
 ---
 
-## 场景 3：跑完之后，让结果自己驱动下一步
+## Scenario 3: let the result drive the next step
 
-需求里说的「执行完了之后怎么引导 Agent 去做后续的事情」有两种做法，不要混：
+"After the run, how do I guide the agent to continue?" — two different mechanisms, do not conflate
+them:
 
-### (a) 用失败分类决定下一步（机械、可判定）
+### (a) branch on the failure class (mechanical, decidable)
 
-`Report.Failure` 已经分好类，不用自己解析字符串：
+`Report.Failure` already classifies the outcome; do not parse strings:
 
 ```go
 rep, err := sess.Exec(ctx, sandbox.Shell("make build"))
 switch {
 case err != nil:
-    // 环境坏了：重建/重试，别让模型改代码
-case rep.ExitCode != 0 && rep.Failure.NextAction == sandbox.ActionModelFix:
-    // 模型的问题：把 rep.Stderr 回灌，让它改
+    // the environment broke: rebuild or retry, never ask the model to edit code
+case rep.ExitCode != 0 && rep.Failure != nil && rep.Failure.NextAction == sandbox.ActionModelFix:
+    // the model's problem: feed rep.Stderr back and regenerate the failing file
 case rep.ExitCode != 0:
-    // 其他（超时、丢失、配额）：换策略，不是改代码
+    // timeout, lost run, quota: change strategy, do not change code
 }
 ```
 
-### (b) 边跑边收输出，实时决定要不要打断
+### (b) collect output while it runs, and decide mid-flight
 
-用 `WithRunSink` 挂一个 sink，输出是**边产生边到**的，`Report.OutputSent` 记录实时送达的字节数：
+Attach a sink with `WithRunSink`; chunks arrive as they are produced and `Report.OutputSent`
+counts what was actually delivered live:
 
 ```go
-sink := &mySink{} // 实现 Emit(ctx, sandbox.OutputChunk) error
+sink := &mySink{} // implements Emit(ctx, sandbox.OutputChunk) error
 rep, err := sess.Exec(ctx,
     sandbox.Shell("npm run build 2>&1"),
     sandbox.WithRunSink("collect", sink),
 )
-// rep.OutputSent > 0 证明「流式送达」是真的发生了，而不是最后给一整块
+// rep.OutputSent > 0 is the proof of live delivery, not a final one-shot blob
 ```
 
-实测输出：
+Measured output:
 
 ```
-run1 exit=2 chunks=4 outputSent=34
-run1 stderr saw failure marker: true        ← sink 在运行中就看到了 BUILD_FAILED
-next action derived from failure class: true ← Failure.NextAction == ActionModelFix
+exit=2 chunks=4 outputSent=34
+sink saw failure marker live: true
+class=user_code next action=model_fix
+-> route stderr back to the model and regenerate the failing file
 ```
 
-这条链路就是「执行完 → 判断 → 下一步」的自动化版本：sink 拿到实时输出做判断，`Report.Failure`
-提供机械的下一步建议，模型只在 `ActionModelFix` 时被叫回来。
+That is the automated form of "run → judge → next step": the sink holds live output for
+immediate decisions, `Report.Failure.Class` and `.NextAction` give the machine-readable route, and
+the model is only called back when the class says the code is wrong.
 
 ---
 
-## 场景 4：一整棵项目树 + 多阶段 + 产物
+## Scenario 4: a whole project tree, ordered phases, artefacts
 
-单个文件用 `Exec` 就够；**整棵项目**要用 `Project`：阶段按顺序跑、共享同一个工作区、
-产物只回收你声明的那些。
+One file at a time fits `Exec`; **a whole project** belongs in `Project`: phases run in order,
+share one workspace, and only declared artefacts come back.
 
 ```go
 proj := sandbox.Project{
@@ -274,43 +302,51 @@ for _, a := range res.Artifacts {
 }
 ```
 
-实测输出：
+Measured output:
 
 ```
-project status=succeeded exit=0 phases=3
+status=succeeded exit=0 phases=3
   phase scaffold exit=0
-  phase vet   exit=0
-  phase run   exit=0
-  artifact out.txt 2 bytes: "5\n"          ← 真的是 sum(2,3) 算出来的
+  phase vet      exit=0
+  phase run      exit=0
+  artifact out.txt  2 bytes: "5\n"     ← genuinely the result of sum(2, 3)
 ```
 
-要点：
+Notes:
 
-- `Required: true` 的阶段失败会中止后续；`FailOpen: true` 适合 lint 这类「结果也是数据」的阶段。
-- `Artifacts` 只回收声明的路径；没声明的东西跑完就随沙盒一起消失。
-- `Project` 没有内联 `Inputs` 字段——**先写树再跑**（scaffold 阶段），或者用
-  `From: sandbox.FromDir(...)` 把宿主机目录作为工作区来源。
+- a failed `Required: true` phase stops the run; `FailOpen: true` suits stages whose result *is*
+  data, like a lint pass.
+- `Artifacts` collects only what you declared; anything else disappears with the sandbox.
+- `Project` has no inline `Inputs` field — **materialise the tree first** (a scaffold phase), or
+  set `From: sandbox.FromDir(...)` to take the workspace from the host.
 
 ---
 
-## 场景 5（进阶）：不确定就先问，别猜
+## Scenario 5 (optional): a runnable end-to-end demo
 
-宿主环境不确定时，先 `Diagnose`，它逐项回答「这个镜像能不能起、隔离实际是什么档、有没有孤儿」：
-
-```go
-diag, err := sb.Diagnose(ctx)
-// DiagReport 全是字段，没有方法；逐项打印 Checks 与 Fixes
-```
-
-命令行等价物：
+The four scenarios above are not just prose — they ship as a program:
 
 ```bash
-hno sandbox doctor  --provider docker --image golang:1.26
-hno sandbox boundary --provider docker --boxes 2     # 实测隔离档，不是按名字猜
-hno sandbox run     --provider docker --image golang:1.26 -shell 'go version'
+go run ./cmd/examples/sandbox_agent_workflow -doctor          # host check, exit 1/70 on failure
+go run ./cmd/examples/sandbox_agent_workflow -scenario all    # every scenario, real engine
+go run ./cmd/examples/sandbox_agent_workflow -scenario streaming
 ```
 
-退出码：`0` 成功 / `1` 检查跑完但没通过 / `70` 环境不可用 / `2` 用法错误 / `124` 超时。
+It reads `HNO_SANDBOX_IMAGE` and `HNO_SANDBOX_BINARY` (set the latter to `container` on macOS
+when `docker` is only a shim). `-doctor` prints every `Diagnose` check with its `fix` line and
+exits non-zero if any of them fails, so you can tell "my code is wrong" from "this host cannot
+run at all" before burning a build.
+
+The same checks are available from the CLI, including the measured isolation tier:
+
+```bash
+hno sandbox doctor   --provider docker --image golang:1.26
+hno sandbox boundary --provider docker --boxes 2   # measure the tier, do not infer it from a name
+hno sandbox run      --provider docker --image golang:1.26 -shell 'go version'
+```
+
+Exit codes: `0` success / `1` checks ran but did not pass / `70` environment unavailable /
+`2` usage error / `124` timeout.
 
 ---
 
@@ -335,18 +371,21 @@ fails the build).
 | `sandbox.ClassUserCode` | `Report.Failure.Class` when the payload exited non-zero |
 | `docker.Register` / `boxlite.Register` | explicit provider registration (D-03) |
 
-## 一页速查
+---
 
-| 我要做的事 | 用哪个 API | 容易忘的前提 |
+## One-page cheat sheet
+
+| What I want | API | The prerequisite people forget |
 |---|---|---|
-| 写文件进沙盒 | `sess.Files()` → `Write/MkdirAll` | provider 要有 `CapFileBridge`，否则 `*CapabilityError` |
-| 跑一条命令 | `sess.Exec(ctx, sandbox.Shell(...))` | 工作目录是 `/workspace`；非 0 退出码不是 error |
-| 边跑边收输出 | `sandbox.WithRunSink(name, sink)` | 用 `Report.OutputSent` 证明真的流式送达 |
-| 跑整棵项目 | `sb.RunProject(ctx, proj)` | `Project` 无内联 Inputs，先写树或用 `FromDir` |
-| 判断下一步 | `Report.Failure.Class` / `.NextAction` | 别去解析 stderr 文本 |
-| 首次创建会话 | `sandbox.WithCreateIfMissing(true)` | 否则未知 id 会被拒绝 |
-| 宿主自检 | `sb.Diagnose(ctx)` / `hno sandbox doctor` | 镜像不在本地会 FAIL，并给拉取指引 |
-| 实测隔离档 | `sb.MeasureKernelBoundary(ctx, 2)` | 要真的起 2 个盒子，不是免费操作 |
+| write files into the sandbox | `sess.Files()` → `Write/MkdirAll` | provider needs `CapFileBridge`, else `*CapabilityError` |
+| run one command | `sess.Exec(ctx, sandbox.Shell(...))` | cwd is `/workspace`; a non-zero exit is not an error |
+| stream output while it runs | `sandbox.WithRunSink(name, sink)` | use `Report.OutputSent` to prove live delivery |
+| run a whole project | `sb.RunProject(ctx, proj)` | no inline Inputs — scaffold first, or use `FromDir` |
+| decide the next step | `Report.Failure.Class` / `.NextAction` | do not parse stderr text |
+| first session creation | `sandbox.WithCreateIfMissing(true)` | otherwise an unknown id is refused |
+| check the host | `sb.Diagnose(ctx)` / `hno sandbox doctor` | a missing image FAILs, with a pull hint |
+| measure the real tier | `sb.MeasureKernelBoundary(ctx, 2)` | it starts 2 boxes; not a free call |
 
-**最小可运行前提清单**：① import 并注册 provider；② 宿主有引擎可执行文件（并选对 binary 名）；
-③ 镜像已在本地；④ 首次 `Session` 加 `WithCreateIfMissing(true)`。四件事都做到，上面的代码就能跑。
+**Minimum runnable checklist**: ① import and register a provider; ② the engine binary exists on
+the host and is addressed by its real name; ③ the image is already local; ④ the first `Session`
+call passes `WithCreateIfMissing(true)`. All four, and the code above runs as written.
