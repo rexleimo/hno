@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 🔗 Fixed (B6 / D-40：站点死链清零，检查开关不再可静默关闭)
+- `website/.vitepress/config.mjs` 的 **`ignoreDeadLinks` 由 `true` 改为 `false`**：此前注入死链后
+  构建仍 `exit 0`（实测 68s），37 条死链与「每次构建成功」长期共存。
+- 修完 **37 条**（20 个页面）：
+  - 仓库内文件（`pkg/agentos/openapi.yaml`、`pkg/hno/mcp/IMPLEMENTATION.md`）不在站点托管范围内，
+    改指 **GitHub 绝对地址**（8 处，en/zh/ja/ko 一致；ja/ko/zh 版原比英文版少一层 `../`，磁盘解析都不成立）。
+  - 指向同话题真实页面：`file-agent → /guide/sandboxed-file-io`、`session-demo → /guide/session-state`、
+    `reasoning-agent → /guide/models`、`/guide/reasoning → /guide/models`、`/ja|ko/architecture → /advanced/architecture`。
+  - **从未存在过**的示例广告链接删除（`chat-agent`、`search-agent`、`googlesheets-agent`；`git log` 无记录、
+    侧栏与索引均未引用），没有改成别的意思。
+- 新增两道门（`pkg/hno/sandbox/dx_site_links_test.go`）：
+  - `TestSiteDeadLinksAreEnforced`：解析 `config.mjs` 断言 `ignoreDeadLinks: false`，注释行不算配置；
+    文件读不到直接 `Fatalf`（「读不到」不等于「没有这个开关」）。
+  - `TestSiteLinksResolve`：全站 **840** 条本地链接按渲染器规则解析（`/x` → `x.md` / `x/index.md` / `public/`），
+    先自检站点根，少于 100 条即判空转失败。
+- 反证：翻回 `true` ⇒ 第一道精确红；中文页注入死链 ⇒ 第二道精确红并给出页面与目标。
+
 ### ✨ Added (B5b / D-39：A2 生效——实测可放宽准入)
 - 新选项 **`sandbox.WithBoundaryMeasurement(report)`**：准入由 `admitBoundary` 双向裁决。
   **放宽**：`private-kernel` 可放行声称低于下限的 provider（本机 `IsolationMicroVM` 从 **exit 70 → exit 0**）。

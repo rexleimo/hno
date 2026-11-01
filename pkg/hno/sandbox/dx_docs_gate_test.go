@@ -501,11 +501,18 @@ var linkRe = regexp.MustCompile(`(?m)\[[^\]]*\]\(([^)]+)\)`)
 // headingRe matches an ATX heading, capturing the text.
 var headingRe = regexp.MustCompile("(?m)^#{1,6}\\s+(.+?)\\s*$")
 
-// TestGuideLinksResolve exists because this site sets ignoreDeadLinks: true in
-// .vitepress/config.mjs, so `npm run docs:build` completes happily no matter how many links
-// point at pages that were never written. Measured: a deliberately dead /guide/does-not-exist
-// link built clean in 68 seconds with exit 0. A green site build is therefore not evidence
-// about links, and the check has to live where the rest of the guide contract is enforced.
+// Two facts govern the link checks below, and both were measured rather than assumed.
+//
+// The site used to set ignoreDeadLinks: true, so `npm run docs:build` completed happily no
+// matter how many links pointed at pages that were never written -- a deliberately dead
+// /guide/does-not-exist built clean in 68 seconds with exit 0. That flag is now false
+// (TestSiteDeadLinksAreEnforced pins it), and the same planted link fails the build with
+// "Found dead link /guide/does-not-exist in file guide/sandbox-runtime.md".
+//
+// The Go checks stay because they cover what the renderer does not: in-page anchors (the
+// renderer validates file targets, not fragments), and they run without node installed. So
+// `go test` catches guide rot and `npm run docs:build` catches site-wide rot; neither
+// replaces the other.
 // guideSlug reproduces the anchor slug the VitePress renderer produces, and it was derived by
 // comparing against the built HTML for both locales rather than by reading the docs and hoping:
 //
