@@ -877,7 +877,10 @@ func TestAppleDialectUsesItsOwnSurfaces(t *testing.T) {
 		}
 		return defaultResponse(c), true
 	}}
-	cfg := Config{Image: "golang:1.26", Binary: "container", Dialect: DialectApple, Runner: fr}
+	// AssumeInstalled because the binary under test is a fake: whether `container` is on
+	// *this* machine's PATH says nothing about whether the dialect renders Apple's CLI
+	// shape, and asserting it made the test pass on macOS and fail on Linux CI.
+	cfg := Config{Image: "golang:1.26", Binary: "container", Dialect: DialectApple, Runner: fr, AssumeInstalled: true}
 	p, err := New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)

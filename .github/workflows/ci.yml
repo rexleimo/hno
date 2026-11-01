@@ -59,18 +59,32 @@ jobs:
       - name: Install tooling
         run: make install-tools
 
+      # Lint and tests are independent gates and both must report. Until this became
+      # `continue-on-error`, a lint failure skipped the test step entirely, so five
+      # consecutive red runs produced zero evidence about whether the tests passed —
+      # and one genuine host-dependent test failure stayed invisible underneath it.
       - name: Run lint
+        id: lint
+        continue-on-error: true
         env:
           LINT_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
         run: |
+          # The default golangci-lint timeout is 1m; this repository takes longer, so the
+          # lint step was failing on the clock rather than on findings (exit 4).
           if [ -n "$LINT_BASE" ] && git rev-parse --verify "$LINT_BASE" >/dev/null 2>&1; then
-            golangci-lint run --new-from-rev="$LINT_BASE" ./...
+            golangci-lint run --timeout=10m --new-from-rev="$LINT_BASE" ./...
           else
-            golangci-lint run ./...
+            golangci-lint run --timeout=10m ./...
           fi
 
       - name: Run tests
         run: make test
+
+      - name: Report lint outcome
+        if: steps.lint.outcome == 'failure'
+        run: |
+          echo "::error title=Lint failed::golangci-lint reported findings; the test step above ran regardless, so read both results"
+          exit 1
 
       - name: Upload coverage artifact
         if: always()

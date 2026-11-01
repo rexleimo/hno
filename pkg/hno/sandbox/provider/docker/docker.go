@@ -117,6 +117,12 @@ type Config struct {
 	// Runner overrides command execution. Tests inject a fake so the contract
 	// and fault injection run without a daemon.
 	Runner Runner
+	// AssumeInstalled skips the host PATH lookup in Probe. It exists for fakes: when a
+	// Runner is injected, "is the binary on this machine's PATH" is a fact about the
+	// test host, not about the provider under test. Without it a dialect test passed on
+	// macOS (where `container` exists) and failed on Linux CI, which is the same class of
+	// host-dependent assertion the rest of this file already avoids.
+	AssumeInstalled bool
 }
 
 // Runner is the command-execution seam. Implementations return the process
@@ -306,6 +312,9 @@ type Provider struct {
 	skippedPrune []string
 	mu           syncMu
 	closeTo      time.Duration
+	// cfgAssumeInstalled mirrors Config.AssumeInstalled: with an injected Runner the
+	// host PATH is not evidence about the provider.
+	cfgAssumeInstalled bool
 }
 
 // New builds a provider from the engine-facing config.
@@ -321,11 +330,12 @@ func New(d Config) (*Provider, error) {
 		bin = "docker"
 	}
 	return &Provider{
-		d:      d,
-		runner: d.Runner,
-		bin:    bin,
-		dial:   newDialect(d.Dialect, bin),
-		live:   map[string]*Environment{},
+		d:                  d,
+		runner:             d.Runner,
+		bin:                bin,
+		dial:               newDialect(d.Dialect, bin),
+		live:               map[string]*Environment{},
+		cfgAssumeInstalled: d.AssumeInstalled,
 	}, nil
 }
 
@@ -758,6 +768,9 @@ func workspaceCWD(mode sandbox.MountMode, bind bool) string {
 
 // lookPath resolves the CLI once per probe with a typed, fix-bearing error.
 func (p *Provider) lookPath(ctx context.Context) (string, error) {
+	if p.cfgAssumeInstalled {
+		return p.bin, nil
+	}
 	if _, err := exec.LookPath(p.bin); err != nil {
 		return "", p.unavailable(fmt.Sprintf("container CLI %q is not installed", p.bin), err,
 			fmt.Sprintf("install %s, or register the provider with the binary you do have", p.bin),
