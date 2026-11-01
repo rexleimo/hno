@@ -113,12 +113,16 @@ seam once, then attach providers to it.
    OCI-native, persistent boxes, `allow_net` egress allowlist, secret placeholders,
    copy-on-write disk, PTY exec) — *behind our interface*, never as our architecture. LiteBox
    stays on strategic watch (§8).
-   **Correction (measured 2026-11, D-41):** this line used to say "Go SDK". There is no Go SDK.
-   Versions v0.5.14 / v0.8.2 / v0.9.7 / v0.10.8 / v0.11.0 ship `sdks/{c,node,python}` only; every
-   `sdks/go` entry in the module zip is an end-to-end test program under `apps/e2e`, the repo has
-   no root `go.mod`, and `go get github.com/boxlite-ai/boxlite/sdks/go` fails with "module found,
-   but does not contain package". The provider is therefore **CLI-backed**, like the container
-   one: no CGO, no Rust toolchain, no new module dependency.
+   **Correction (measured 2026-11, D-41; revised for v3.1.1):** an earlier revision of this
+   note said "there is no Go SDK" — that was true for every version we could resolve at the
+   time and **false for v0.11.0**, which shipped one (2026-10-30). `go get .../sdks/go` resolves
+   for v0.11.0 and for none of v0.5.14 / v0.8.2 / v0.9.7 / v0.10.0 / v0.10.5 / v0.10.8. It is
+   still not what we use, for measured reasons: it is cgo-only (it does not compile at all under
+   `CGO_ENABLED=0`, which is how this repository's CI builds: `undefined: Box`), and it requires
+   `go run .../cmd/setup` to download a ~70MB prebuilt native archive, which failed twice on the
+   development host and arrived truncated with an empty `include/`, so cgo then reported
+   `boxlite.h not found`. The provider is therefore **CLI-backed**, like the container one: no
+   CGO, no Rust toolchain, no new module dependency, and a build that needs no network.
 4. Cheapest first win that needs no new dependency: **gVisor (`runsc`) as an OCI runtime** for the
    existing container executor, which closes the doc's own admitted kernel-escape gap.
 

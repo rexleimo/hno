@@ -362,9 +362,11 @@ hno sandbox run --isolation microvm --measure-boundary -- go version
 `boxlite` 在本构建里注册为第二个引擎，也是笔记本上能把 VM 这一档真正落地的那一个。在把
 profile 指向它之前，有两点值得先知道，因为这两点都是实测出来的、不是读文档得来的：
 
-- 它**没有 Go SDK**。上游 README 写着 `go get github.com/boxlite-ai/boxlite/sdks/go` 并需要
-  CGO，而模块里只有 `sdks/{c,node,python}`，所有 `sdks/go` 命中都是端到端测试程序。所以这个
-  provider 像容器 provider 一样包 CLI：没有 cgo、不需要 Rust 工具链、不新增任何模块依赖。
+- 它的 **Go SDK 从 v0.11.0 才有**（更早的版本 `go get .../sdks/go` 都解析不到），而本 provider
+  不用它。它只能 CGO：在 `CGO_ENABLED=0`（本仓库 CI 的构建方式）下根本编译不过；而且要额外跑
+  `go run .../cmd/setup` 去下载约 70MB 的预编译原生库。在本机实测：这个下载失败了两次、到手的是
+  截断包、`include/` 是空的，于是 cgo 报 `boxlite.h not found`。所以这个 provider 像容器
+  provider 一样包 CLI：没有 cgo、不需要 Rust 工具链、不新增模块依赖，构建也不依赖网络。
 - 这个 CLI **没有 label 概念**。所以在一台机器上发现的 box 无法被归因到本进程，`Prune` 因此
   拒绝删除而不是猜——`SkippedPrune()` 返回原因，并且会被打印出来，而不是藏进一个 0 里。容器
   provider 敢删是因为它创建的每个 box 都带归属 label，这个做不到，就如实说做不到。

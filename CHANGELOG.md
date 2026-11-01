@@ -5,6 +5,24 @@ All notable changes to Agno-Go will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### 🧾 Fixed (事实更正：BoxLite 的 Go SDK 从 v0.11.0 起存在)
+
+v3.1.0 的台账与文档写了「BoxLite 没有 Go SDK」，这条对 v0.11.0 **是错的**，在此更正，
+代码行为不变：
+
+- `sdks/go` **自 v0.11.0（2026-10-30）起存在**（该版 release notes 含
+  `feat(go): add guest SSH control through the C SDK`）。逐个版本 `go get` 实测：
+  v0.5.14 / v0.8.2 / v0.9.7 / v0.10.0 / v0.10.5 / v0.10.8 均解析失败，v0.11.0 可用。
+- **仍然不采用**，理由改为实测而非「不存在」：① 只能 CGO，`CGO_ENABLED=0`（本仓库 CI 的
+  构建方式）下编译直接失败（`agents.go:184:10: undefined: Box`）；② 需额外
+  `go run .../sdks/go/cmd/setup` 下载约 70MB 预编译原生库，本机两次失败
+  （`unexpected EOF` / `i/o timeout`），到手归档 `gzip -t` 报截断、`include/` 为空，
+  随后 cgo 报 `boxlite.h not found`。
+- 结论不变：provider 继续走 CLI（零新依赖、构建不需要网络），但**台账、包注释、中英文指南、
+  LiteBox 评估文档与 CHANGELOG 里的错误表述全部改写**，不留「上游说了但没有」这种过期判断。
+
 ## [3.1.0] - 2026-11-01
 
 ### ⚠️ 验证范围（发布前必须读）
@@ -35,10 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### 🚀 Added (B3 / D-41：BoxLite 微虚拟机 provider —— CLI 形状，零新依赖)
 
 - 新增 `pkg/hno/sandbox/provider/boxlite`：在冻结的 `Provider` 契约之上接入 boxlite 引擎。
-  - **上游文档是错的**：README 与设计文档都写 `go get github.com/boxlite-ai/boxlite/sdks/go`（CGO），
-    但 v0.5.14/0.8.2/0.9.7/0.10.8/0.11.0 只发布 `sdks/{c,node,python}`，`sdks/go` 命中全是
-    `apps/e2e` 端到端测试程序，`go get` 报 **does not contain package**。因此走 CLI：无 CGO、无 Rust、
-    不新增模块依赖。
+  - **走 CLI 而不是 SDK**：此处原写「没有 Go SDK」，对 v0.11.0 不成立，已在 `[Unreleased]` 更正
+    （SDK 自 v0.11.0 起存在，但只能 CGO、且需下载 ~70MB 预编译原生库，`CGO_ENABLED=0` 下编译失败）。
+    结论不变：CLI 形状，无 CGO、无 Rust、不新增模块依赖、构建不需要网络。
   - 能力只声明 CLI 面兜得住的 `session / streaming / port-forward / egress-allowlist`；snapshot、
     clone、rebuild、file-bridge **不声明**（引擎无对应动词或尚未实现），核心在绑定时即校验。
   - `Probe` 不按 `GOOS` 分支，而是问引擎 `info` 的 `virtualization:` 字段；**「没回答」不等于「通过」**，

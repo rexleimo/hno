@@ -1,18 +1,26 @@
 // Package boxlite implements the sandbox Provider contract over the boxlite CLI.
 //
-// # Why a CLI and not an SDK
+// # Why a CLI and not the Go SDK
 //
-// The upstream project documents a Go SDK — its README says
-// `go get github.com/boxlite-ai/boxlite/sdks/go`, "Go 1.24+ with CGO" — and that
-// package does not exist. Checked against the module contents of v0.5.14, v0.8.2,
-// v0.9.7, v0.10.8 and v0.11.0: every one ships sdks/{c,node,python} and nothing else,
-// the only sdks/go entries in the module zip are end-to-end test programs under
-// apps/e2e, and `go get .../sdks/go` fails with "module found, but does not contain
-// package". So the choice is not "embed or shell out" — embedding does not exist, and
-// a provider that imported it would not compile.
+// The upstream project gained a Go SDK in v0.11.0 (released 2026-10-30, PR
+// "feat(go): add guest SSH control through the C SDK"). It did not exist before that:
+// `go get .../sdks/go` resolved for no earlier version we checked (v0.5.14, v0.8.2,
+// v0.9.7, v0.10.0, v0.10.5, v0.10.8 all fail). This package was written against
+// v0.11.0, where it does exist — and it is still not what we use, for measured
+// reasons rather than for absence:
 //
-// Shelling out is also the shape this project already uses for its container
-// provider, at the cost of no new module dependency, no cgo and no Rust toolchain.
+//   - it is cgo-only. With CGO_ENABLED=0 — which is how this project's CI builds —
+//     the SDK does not compile at all: "agents.go:184:10: undefined: Box".
+//   - it needs a separate setup step (`go run .../sdks/go/cmd/setup`) that downloads
+//     a ~70MB prebuilt native archive into the module cache. On the development host
+//     that download failed twice (unexpected EOF, then a timeout), the archive that
+//     did arrive was truncated, and its include/ directory was empty — no boxlite.h —
+//     so cgo then failed with "boxlite.h not found".
+//
+// Adopting it would put a network-dependent, cgo-only, prebuilt-native step in front
+// of every build of this repository. Shelling out is also the shape this project
+// already uses for its container provider, at the cost of no new module dependency,
+// no cgo and no Rust toolchain.
 //
 // # What the engine actually provides
 //

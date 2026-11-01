@@ -392,11 +392,14 @@ hno sandbox run --isolation microvm --measure-boundary -- go version
 VM tier on a laptop. Two facts about it are worth knowing before you point a profile at it,
 because both were measured rather than read:
 
-- There is **no Go SDK**. The upstream README documents
-  `go get github.com/boxlite-ai/boxlite/sdks/go` with CGO, and the module ships
-  `sdks/{c,node,python}` only — every `sdks/go` entry is an end-to-end test program. The
-  provider therefore wraps the CLI, exactly like the container provider, which means no cgo,
-  no Rust toolchain and no new module dependency.
+- The **Go SDK exists from v0.11.0 only** (`go get .../sdks/go` resolves for no earlier
+  version), and it is not what this provider uses. It is cgo-only — with `CGO_ENABLED=0`,
+  which is how this project's CI builds, it does not compile at all — and it needs a separate
+  `go run .../cmd/setup` step that downloads a ~70MB prebuilt native archive. On the machine
+  this was measured on, that download failed twice, arrived truncated, and shipped an empty
+  `include/` directory, so cgo then reported `boxlite.h not found`. The provider therefore
+  wraps the CLI, exactly like the container provider: no cgo, no Rust toolchain, no new
+  module dependency, and a build that needs no network.
 - The CLI has **no label concept**. So a box found on a host cannot be attributed to this
   process, and `Prune` refuses instead of guessing — `SkippedPrune()` returns the reason,
   which is printed rather than hidden behind a zero count. The container provider can delete
