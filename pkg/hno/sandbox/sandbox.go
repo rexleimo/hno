@@ -36,8 +36,11 @@ type Sandbox struct {
 	// can report it without booting anything. Guarded by mu: producing one is
 	// expensive, reading it back is not.
 	lastBoundary *KernelBoundaryReport
-	createdAt    time.Time
-	closed       bool
+	// admittedBy is the measurement that lifted this handle above its provider's claim,
+	// recorded so Status can report the basis rather than a bare enum.
+	admittedBy *KernelBoundaryReport
+	createdAt  time.Time
+	closed     bool
 
 	probeAt    time.Time
 	probeErr   error
@@ -135,8 +138,33 @@ func (sb *Sandbox) bind(ctx context.Context) error {
 		}
 		iso := prov.Isolation()
 		caps := prov.Capabilities()
-		if !iso.AtLeast(sb.cfg.MinIsolation) {
-			tried = append(tried, Attempt{Provider: name, Isolation: iso, Reason: fmt.Sprintf("isolation %s below required %s", iso, sb.cfg.MinIsolation), Fix: "choose a provider that meets the floor or lower WithMinimumIsolation",
+		// Admission reconciles the claim against a measurement, in both directions
+		// (D-39). Without evidence this is exactly what it was before: the claim
+		// decides, and a provider below the floor is refused.
+		adm := admitBoundary(sb.cfg, name, iso, sb.cfg.Boundary)
+		if adm.Refuse {
+			tried = append(tried, Attempt{Provider: name, Isolation: iso, Reason: adm.Reason, Fix: adm.Fix,
+				Cause: &IsolationError{Provider: name, Want: sb.cfg.MinIsolation, Got: iso}})
+			_ = prov.Close(ctx)
+			continue
+		}
+		if !iso.AtLeast(sb.cfg.MinIsolation) && !adm.Lift {
+			fix := "choose a provider that meets the floor or lower WithMinimumIsolation"
+			reason := fmt.Sprintf("isolation %s below required %s", iso, sb.cfg.MinIsolation)
+			// When measurement was supplied and it did not hold up (another engine,
+			// another host, stale), that is the reason, and telling the caller "go
+			// measure" when they already did sends them in a circle.
+			if adm.Reason != "" {
+				reason = adm.Reason
+				if adm.Fix != "" {
+					fix = adm.Fix
+				}
+			} else if _, ok := prov.(KernelBoundaryQueryable); ok {
+				// The provider can answer the question that would lift this refusal, and
+				// saying so is the difference between "not supported" and "not asked".
+				fix = "measure this engine (hno sandbox boundary) and pass the result to WithBoundaryMeasurement, or choose a provider that meets the floor, or lower WithMinimumIsolation"
+			}
+			tried = append(tried, Attempt{Provider: name, Isolation: iso, Reason: reason, Fix: fix,
 				Cause: &IsolationError{Provider: name, Want: sb.cfg.MinIsolation, Got: iso}})
 			_ = prov.Close(ctx)
 			continue
@@ -165,6 +193,9 @@ func (sb *Sandbox) bind(ctx context.Context) error {
 			continue
 		}
 		sb.provider, sb.name, sb.caps, sb.iso = prov, name, caps, iso
+		if adm.Lift {
+			sb.admittedBy = sb.cfg.Boundary
+		}
 		sb.probeAt = time.Now()
 		sb.emit(ctx, Event{Kind: EventResolved, Provider: name, Isolation: iso, Detail: map[string]any{"capabilities": caps.Strings()}})
 		if len(tried) > 0 && len(sb.cfg.Observers) == 0 && sb.cfg.AllowFallback {
@@ -226,9 +257,17 @@ func (sb *Sandbox) Status() Status {
 	sb.mu.RLock()
 	sessions := len(sb.sessions)
 	sb.mu.RUnlock()
+	boundary := sb.cfg.Boundary
+	if sb.admittedBy != nil {
+		boundary = sb.admittedBy
+	}
 	return Status{
-		Provider:     sb.name,
-		Isolation:    sb.iso,
+		Provider:  sb.name,
+		Isolation: sb.iso,
+		// Boundary is the measurement admission relied on, nil when admission used the
+		// claim alone. Reporting it here keeps "what tier is this" answerable with the
+		// evidence attached instead of a bare enum the caller has to trust.
+		Boundary:     boundary,
 		Capabilities: sb.caps,
 		Image:        sb.cfg.Image,
 		Formation:    sb.cfg.Formation,

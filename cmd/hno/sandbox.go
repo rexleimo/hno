@@ -55,14 +55,7 @@ func sandboxMain(argv []string, stdout, stderr io.Writer) int {
 
 	fs := flag.NewFlagSet("hno sandbox "+verb, flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	cfg := commonFlags(fs)
-	shell := fs.String("shell", "", "run this script through the guest shell instead of an argv (run)")
-	session := fs.String("session", "", "reuse this session id, creating it if absent (run)")
-	timeout := fs.Duration("timeout", 0, "per-run execution budget, e.g. 30s; 0 keeps the runtime default (run)")
-	yes := fs.Bool("yes", false, "actually delete, rather than only report (prune)")
-	asJSON := fs.Bool("json", false, "machine-readable output (doctor, boundary)")
-	boxes := fs.Int("boxes", 0, fmt.Sprintf("how many boxes the boundary measurement starts (%d-%d); 0 uses the runtime default %d (boundary)", 2, sandbox.MaxBoundaryBoxes, sandbox.DefaultBoundaryBoxes))
-	expect := fs.String("expect", "", "fail unless the measured boundary is this: shared-kernel or private-kernel (boundary)")
+	flags := registerVerbFlags(fs)
 	fs.Usage = func() { usageSandbox(fs, stderr, verb) }
 	if err := fs.Parse(argv[1:]); err != nil {
 		return exitUsage
@@ -71,15 +64,43 @@ func sandboxMain(argv []string, stdout, stderr io.Writer) int {
 	ctx := context.Background()
 	switch verb {
 	case verbDoctor:
-		return doctorCmd(ctx, cfg, *asJSON, stdout, stderr)
+		return doctorCmd(ctx, flags.cfg, *flags.asJSON, *flags.measureBoundary, stdout, stderr)
 	case verbPrune:
-		return pruneCmd(ctx, cfg, *yes, stdout, stderr)
+		return pruneCmd(ctx, flags.cfg, *flags.yes, stdout, stderr)
 	case verbRun:
-		return runCmd(ctx, cfg, *session, *shell, *timeout, fs.Args(), stdout, stderr)
+		return runCmd(ctx, flags.cfg, *flags.session, *flags.shell, *flags.timeout, *flags.measureBoundary, fs.Args(), stdout, stderr)
 	case verbBoundary:
-		return boundaryCmd(ctx, cfg, *boxes, *expect, *asJSON, stdout, stderr)
+		return boundaryCmd(ctx, flags.cfg, *flags.boxes, *flags.expect, *flags.asJSON, stdout, stderr)
 	}
 	return exitUsage
+}
+
+// verbFlags is the flag set every sandbox verb shares. It is built by one function rather
+// than inline in the dispatcher so a test can read the text that actually ships: a help
+// string copied into a test proves only that the copy exists.
+type verbFlags struct {
+	cfg             *sandboxConfig
+	shell           *string
+	session         *string
+	timeout         *time.Duration
+	yes             *bool
+	asJSON          *bool
+	measureBoundary *bool
+	boxes           *int
+	expect          *string
+}
+
+func registerVerbFlags(fs *flag.FlagSet) *verbFlags {
+	v := &verbFlags{cfg: commonFlags(fs)}
+	v.shell = fs.String("shell", "", "run this script through the guest shell instead of an argv (run)")
+	v.session = fs.String("session", "", "reuse this session id, creating it if absent (run)")
+	v.timeout = fs.Duration("timeout", 0, "per-run execution budget, e.g. 30s; 0 keeps the runtime default (run)")
+	v.yes = fs.Bool("yes", false, "actually delete, rather than only report (prune)")
+	v.asJSON = fs.Bool("json", false, "machine-readable output (doctor, boundary)")
+	v.measureBoundary = fs.Bool("measure-boundary", false, "measure this engine's kernel boundary first and let it decide admission against --isolation; this starts boxes (run, doctor)")
+	v.boxes = fs.Int("boxes", 0, fmt.Sprintf("how many boxes the boundary measurement starts (%d-%d); 0 uses the runtime default %d (boundary)", 2, sandbox.MaxBoundaryBoxes, sandbox.DefaultBoundaryBoxes))
+	v.expect = fs.String("expect", "", "fail unless the measured boundary is this: shared-kernel or private-kernel (boundary)")
+	return v
 }
 
 func usageSandbox(fs *flag.FlagSet, w io.Writer, verb string) {
@@ -163,6 +184,35 @@ func (c *sandboxConfig) options() ([]sandbox.Option, error) {
 		opts = append(opts, sandbox.WithAttrs(map[string]any(c.attrs)))
 	}
 	return opts, nil
+}
+
+// measureForAdmission takes a measurement on a probe handle and returns it for
+// WithBoundaryMeasurement. It is the bridge between `hno sandbox boundary` (which answers
+// the question) and admission (which consumes the answer) without making either of them
+// guess: nothing is measured unless the operator asked for it with --measure-boundary.
+//
+// The probe handle is opened at the caller's floor *lowered*, because the point of the
+// exercise is to find out whether that floor is satisfiable -- asking admission to check
+// the floor before the measurement exists is the circularity this avoids.
+func measureForAdmission(ctx context.Context, cfg *sandboxConfig, stderr io.Writer) (*sandbox.KernelBoundaryReport, int, error) {
+	probe := *cfg
+	probe.isolation = ""
+	opts, err := probe.options()
+	if err != nil {
+		return nil, exitUsage, err
+	}
+	sb, err := openHandle(ctx, opts...)
+	if err != nil {
+		return nil, exitEnvFailure, err
+	}
+	defer sb.Close()
+	report, err := sb.MeasureKernelBoundary(ctx, 0)
+	if err != nil {
+		return nil, exitEnvFailure, err
+	}
+	fmt.Fprintf(stderr, "measured kernel boundary: %s (%d of %d boxes, %d distinct readings)\n",
+		report.Verdict, len(report.BootIDs), report.Boxes, report.Distinct())
+	return report, exitOK, nil
 }
 
 // openHandle registers the providers this binary ships and opens a handle. Registration is
@@ -257,11 +307,19 @@ func boundaryCmd(ctx context.Context, cfg *sandboxConfig, boxes int, expect stri
 	return exitOK
 }
 
-func doctorCmd(ctx context.Context, cfg *sandboxConfig, asJSON bool, stdout, stderr io.Writer) int {
+func doctorCmd(ctx context.Context, cfg *sandboxConfig, asJSON, measure bool, stdout, stderr io.Writer) int {
 	opts, err := cfg.options()
 	if err != nil {
 		fmt.Fprintf(stderr, "hno sandbox doctor: %v\n", err)
 		return exitUsage
+	}
+	if measure {
+		report, code, merr := measureForAdmission(ctx, cfg, stderr)
+		if merr != nil {
+			fmt.Fprintf(stderr, "hno sandbox doctor: %v\n", merr)
+			return code
+		}
+		opts = append(opts, sandbox.WithBoundaryMeasurement(*report))
 	}
 	sb, err := openHandle(ctx, opts...)
 	if err != nil {
@@ -404,11 +462,22 @@ func reportRefusals(w io.Writer, rec sandbox.Reclaimer) {
 
 // runCmd executes one request and keeps the two failure kinds apart: the program's own
 // status is passed through, an unusable environment is not reportable as a failing program.
-func runCmd(ctx context.Context, cfg *sandboxConfig, session, shell string, timeout time.Duration, argv []string, stdout, stderr io.Writer) int {
+func runCmd(ctx context.Context, cfg *sandboxConfig, session, shell string, timeout time.Duration, measure bool, argv []string, stdout, stderr io.Writer) int {
 	opts, err := cfg.options()
 	if err != nil {
 		fmt.Fprintf(stderr, "hno sandbox run: %v\n", err)
 		return exitUsage
+	}
+	// --measure-boundary is the only way a micro-VM floor becomes satisfiable on an
+	// engine whose own claim is lower, and it is opt-in because it starts boxes before
+	// the run does.
+	if measure {
+		report, code, merr := measureForAdmission(ctx, cfg, stderr)
+		if merr != nil {
+			fmt.Fprintf(stderr, "hno sandbox run: %v\n", merr)
+			return code
+		}
+		opts = append(opts, sandbox.WithBoundaryMeasurement(*report))
 	}
 	req, err := buildRequest(shell, argv)
 	if err != nil {

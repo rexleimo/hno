@@ -107,6 +107,11 @@ type KernelBoundaryReport struct {
 	// Uptimes holds each box's seconds-since-kernel-boot, which corroborates the
 	// boot ids: two boxes on one kernel cannot have independently aged kernels.
 	Uptimes []string
+	// Provider is the provider that took the measurement. It is load-bearing: a
+	// report is evidence about one engine, and admission refuses to spend evidence
+	// gathered from a different one (D-39), the same way an approval is bound to the
+	// environment the human saw (D-25).
+	Provider string
 	// GuestKernel is the guest's "uname -sr" equivalent, HostKernel the same for
 	// this process. A Linux guest on a non-Linux host already proves a VM exists;
 	// the boot-id comparison then decides whether it is per box.
@@ -302,4 +307,99 @@ func (s *Sandbox) KernelBoundary() (KernelBoundaryReport, bool) {
 	out.BootIDs = append([]string(nil), s.lastBoundary.BootIDs...)
 	out.Uptimes = append([]string(nil), s.lastBoundary.Uptimes...)
 	return out, true
+}
+
+// boundaryAdmission is the reconciliation between what a provider claims and what a
+// measurement found. It exists because the isolation floor used to be decided entirely by
+// Provider.Isolation(), which is a constant: on this project's development host that
+// constant under-reported by two tiers (a VM-per-box engine registered as container
+// isolation), and the opposite mistake -- an engine claiming the VM tier while sharing one
+// kernel -- was invisible to admission altogether.
+//
+// Tighten and relax are deliberately asymmetric:
+//
+//   - evidence against a claim is always honoured, because refusing is the safe direction;
+//   - evidence for a claim below the floor is honoured too (that is the A2 decision), but
+//     only when the evidence is about *this* engine, on *this* host, and recent enough to
+//     still describe it.
+type boundaryAdmission struct {
+	// Lift reports whether the measurement allows admission below the floor.
+	Lift bool
+	// Refuse reports whether the measurement forbids admission the claim would allow.
+	Refuse bool
+	// Reason explains a refusal; it is empty when nothing was refused.
+	Reason string
+	// Fix is the actionable half of a refusal.
+	Fix string
+}
+
+// admitBoundary decides whether a measurement may change the answer for one provider.
+func admitBoundary(cfg Config, providerName string, claim Isolation, report *KernelBoundaryReport) boundaryAdmission {
+	if report == nil {
+		return boundaryAdmission{}
+	}
+	// Provenance first: evidence about another engine, another host, or another moment
+	// proves nothing here. Each of these refusals names what is wrong rather than
+	// silently dropping the measurement, because a measurement that is quietly ignored
+	// looks exactly like one that was never taken.
+	if report.Provider != "" && report.Provider != providerName {
+		return boundaryAdmission{
+			Lift:   false,
+			Fix:    fmt.Sprintf("measure %q itself: a report taken against provider %q is not evidence about this engine", providerName, report.Provider),
+			Reason: fmt.Sprintf("the measurement came from provider %q, not %q", report.Provider, providerName),
+		}
+	}
+	if report.HostKernel != "" && report.HostKernel != hostKernelString() {
+		return boundaryAdmission{
+			Fix:    fmt.Sprintf("re-measure on this host: the report was taken on %s and this process runs %s", report.HostKernel, hostKernelString()),
+			Reason: "the measurement was taken on a different host",
+		}
+	}
+	fresh := cfg.Timeouts.BoundaryFresh
+	switch {
+	case fresh == 0:
+		// WithTimeouts replaces the whole struct, so a caller who set only Setup and Exec
+		// arrives here with every other field zeroed. Zero is not a freshness anyone can
+		// mean -- it would reject a measurement taken this instant -- so it resolves to
+		// the documented default instead of becoming a trap that reads "stale" right
+		// after measuring.
+		fresh = DefaultTimeouts().BoundaryFresh
+	case fresh < 0:
+		// Negative means "no stored measurement is fresh enough", which is what the doc
+		// promises; the first version implemented the opposite and let an expired report
+		// through.
+		fresh = 0
+	}
+	if !report.MeasuredAt.IsZero() && time.Since(report.MeasuredAt) > fresh {
+		return boundaryAdmission{
+			Fix:    fmt.Sprintf("re-run the measurement (hno sandbox boundary, or Sandbox.MeasureKernelBoundary): a report older than Timeouts.BoundaryFresh no longer describes this engine"),
+			Reason: fmt.Sprintf("the measurement is stale (taken %s ago, BoundaryFresh is %s)", time.Since(report.MeasuredAt).Truncate(time.Second), fresh),
+		}
+	}
+
+	switch report.Verdict {
+	case BoundaryPrivateKernel:
+		// Evidence for the stronger tier. It lifts admission only out of a claim that is
+		// weaker, which is exactly the case that used to be refused.
+		if claim.Rank() < IsolationMicroVM.Rank() {
+			return boundaryAdmission{Lift: true}
+		}
+		return boundaryAdmission{}
+	case BoundarySharedKernel:
+		// Evidence against a VM claim. This half never widens anything: a provider that
+		// says micro-VM while its own boxes answered with one boot id is refused even
+		// though its claim alone would have passed.
+		if claim.Rank() >= IsolationMicroVM.Rank() {
+			return boundaryAdmission{
+				Refuse: true,
+				Reason: fmt.Sprintf("provider claims %s but the measurement found a shared kernel", claim),
+				Fix:    "fix the engine (enable a VM-per-box runtime) or declare the tier it actually provides; do not raise the floor to match the claim",
+			}
+		}
+		return boundaryAdmission{}
+	default:
+		// unknown/unmeasured support nothing in either direction. Refusing to lift is not
+		// a refusal to run: the claim alone still decides what it always decided.
+		return boundaryAdmission{}
+	}
 }

@@ -101,11 +101,14 @@ func (p Profile) String() string {
 // Config is the fully resolved configuration of a Sandbox handle. It is
 // produced only by resolve() so no call site can hold a half-filled config.
 type Config struct {
-	ProfileName   Profile
-	Provider      string
-	Formation     Formation
-	Image         string
-	MinIsolation  Isolation
+	ProfileName  Profile
+	Provider     string
+	Formation    Formation
+	Image        string
+	MinIsolation Isolation
+	// Boundary is measured evidence admission reconciles against the provider's claim
+	// (D-39). Nil means the claim decides, which is the pre-D-39 behaviour.
+	Boundary      *KernelBoundaryReport
 	Allowed       []string // provider allow-list; empty = registry order
 	Egress        Egress
 	Timeouts      Timeouts
@@ -155,28 +158,68 @@ type Timeouts struct {
 	SessionTTL   time.Duration // default 30m (D-09)
 	Cleanup      time.Duration // default 10s
 	ApprovalHold time.Duration // default 5m before a suspended run expires
+	// BoundaryFresh is how long a kernel-boundary measurement stays usable as a
+	// reason to admit a provider below the isolation floor (D-39). A measurement
+	// describes one engine at one moment; an engine upgrade, a runtime flag change
+	// or a different host invalidates it silently, so it expires rather than being
+	// trusted forever. Set it negative to require a measurement per Open.
+	BoundaryFresh time.Duration // default 30m
 }
 
 // DefaultTimeouts returns the documented floors.
 func DefaultTimeouts() Timeouts {
 	return Timeouts{
-		Probe:        5 * time.Second,
-		Connect:      3 * time.Second,
-		Provision:    120 * time.Second,
-		Exec:         30 * time.Second,
-		Setup:        30 * time.Second,
-		Collect:      30 * time.Second,
-		Drain:        200 * time.Millisecond,
-		Idle:         15 * time.Minute,
-		SessionTTL:   30 * time.Minute,
-		Cleanup:      10 * time.Second,
-		ApprovalHold: 5 * time.Minute,
+		Probe:         5 * time.Second,
+		Connect:       3 * time.Second,
+		Provision:     120 * time.Second,
+		Exec:          30 * time.Second,
+		Setup:         30 * time.Second,
+		Collect:       30 * time.Second,
+		Drain:         200 * time.Millisecond,
+		Idle:          15 * time.Minute,
+		SessionTTL:    30 * time.Minute,
+		Cleanup:       10 * time.Second,
+		ApprovalHold:  5 * time.Minute,
+		BoundaryFresh: 30 * time.Minute,
 	}
 }
 
 // Option configures a handle. Options are applied in order, so WithLimits after
 // WithProfile wins: profile first, exceptions after.
 type Option func(*Config)
+
+// WithBoundaryMeasurement supplies a kernel-boundary measurement for admission to
+// reconcile against the provider's isolation claim.
+//
+// It exists because the tier a provider reports is a constant, and on real hosts that
+// constant is wrong in both directions: an engine that puts every box in its own VM
+// registered as container isolation under-reports, and one that shares a kernel while
+// claiming the VM tier cannot be caught at all. Handing in a measurement is how a caller
+// says "here is what this engine actually does, on this host, at this moment".
+//
+// Two directions, and only one of them is new:
+//
+//   - a private-kernel measurement admits a provider whose claim is below the floor, which
+//     is what makes WithMinimumIsolation(IsolationMicroVM) satisfiable on such an engine;
+//   - a shared-kernel measurement refuses a provider that claims the VM tier, which the
+//     claim alone would have allowed. Evidence against a claim is always honoured.
+//
+// The measurement is not free and is not taken here: obtain it from
+// Sandbox.MeasureKernelBoundary (or hno sandbox boundary --json) and pass it in. Admission
+// spends it only when it is about this provider, on this host, and younger than
+// Timeouts.BoundaryFresh -- a stale or third-party report is refused with a reason instead
+// of being quietly ignored.
+func WithBoundaryMeasurement(r KernelBoundaryReport) Option {
+	return func(c *Config) {
+		if r.Fixes == nil {
+			r.Fixes = []string{}
+		}
+		if r.Evidence == nil {
+			r.Evidence = []string{}
+		}
+		c.Boundary = &r
+	}
+}
 
 // WithProfile applies a named preset before any other option.
 func WithProfile(p Profile) Option { return func(c *Config) { c.ProfileName = p; applyProfile(c, p) } }

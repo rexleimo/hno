@@ -302,8 +302,12 @@ type RunRef struct {
 // Status describes a live sandbox handle: what it actually provides, not what
 // was asked for. CI asserts on this instead of on a version string (§5).
 type Status struct {
-	Provider     string
-	Isolation    Isolation
+	Provider  string
+	Isolation Isolation
+	// Boundary is the kernel measurement admission relied on, or nil when the provider's
+	// own claim decided. A caller who wanted a micro-VM floor and is running on a provider
+	// that claims container isolation needs to see the evidence, not just a pass.
+	Boundary     *KernelBoundaryReport
 	Capabilities CapabilitySet
 	// Image is the resolved environment reference.
 	Image string

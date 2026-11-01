@@ -419,9 +419,26 @@ func (sb *Sandbox) Diagnose(ctx context.Context) (*DiagReport, error) {
 	report := &DiagReport{Reached: sb.iso}
 	report.Checks = append(report.Checks, Check{Env: "provider", Want: sb.cfg.Provider, Got: sb.name, OK: sb.provider != nil})
 	report.Checks = append(report.Checks, Check{Env: "formation", Want: sb.cfg.Formation.String(), Got: sb.cfg.Formation.String(), OK: true})
-	report.Checks = append(report.Checks, Check{Env: "isolation", Want: sb.cfg.MinIsolation.String(), Got: sb.iso.String(), OK: sb.iso.AtLeast(sb.cfg.MinIsolation)})
-	if !sb.iso.AtLeast(sb.cfg.MinIsolation) {
-		report.Fixes = append(report.Fixes, fmt.Sprintf("require isolation %s or lower the profile floor", sb.cfg.MinIsolation))
+	// The isolation line has to agree with what admission actually did, or the health
+	// report contradicts the handle it describes: a provider admitted on measured
+	// evidence would show "isolation container, want microvm, FAIL" while running.
+	isoOK := sb.iso.AtLeast(sb.cfg.MinIsolation)
+	isoGot := sb.iso.String()
+	if sb.admittedBy != nil && sb.admittedBy.Verdict == BoundaryPrivateKernel {
+		if !isoOK {
+			isoOK = true
+			isoGot = fmt.Sprintf("%s claimed, %s measured (admitted on measurement)", sb.iso, sb.admittedBy.Verdict)
+		}
+	}
+	if sb.admittedBy != nil && sb.admittedBy.Verdict == BoundarySharedKernel && sb.iso.Rank() >= IsolationMicroVM.Rank() {
+		// Measured against the claim: the handle should not exist, and saying so is more
+		// useful than reporting a tier nobody can back.
+		isoOK = false
+		isoGot = fmt.Sprintf("%s claimed, %s measured", sb.iso, sb.admittedBy.Verdict)
+	}
+	report.Checks = append(report.Checks, Check{Env: "isolation", Want: sb.cfg.MinIsolation.String(), Got: isoGot, OK: isoOK})
+	if !isoOK {
+		report.Fixes = append(report.Fixes, fmt.Sprintf("require isolation %s or lower the profile floor, or supply a measurement that supports the floor", sb.cfg.MinIsolation))
 	}
 	caps := sb.caps.Strings()
 	report.Checks = append(report.Checks, Check{Env: "capabilities", Want: "non-empty", Got: fmt.Sprint(caps), OK: len(caps) > 0})
