@@ -5,7 +5,32 @@ All notable changes to Agno-Go will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.1.0] - 2026-11-01
+
+### ⚠️ 验证范围（发布前必须读）
+
+本次发版的真机验证在 **darwin/arm64** 上完成，Linux 真机未验证，原因已实测而非推测：
+
+- **在容器里跑不了 BoxLite**：本机 Apple containerisation 的 guest 里 `/dev/kvm` 不存在
+  （arm64 与 amd64 两个 guest 都测过，`grep -c "vmx\|svm" /proc/cpuinfo` 为 0）⇒ 无嵌套虚拟化，
+  `boxlite info` 会报 `virtualization: unavailable`，provider 会以 `UnavailableError` 拒绝而不是
+  假装可用。所以要验证 BoxLite 的 Linux 路径，需要 **真实 Linux 宿主 + KVM 可访问**。
+- 因此：**容器路径（docker provider）在 Linux 上有 CI 覆盖（ubuntu-latest，全量 `-race` 通过）；
+  BoxLite 路径的真机证据只有 darwin/arm64**（2 盒 ⇒ 2 个不同 `boot_id` ⇒ `private-kernel`）。
+  在 Linux 上首次使用 BoxLite 时，请先跑 `hno sandbox boundary --provider boxlite` 自证，
+  不要以本 changelog 的 macOS 数据代替。
+- 本机 `internal/session/store/postgres` 的 5 个用例失败是**宿主缺陷**（testcontainers 打到
+  Apple container 引擎报 `page not found: /networks`），CI ubuntu 上通过。
+
+### 🔧 Fixed (CI 门禁本身失效，导致全量测试从未真正执行)
+
+- `Run lint` 失败会让 `Run tests` 被 **skipped**：连续 5 次红跑里测试一次都没跑过。改为 lint
+  `continue-on-error` + 独立回报步骤，两个门禁始终各自出结论。
+- `golangci-lint` 用默认 1m 超时跑不完本仓库（`exit 4`，报错信息只说 "Timeout exceeded"）。提高到 10m。
+- 门禁恢复后立刻暴露两处真缺陷（均已修）：① `TestAppleDialectUsesItsOwnSurfaces` 断言宿主机 PATH
+  里存在 `container`，macOS 绿、Linux CI 红 —— 新增 `Config.AssumeInstalled`，注入 Runner 时宿主
+  PATH 不是证据；② `pubmed` 测试真实调用 NCBI，上游 500 即失败 —— 改为 `httptest` 本地替身，
+  并补双向断言（有响应必须有结果 / 上游 500 必须是 error）。两处都做过反证。
 
 ### 🚀 Added (B3 / D-41：BoxLite 微虚拟机 provider —— CLI 形状，零新依赖)
 
