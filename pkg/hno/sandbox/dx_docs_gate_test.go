@@ -339,7 +339,10 @@ func TestGuideAPINamesResolve(t *testing.T) {
 			if len(onlyBase) > 0 || len(onlyOther) > 0 {
 				sort.Strings(onlyBase)
 				sort.Strings(onlyOther)
-				t.Errorf("guide locales disagree on API references: %s lacks %v; %s lacks %v", rel, capList(onlyBase), rel, capList(onlyOther))
+				// Name the page each missing set belongs to. Printing `rel` twice made the
+				// English page's gaps read as the translated page's, which sends a reader to
+				// the wrong file.
+				t.Errorf("guide locales disagree on API references: %s lacks %v; %s lacks %v", rel, capList(onlyBase), guidePages[i], capList(onlyOther))
 			}
 		}
 	}
