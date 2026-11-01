@@ -2,17 +2,60 @@ package pubmed
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
+// pubmedServer stands in for NCBI E-utilities.
+//
+// The tests used to call eutils.ncbi.nlm.nih.gov for real, so the suite failed whenever
+// upstream answered 500 — observed on Linux CI, where these tests had never actually run
+// because a lint timeout skipped the test step. A test whose verdict depends on a
+// third-party service is not a test of this package.
+func pubmedServer(t *testing.T, status int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			return
+		}
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/esearch.fcgi"):
+			w.Header().Set("Content-Type", "text/xml")
+			_, _ = w.Write([]byte(`<eSearchResult><Count>2</Count><IdList><Id>111</Id><Id>222</Id></IdList></eSearchResult>`))
+		case strings.HasSuffix(r.URL.Path, "/esummary.fcgi"):
+			w.Header().Set("Content-Type", "text/xml")
+			_, _ = w.Write([]byte(`<eSummaryResult><DocSum><Id>111</Id>
+<Item Name="Title" Type="String">A study of cancer research</Item>
+<Item Name="FullJournalName" Type="String">Journal of Tests</Item>
+<Item Name="PubDate" Type="String">2024 Jan</Item>
+<Item Name="Author" Type="String">Doe J</Item>
+<Item Name="DOI" Type="String">10.1000/test</Item>
+</DocSum></eSummaryResult>`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func newTestToolkit(t *testing.T, status int) *PubMedToolkit {
+	t.Helper()
+	tk := New()
+	tk.baseURL = pubmedServer(t, status).URL
+	return tk
+}
+
 func TestPubMedToolkit_SearchArticles(t *testing.T) {
-	toolkit := New()
+	toolkit := newTestToolkit(t, http.StatusOK)
 
 	// Test searching for articles
 	result, err := toolkit.searchArticles(context.Background(), map[string]interface{}{
-		"query":        "cancer research",
-		"max_results":  5,
+		"query":       "cancer research",
+		"max_results": 5,
 	})
 
 	if err != nil {
@@ -68,7 +111,7 @@ func TestPubMedToolkit_SearchArticles(t *testing.T) {
 }
 
 func TestPubMedToolkit_GetArticleDetails(t *testing.T) {
-	toolkit := New()
+	toolkit := newTestToolkit(t, http.StatusOK)
 
 	// Test getting article details (using a known article ID)
 	result, err := toolkit.getArticleDetails(context.Background(), map[string]interface{}{
@@ -131,5 +174,32 @@ func TestPubMedToolkit_New(t *testing.T) {
 		if !found {
 			t.Errorf("Expected function '%s' not found", expected)
 		}
+	}
+}
+
+// The upstream 500 the suite used to depend on is now a controlled input: this is the
+// assertion that a failing API is reported as an error rather than as empty results.
+func TestSearchArticlesReportsAnUpstreamFailure(t *testing.T) {
+	tk := newTestToolkit(t, http.StatusInternalServerError)
+	if _, err := tk.searchArticles(context.Background(), map[string]interface{}{"query": "cancer"}); err == nil {
+		t.Fatal("an upstream 500 was reported as a successful search")
+	}
+}
+
+// And the reverse: a served page must actually populate results, so "no network" cannot
+// pass by returning an empty list.
+func TestSearchArticlesReadsAServedResponse(t *testing.T) {
+	tk := newTestToolkit(t, http.StatusOK)
+	out, err := tk.searchArticles(context.Background(), map[string]interface{}{"query": "cancer research"})
+	if err != nil {
+		t.Fatalf("searchArticles: %v", err)
+	}
+	m, _ := out.(map[string]interface{})
+	results, _ := m["results"].([]map[string]interface{})
+	if len(results) == 0 {
+		t.Fatal("a served esearch response produced no results")
+	}
+	if got, _ := results[0]["title"].(string); !strings.Contains(got, "cancer research") {
+		t.Fatalf("first result title = %q, want the served title", got)
 	}
 }

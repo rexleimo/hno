@@ -17,12 +17,30 @@ import (
 
 type PubMedToolkit struct {
 	*toolkit.BaseToolkit
+	// baseURL overrides the NCBI endpoint. Tests point it at an httptest server: this
+	// package's tests used to call eutils.ncbi.nlm.nih.gov for real, which made the suite
+	// fail whenever the upstream answered 500 (observed on Linux CI, where the same test
+	// had never actually run because a lint timeout skipped the test step).
+	baseURL string
+}
+
+// defaultBaseURL is the public NCBI endpoint.
+const defaultBaseURL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+// endpoint joins the configured base with one E-utilities script.
+func (p *PubMedToolkit) endpoint(script string) string {
+	base := p.baseURL
+	if base == "" {
+		base = defaultBaseURL
+	}
+	return strings.TrimSuffix(base, "/") + "/" + script
 }
 
 // New creates a new PubMed toolkit
 func New() *PubMedToolkit {
 	t := &PubMedToolkit{
 		BaseToolkit: toolkit.NewBaseToolkit("pubmed"),
+		baseURL:     defaultBaseURL,
 	}
 
 	// Register PubMed search function
@@ -79,8 +97,8 @@ type PubMedSummaryResponse struct {
 }
 
 type Doc struct {
-	ID    string   `xml:"Id,attr"`
-	Items []Item   `xml:"Item"`
+	ID    string `xml:"Id,attr"`
+	Items []Item `xml:"Item"`
 }
 
 type Item struct {
@@ -102,7 +120,7 @@ func (p *PubMedToolkit) searchArticles(ctx context.Context, args map[string]inte
 	}
 
 	// Build PubMed ESearch API URL
-	baseURL := "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+	baseURL := p.endpoint("esearch.fcgi")
 	params := url.Values{}
 	params.Add("db", "pubmed")
 	params.Add("term", query)
@@ -187,7 +205,7 @@ func (p *PubMedToolkit) getArticleSummaries(articleIDs []string) ([]map[string]i
 	}
 
 	// Build PubMed ESummary API URL
-	baseURL := "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+	baseURL := p.endpoint("esummary.fcgi")
 	params := url.Values{}
 	params.Add("db", "pubmed")
 	params.Add("id", strings.Join(articleIDs, ","))
