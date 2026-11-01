@@ -374,3 +374,13 @@ A2 = 让实测出的私有内核满足 IsolationMicroVM 准入。实现要点：
 反证：分别拆掉「收紧半边」与「放宽半边」，对应测试各自精确变红。
 
 覆盖 core 74.1%、cmd/hno 78.4%、docker 64.0%；-race 四包绿；docs:build 17.9s，中英各 14/14 slug 一致。
+
+## B6 完成记录（D-40：站点死链清零）
+
+把 ignoreDeadLinks 翻成 false 并修完 37 条（20 页面）。修法按语义分派：仓库文件→GitHub 绝对地址；
+有同话题真实页面→改指过去；从未存在过的示例广告→删行（不改写成别的意思）。
+反证先行：注入死链后构建 rc=1 并精确报文件，恢复后 rc=0。
+新增两道 Go 门：开关必须有门（TestSiteDeadLinksAreEnforced，注释行不算配置、读不到=Fatalf）、
+全站 840 条本地链接解析（TestSiteLinksResolve，先自检根、少于 100 条判空转）。
+分工：go test 覆盖文件目标与页内锚点（渲染器不校验 fragment），docs:build 覆盖渲染器能判的一切。
+真实引擎门复跑 44.6s 全绿、残留 0；-race 四包绿；docs:build 15.6s rc=0；覆盖 core 74.1%。
