@@ -580,5 +580,4 @@ Use standard A1 notation for ranges:
 ## Related Examples
 
 - [Simple Agent](/examples/simple-agent) - Calculator tool usage
-- [Search Agent](/examples/search-agent) - HTTP tool for web search
-- [File Agent](/examples/file-agent) - File operations
+- [File Agent](/guide/sandboxed-file-io) - File operations

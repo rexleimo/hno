@@ -535,5 +535,4 @@ func main() {
 ## 관련 예제
 
 - [Simple Agent](/examples/simple-agent) - Calculator 도구 사용
-- [Search Agent](/examples/search-agent) - 웹 검색을 위한 HTTP 도구
-- [File Agent](/examples/file-agent) - 파일 작업
+- [File Agent](/guide/sandboxed-file-io) - 파일 작업

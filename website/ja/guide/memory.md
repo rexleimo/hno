@@ -513,5 +513,4 @@ func (sm *SessionManager) EndSession(sessionID string) {
 ## 関連例
 
 - [Simple Agent](/examples/simple-agent) - 基本的なメモリ使用
-- [Multi-Turn Chat](/examples/chat-agent) - 会話例
-- [Session Management](/examples/session-demo) - セッションベースのメモリ
+- [Session Management](/guide/session-state) - セッションベースのメモリ

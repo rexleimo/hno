@@ -549,5 +549,4 @@ func main() {
 ## 相关示例
 
 - [Simple Agent](/examples/simple-agent) - Calculator 工具使用
-- [Search Agent](/examples/search-agent) - HTTP 工具进行网络搜索
-- [File Agent](/examples/file-agent) - 文件操作
+- [File Agent](/guide/sandboxed-file-io) - 文件操作

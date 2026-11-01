@@ -98,7 +98,7 @@ server.Shutdown(ctx)
 
 ## APIエンドポイント
 
-完全なAPIドキュメントは[OpenAPI仕様](../../pkg/agentos/openapi.yaml)を参照してください。
+完全なAPIドキュメントは[OpenAPI仕様](https://github.com/rexleimo/hno/blob/main/pkg/agentos/openapi.yaml)を参照してください。
 
 **コアエンドポイント:**
 - `GET /health` - ヘルスチェック

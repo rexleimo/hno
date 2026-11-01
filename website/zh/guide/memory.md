@@ -513,5 +513,4 @@ func (sm *SessionManager) EndSession(sessionID string) {
 ## 相关示例
 
 - [Simple Agent](/examples/simple-agent) - 基础记忆使用
-- [Multi-Turn Chat](/examples/chat-agent) - 对话示例
-- [Session Management](/examples/session-demo) - 基于会话的记忆
+- [Session Management](/guide/session-state) - 基于会话的记忆

@@ -535,6 +535,4 @@ func main() {
 ## 関連例
 
 - [Simple Agent](/examples/simple-agent) - Calculator toolの使用
-- [Search Agent](/examples/search-agent) - Web検索用のHTTP tool
-- [File Agent](/examples/file-agent) - ファイル操作
-- [Google Sheets Agent](/examples/googlesheets-agent) - Google Sheets統合
+- [File Agent](/guide/sandboxed-file-io) - ファイル操作

@@ -565,9 +565,9 @@ a2aInterface.RegisterEntity("your-agent-id", agent)
 
 ## 相关文档
 
-- [会话状态管理](session-state) - 会话状态管理
-- [多租户支持](multi-tenant) - 多租户支持
-- [架构设计](../architecture) - 架构设计
+- [会话状态管理](/guide/session-state) - 会话状态管理
+- [多租户支持](/advanced/multi-tenant) - 多租户支持
+- [架构设计](/advanced/architecture) - 架构设计
 
 ## 版本历史
 

@@ -149,7 +149,7 @@ toolkit, err := mcptoolkit.New(ctx, mcptoolkit.Config{
 ## 다음 단계 | Next Steps
 
 - [MCP 데모](../examples/mcp-demo.md)를 시도해보세요
-- [MCP 구현 가이드](../../pkg/hno/mcp/IMPLEMENTATION.md)를 읽어보세요
+- [MCP 구현 가이드](https://github.com/rexleimo/hno/blob/main/pkg/hno/mcp/IMPLEMENTATION.md)를 읽어보세요
 - [MCP 프로토콜 사양](https://spec.modelcontextprotocol.io/)을 탐색하세요
 - [GitHub](https://github.com/rexleimo/agno-go/discussions)에서 토론에 참여하세요
 

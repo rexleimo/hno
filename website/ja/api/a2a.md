@@ -490,7 +490,7 @@ a2aInterface.RegisterEntity("your-agent-id", agent)
 
 - [セッション状態管理](/ja/guide/session-state) - セッション状態管理
 - [マルチテナントサポート](/ja/advanced/multi-tenant) - マルチテナントサポート
-- [アーキテクチャ設計](/ja/architecture) - アーキテクチャ設計
+- [アーキテクチャ設計](/advanced/architecture) - アーキテクチャ設計
 
 ---
 

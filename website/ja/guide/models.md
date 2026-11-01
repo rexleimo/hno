@@ -701,7 +701,7 @@ func init() {
 - 会話履歴については[Memory](/guide/memory)を参照
 - 混合モデルで[Teams](/guide/team)を構築
 - 実際の使用法については[Examples](/examples/)を参照
-- 推論機能については[Reasoning](/guide/reasoning)を参照
+- 推論機能については[Reasoning](/guide/models)を参照
 
 ---
 
@@ -711,4 +711,3 @@ func init() {
 - [Claude Agent](/examples/claude-agent) - Anthropicの例
 - [GLM Agent](/examples/glm-agent) - GLM (智谱AI)の例
 - [Ollama Agent](/examples/ollama-agent) - ローカルモデルの例
-- [Reasoning Agent](/examples/reasoning-agent) - 推論モデルの例

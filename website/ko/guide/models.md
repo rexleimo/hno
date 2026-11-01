@@ -696,7 +696,7 @@ func init() {
 - 대화 히스토리를 위한 [Memory](/guide/memory) 배우기
 - 혼합 모델로 [Teams](/guide/team) 구축
 - 실제 사용을 위한 [Examples](/examples/) 탐색
-- 추론 기능을 위한 [Reasoning](/guide/reasoning) 참조
+- 추론 기능을 위한 [Reasoning](/guide/models) 참조
 
 ---
 
@@ -706,4 +706,3 @@ func init() {
 - [Claude Agent](/examples/claude-agent) - Anthropic 예제
 - [GLM Agent](/examples/glm-agent) - GLM (智谱AI) 예제
 - [Ollama Agent](/examples/ollama-agent) - 로컬 모델 예제
-- [Reasoning Agent](/examples/reasoning-agent) - 추론 모델 예제

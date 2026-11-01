@@ -490,7 +490,7 @@ a2aInterface.RegisterEntity("your-agent-id", agent)
 
 - [세션 상태 관리](/ko/guide/session-state) - 세션 상태 관리
 - [멀티 테넌트 지원](/ko/advanced/multi-tenant) - 멀티 테넌트 지원
-- [아키텍처 설계](/ko/architecture) - 아키텍처 설계
+- [아키텍처 설계](/advanced/architecture) - 아키텍처 설계
 
 ---
 

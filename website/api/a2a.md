@@ -565,9 +565,9 @@ a2aInterface.RegisterEntity("your-agent-id", agent)
 
 ## Related Documentation
 
-- [Session State Management](session-state) - Session state management
-- [Multi-Tenant Support](multi-tenant) - Multi-tenant support
-- [Architecture Design](../architecture) - Architecture design
+- [Session State Management](/guide/session-state) - Session state management
+- [Multi-Tenant Support](/advanced/multi-tenant) - Multi-tenant support
+- [Architecture Design](/advanced/architecture) - Architecture design
 
 ## Version History
 

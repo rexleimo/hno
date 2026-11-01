@@ -98,7 +98,7 @@ server.Shutdown(ctx)
 
 ## API Endpoints
 
-See [OpenAPI Specification](../../pkg/agentos/openapi.yaml) for complete API documentation.
+See [OpenAPI Specification](https://github.com/rexleimo/hno/blob/main/pkg/agentos/openapi.yaml) for complete API documentation.
 
 **Core Endpoints:**
 - `GET /health` - Health check

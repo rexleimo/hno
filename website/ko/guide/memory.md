@@ -513,5 +513,4 @@ func (sm *SessionManager) EndSession(sessionID string) {
 ## 관련 예제
 
 - [Simple Agent](/examples/simple-agent) - 기본 메모리 사용
-- [Multi-Turn Chat](/examples/chat-agent) - 대화 예제
-- [Session Management](/examples/session-demo) - 세션 기반 메모리
+- [Session Management](/guide/session-state) - 세션 기반 메모리

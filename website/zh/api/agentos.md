@@ -98,7 +98,7 @@ server.Shutdown(ctx)
 
 ## API 端点 / API Endpoints
 
-查看完整的 API 文档请参阅 [OpenAPI 规范](../../pkg/agentos/openapi.yaml)。/ See [OpenAPI Specification](../../pkg/agentos/openapi.yaml) for complete API documentation.
+查看完整的 API 文档请参阅 [OpenAPI 规范](https://github.com/rexleimo/hno/blob/main/pkg/agentos/openapi.yaml)。/ See [OpenAPI Specification](https://github.com/rexleimo/hno/blob/main/pkg/agentos/openapi.yaml) for complete API documentation.
 
 **核心端点 / Core Endpoints:**
 - `GET /health` - 健康检查 / Health check

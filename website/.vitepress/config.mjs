@@ -5,7 +5,7 @@ export default defineConfig({
   title: "HNO",
   description: "Multi-agent system framework built with Go",
   base: '/',
-  ignoreDeadLinks: true,
+  ignoreDeadLinks: false,
   sitemap: { hostname: 'https://hno.rexai.top/' },
 
   head: [

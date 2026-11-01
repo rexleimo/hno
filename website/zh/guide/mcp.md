@@ -296,7 +296,7 @@ Current implementation status:
 ## 下一步 | Next Steps
 
 - 尝试 [MCP 演示示例](../examples/mcp-demo.md) | Try the [MCP Demo Example](../examples/mcp-demo.md)
-- 阅读 [MCP 实现指南](../../pkg/hno/mcp/IMPLEMENTATION.md) | Read the [MCP Implementation Guide](../../pkg/hno/mcp/IMPLEMENTATION.md)
+- 阅读 [MCP 实现指南](https://github.com/rexleimo/hno/blob/main/pkg/hno/mcp/IMPLEMENTATION.md) | Read the [MCP Implementation Guide](https://github.com/rexleimo/hno/blob/main/pkg/hno/mcp/IMPLEMENTATION.md)
 - 探索 [MCP 协议规范](https://spec.modelcontextprotocol.io/) | Explore the [MCP Protocol Specification](https://spec.modelcontextprotocol.io/)
 - 在 [GitHub](https://github.com/rexleimo/HNO/discussions) 上参与讨论 | Join discussions on [GitHub](https://github.com/rexleimo/HNO/discussions)
 

@@ -98,7 +98,7 @@ server.Shutdown(ctx)
 
 ## API 엔드포인트
 
-완전한 API 문서는 [OpenAPI 명세](../../pkg/agentos/openapi.yaml)를 참고하세요.
+완전한 API 문서는 [OpenAPI 명세](https://github.com/rexleimo/hno/blob/main/pkg/agentos/openapi.yaml)를 참고하세요.
 
 **핵심 엔드포인트:**
 - `GET /health` - 헬스 체크
