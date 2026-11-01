@@ -4,6 +4,10 @@
 一次性运行与长生命周期会话共用。本页描述运行时**实际上**报告的内容——下面的数字是解析后的
 默认值，`pkg/hno/sandbox/dx_gate_test.go` 里有一条测试会在表格与代码漂移时失败。
 
+**想按「先写文件 → 再执行 → 让结果驱动下一步」的顺序上手？** 先看
+[Agent 边写边跑](/zh/guide/agent-sandbox-quickstart)，它列出四个必要前提（注册 provider、
+引擎可执行文件、本地镜像、`WithCreateIfMissing`）并给出四个可跑通的实例。
+
 如果你在用 `pkg/hno/tools/run` 的 `code_execution`，遗留 `Executor` 接口见
 [Sandbox 代码执行](/zh/guide/code-execution-sandbox)，兼容适配器见下面的
 [从遗留 Executor 迁移](#从遗留-executor-迁移)。

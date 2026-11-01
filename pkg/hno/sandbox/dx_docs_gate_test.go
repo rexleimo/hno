@@ -36,6 +36,12 @@ import (
 var guidePages = []string{
 	"../../../website/guide/sandbox-runtime.md",
 	"../../../website/zh/guide/sandbox-runtime.md",
+	// The task-oriented walkthrough. It is gated by the same rules as the reference
+	// page: every API name it mentions must exist, and both locales must mention the
+	// same set — a tutorial that drifts from the code teaches the wrong thing faster
+	// than a reference page does.
+	"../../../website/guide/agent-sandbox-quickstart.md",
+	"../../../website/zh/guide/agent-sandbox-quickstart.md",
 }
 
 func guidePath(t *testing.T, rel string) string {
@@ -53,7 +59,14 @@ func guidePath(t *testing.T, rel string) string {
 // forEachGuide runs fn once per documented page, with the page name in the subtest.
 func forEachGuide(t *testing.T, fn func(t *testing.T, lines []string, page string)) {
 	t.Helper()
-	for _, rel := range guidePages {
+	forEachGuides(t, guidePages, fn)
+}
+
+// forEachGuides runs fn over an explicit page list, for gates that apply to a subset
+// (for example the resolved-defaults table, which belongs to the reference page).
+func forEachGuides(t *testing.T, pages []string, fn func(t *testing.T, lines []string, page string)) {
+	t.Helper()
+	for _, rel := range pages {
 		rel := rel
 		t.Run(strings.ReplaceAll(rel, "../", ""), func(t *testing.T) {
 			p := guidePath(t, rel)
@@ -112,8 +125,16 @@ func docValue(v any) string {
 	}
 }
 
+// defaultsPages are the pages that carry the resolved-defaults table. The table is a
+// reference artifact, so a task-oriented walkthrough must not be forced to duplicate it:
+// requiring every documentation page to copy the same table would make the gate fail for
+// the right reason on the wrong page, and inviting a copy is how two tables start to drift.
+func defaultsPages() []string {
+	return guidePages[:2]
+}
+
 func TestGuideNumbersMatchResolvedDefaults(t *testing.T) {
-	forEachGuide(t, func(t *testing.T, lines []string, page string) {
+	forEachGuides(t, defaultsPages(), func(t *testing.T, lines []string, page string) {
 		rows := map[string]string{}
 		for _, ln := range lines {
 			if !strings.HasPrefix(ln, "| ") {
@@ -186,6 +207,22 @@ func surfaceOf(t *testing.T, dir string) pkgSurface {
 						case *ast.TypeSpec:
 							if exportedNameRe.MatchString(sp.Name.Name) {
 								s.names[sp.Name.Name] = true
+								// An interface's methods are exported capability too. The gate
+								// only knew struct fields, so documenting sess.Files() —
+								// FileService.Write/MkdirAll/Read — was reported as an invented
+								// method even though the API exists.
+								if it, ok := sp.Type.(*ast.InterfaceType); ok {
+									if s.members[sp.Name.Name] == nil {
+										s.members[sp.Name.Name] = map[string]bool{}
+									}
+									for _, m := range it.Methods.List {
+										for _, n := range m.Names {
+											if exportedNameRe.MatchString(n.Name) {
+												s.members[sp.Name.Name][n.Name] = true
+											}
+										}
+									}
+								}
 								if st, ok := sp.Type.(*ast.StructType); ok {
 									if s.members[sp.Name.Name] == nil {
 										s.members[sp.Name.Name] = map[string]bool{}
@@ -278,9 +315,15 @@ func TestGuideAPINamesResolve(t *testing.T) {
 	}
 	// Locales must not drift in API coverage: a translated page that quietly drops an
 	// option leaves readers of that locale with an incomplete contract.
-	if len(guidePages) > 1 {
-		base := seenPerPage[guidePages[0]]
-		for _, rel := range guidePages[1:] {
+	//
+	// The comparison is per page pair, not across the whole list. Comparing every page to
+	// guidePages[0] made adding a task-oriented walkthrough impossible: a tutorial and a
+	// reference page legitimately mention different subsets, and the gate reported each
+	// page as "lacking" the other page's subjects.
+	for i := 0; i+1 < len(guidePages); i += 2 {
+		base := seenPerPage[guidePages[i]]
+		rel := guidePages[i+1]
+		{
 			other := seenPerPage[rel]
 			var onlyBase, onlyOther []string
 			for k := range base {

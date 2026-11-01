@@ -5,6 +5,28 @@ All notable changes to Agno-Go will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### 📖 Docs (新增任务型教程，并修掉三处门禁自身的盲点)
+
+用户反馈文档说不清两件事：Agent 生成过程中怎么写入、写完之后怎么驱动下一步；以及「装了依赖
+就能用吗」。新增 `website/guide/agent-sandbox-quickstart.md` 与中文版（侧栏可点、与参考页互链），
+内容全部**真机跑通后**才写进去：
+
+- **前置条件四条**，每条附实测报错原文：① provider 必须显式 `Register()`（否则 `Open` 报
+  `docker: not registered`）；② 宿主需引擎二进制且选对名字（macOS 上 `WithAttrs{"binary":"container"}`）；
+  ③ 首次 `Session` 必须 `WithCreateIfMissing(true)`；④ 镜像要已在本地（`doctor` 会 FAIL 并给拉取指引）。
+- **写入通道三种**：`sess.Files()`、请求内联 `Inputs`、工作区来源
+  `FromDir/FromArchive/FromGit/FromImage`；并说明 `RecordInput` 是「能跑一次」与「可复现」的分界。
+- **四个场景**：写后跑、边生成边 `vet`、失败分类 + sink 实时驱动下一步、`RunProject`
+  多阶段 + 产物回收（实测 `artifact out.txt = "5\n"`）。
+- 记录两个真实坑：缺 `go.mod` 直接报模块错误；`cmd | head` 会**吃掉退出码**，编译失败显示成
+  `exit=0`——这正是让 Agent 绿灯放过坏项目的形状。
+
+顺带修掉三处**门禁自身**的缺陷（加教程时暴露）：fenced-method 门的符号宇宙不收接口方法
+（`FileService.MkdirAll/Write/Read` 被判编造）；语言对照拿所有页比第一页（加教程必冲突，改成同页配对）；
+默认值表门要求每页复制 `Limits`/`Timeouts` 表（改为 `defaultsPages()` 限定参考页）。
+
 ## [3.1.1] - 2026-11-01
 
 ### 🧾 Fixed (事实更正：BoxLite 的 Go SDK 从 v0.11.0 起存在)

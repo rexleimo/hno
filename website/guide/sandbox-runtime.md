@@ -5,6 +5,11 @@ vocabulary, shared by one-shot runs and long-lived sessions. This page describes
 runtime actually reports — the numbers below are the resolved defaults, and a test in
 `pkg/hno/sandbox/dx_gate_test.go` fails if the table drifts from the code.
 
+**Want the task-oriented version — write files, then run, then let the result drive the next
+step?** Read [Agent: write, then run](/guide/agent-sandbox-quickstart) first; it states the four
+prerequisites (provider registration, engine binary, local image, `WithCreateIfMissing`) and
+shows four worked examples.
+
 If you are using `code_execution` from `pkg/hno/tools/run`, see
 [Sandbox code execution](/guide/code-execution-sandbox) for the legacy `Executor` surface, and
 [From the legacy executor](#from-the-legacy-executor) below for the compatibility adapter.
