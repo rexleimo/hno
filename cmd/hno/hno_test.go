@@ -693,3 +693,58 @@ func TestIsolationVocabularyRoundTrips(t *testing.T) {
 		}
 	}
 }
+
+// A2 (D-39) at the command line: --measure-boundary is the only path from "the engine's
+// claim is below my floor" to "the run happened", so it has to be reachable without a Go
+// program -- and it has to be the thing that decided, not a coincidence.
+
+// TestMeasureBoundaryMakesAMicroVMTierReachable drives the whole exchange: without the
+// flag the floor is refused, with it the measured verdict decides.
+func TestMeasureBoundaryMakesAMicroVMTierReachable(t *testing.T) {
+	// The double shares one kernel between everything it hands out, so the honest verdict
+	// here is shared-kernel: this asserts that the CLI reports a refusal rather than
+	// pretending the flag fixed anything.
+	bndFixture.BoundaryReport = nil
+	code, stdout, stderr := runBoundary()
+	if code != 0 || !strings.Contains(stdout, "shared-kernel") {
+		t.Fatalf("baseline measurement: exit %d\n%s\n%s", code, stdout, stderr)
+	}
+
+	var out, errOut bytes.Buffer
+	code = sandboxMain([]string{
+		"run", "--provider", boundaryProviderName, "--isolation", "microvm",
+		"--measure-boundary", "--shell", "true",
+	}, &out, &errOut)
+	if code == exitOK {
+		t.Fatalf("a shared-kernel engine satisfied a microvm floor through the CLI:\n%s", out.String())
+	}
+	// The refusal has to name the measurement, not just the floor: otherwise an operator
+	// cannot tell "measured and rejected" from "never measured".
+	combined := out.String() + errOut.String()
+	if !strings.Contains(combined, "measured kernel boundary: shared-kernel") && !strings.Contains(combined, "shared kernel") {
+		t.Errorf("the refusal does not mention what was measured:\n%s", combined)
+	}
+}
+
+// TestMeasureBoundaryFlagNamesTheCost: the flag starts boxes, so its help has to say so
+// rather than looking like a free verification.
+func TestMeasureBoundaryFlagNamesTheCost(t *testing.T) {
+	// Read the shipped registration, not a copy: the first version of this test built its
+	// own FlagSet, asserted on an empty usage string it had just written, and failed while
+	// proving nothing either way.
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	registerVerbFlags(fs)
+	f := fs.Lookup("measure-boundary")
+	if f == nil {
+		t.Fatalf("--measure-boundary is not registered")
+	}
+	if !strings.Contains(f.Usage, "boxes") {
+		t.Errorf("help %q does not warn that measuring starts boxes", f.Usage)
+	}
+	// And the flags a caller needs in order to use it are registered too.
+	for _, name := range []string{"isolation", "provider", "image"} {
+		if fs.Lookup(name) == nil {
+			t.Errorf("--%s missing from the shipped flag set", name)
+		}
+	}
+}

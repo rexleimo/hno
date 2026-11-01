@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ✨ Added (B5b / D-39：A2 生效——实测可放宽准入)
+- 新选项 **`sandbox.WithBoundaryMeasurement(report)`**：准入由 `admitBoundary` 双向裁决。
+  **放宽**：`private-kernel` 可放行声称低于下限的 provider（本机 `IsolationMicroVM` 从 **exit 70 → exit 0**）。
+  **收紧**：`shared-kernel` + 声称 ≥ micro-VM ⇒ 拒绝（单靠声称本会通过）。
+- 放宽需**三证齐全**：`report.Provider` 与当前 provider 一致、`report.HostKernel` 与本进程宿主一致、
+  `MeasuredAt` 在 `Timeouts.BoundaryFresh` 内；任一不成立则**不提升**，并指明是三条里的哪一条
+  （首版丢掉原因、只回泛泛的 "below required" 并让人去测量——而他已经测过）。
+- `KernelBoundaryReport.Provider` 记录测量来源；`Status.Boundary` 携带准入所依据的证据，
+  `Status.Isolation` **仍报 provider 自己的声称**（改写声称等于宣称引擎换了性质）。
+- `Diagnose` 的 `isolation` 行与准入结论一致：「container claimed, private-kernel measured」。
+- `Timeouts.BoundaryFresh`（默认 30m）：测量作为放行理由的有效期。**0 解析为默认**——`WithTimeouts`
+  是整体替换，只写 Setup/Exec 的调用方会拿到 0，而 0 会拒掉刚测出的报告；负数=每次 Open 重测。
+- CLI 新 flag **`--measure-boundary`**（run/doctor，会先起盒）；verb flag 注册提取为
+  `registerVerbFlags`，帮助文本可被测试直接读取（不再由测试自造副本）。
+
+### 🐛 Fixed（本轮被自己的测试/真机抓出）
+- `BoundaryFresh` 负值被实现成「永不过期」，与文档承诺的「每次 Open 重测」相反。
+- 证据不成立时（别的引擎/别的宿主/过期）丢弃原因，导致提示让人去重测一台已测好的引擎。
+- 真机测试漏注册 provider 且未带 `--binary` 属性；抽出 `realOptions` 供全部真实门共用，避免再漂移。
+- 一个 CLI 测试自建 FlagSet、断言自己写的空 usage（空转）——改为读取发布的注册。
+
 ### ✨ Added (B5a / D-38：隔离档位改为实测)
 - 新可选接口 **`sandbox.KernelBoundaryQueryable`**（`MeasureKernelBoundary(ctx, boxes)`）：provider 起若干盒、
   读每盒 `/proc/sys/kernel/random/boot_id` + `/proc/uptime` + `uname -sr`，**由读数**判定档位。

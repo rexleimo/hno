@@ -183,6 +183,41 @@ func TestRealLostEnvironmentFault(t *testing.T) {
 
 // requireRealEngine opens a handle against the real daemon, or skips with a
 // reason that says which gate was not met.
+// realOptions is the option set every real-engine test opens with. It exists so a second
+// test cannot drift from the first: the binary attribute and the widened timeouts are what
+// make these tests work against a real engine, and a copy of them that forgot one would
+// fail for a reason unrelated to what it tests.
+//
+// Timeouts is a whole-struct replacement, so every field that matters has to be named here.
+// BoundaryFresh is named explicitly for that reason.
+func realOptions(t *testing.T, image string, floor sandbox.Isolation, extra ...sandbox.Option) []sandbox.Option {
+	t.Helper()
+	def := sandbox.DefaultTimeouts()
+	opts := []sandbox.Option{
+		sandbox.WithProvider("docker"),
+		sandbox.WithAllowedProviders("docker"),
+		sandbox.WithImage(image),
+		sandbox.WithMinimumIsolation(floor),
+		sandbox.WithAttrs(map[string]any{"binary": dockerBinary()}),
+		sandbox.WithTimeouts(sandbox.Timeouts{
+			Probe:         def.Probe,
+			Connect:       def.Connect,
+			Provision:     def.Provision,
+			Setup:         3 * time.Minute, // container start plus module resolution
+			Exec:          5 * time.Minute,
+			Collect:       def.Collect,
+			Drain:         def.Drain,
+			Idle:          def.Idle,
+			SessionTTL:    def.SessionTTL,
+			Cleanup:       def.Cleanup,
+			ApprovalHold:  def.ApprovalHold,
+			BoundaryFresh: def.BoundaryFresh,
+		}),
+		sandbox.WithLimits(sandbox.Limits{OutputMaxBytes: 8 << 20}),
+	}
+	return append(opts, extra...)
+}
+
 func requireRealEngine(t *testing.T, ctx context.Context) *sandbox.Sandbox {
 	t.Helper()
 	if os.Getenv("HNO_SANDBOX_DOCKER") == "" {
@@ -195,18 +230,7 @@ func requireRealEngine(t *testing.T, ctx context.Context) *sandbox.Sandbox {
 	if err := Register(); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	sb, err := sandbox.Open(ctx,
-		sandbox.WithProvider("docker"),
-		sandbox.WithAllowedProviders("docker"),
-		sandbox.WithImage(image),
-		sandbox.WithMinimumIsolation(sandbox.IsolationContainer),
-		sandbox.WithAttrs(map[string]any{"binary": dockerBinary()}),
-		sandbox.WithTimeouts(sandbox.Timeouts{
-			Setup: 3 * time.Minute, // container start plus module resolution
-			Exec:  5 * time.Minute,
-		}),
-		sandbox.WithLimits(sandbox.Limits{OutputMaxBytes: 8 << 20}),
-	)
+	sb, err := sandbox.Open(ctx, realOptions(t, image, sandbox.IsolationContainer)...)
 	if err != nil {
 		t.Fatalf("Open against %s: %v", image, err)
 	}
@@ -901,5 +925,86 @@ func TestRealKernelBoundaryIsMeasured(t *testing.T) {
 	}
 	if !c.OK {
 		t.Errorf("the floor this handle was opened with is container isolation, which either verdict satisfies, yet the check failed: %+v", c)
+	}
+}
+
+// TestRealMeasuredBoundaryAdmitsTheMicroVMTier is A2 against the live engine (D-39).
+//
+// The docker provider claims IsolationContainer, so a micro-VM floor is refused on the
+// claim alone -- that refusal is asserted first, because without it the rest of the test
+// would pass on a machine where the floor was never enforced. Then the same floor is
+// attempted with the measurement this engine actually produced, and the run has to happen.
+//
+// What is *not* asserted: that the measurement says private-kernel. It does on this host
+// (a VM per box), but a shared-kernel engine would make this test's second half fail for a
+// legitimate reason, and an integration gate that only passes on one machine is a record of
+// that machine. The verdict is checked for internal consistency in
+// TestRealKernelBoundaryIsMeasured; here it is only used as evidence.
+func TestRealMeasuredBoundaryAdmitsTheMicroVMTier(t *testing.T) {
+	ctx := context.Background()
+	if os.Getenv("HNO_SANDBOX_DOCKER") == "" {
+		t.Skip("B2 real-engine gate not exercised: set HNO_SANDBOX_DOCKER=1")
+	}
+	if err := Register(); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Baseline on the real engine: the floor cannot be met by the claim.
+	refused, err := sandbox.Open(ctx, realOptions(t, testImage(t), sandbox.IsolationMicroVM)...)
+	if err == nil {
+		_ = refused.Close()
+		t.Skip("this engine claims the micro-VM tier itself, so there is no gap for the measurement to close")
+	}
+	if !strings.Contains(err.Error(), "microvm") {
+		t.Fatalf("refusal is about something other than the floor: %v", err)
+	}
+	// The refusal has to point at the way out, or the operator is stuck with "no".
+	if !strings.Contains(err.Error(), "WithBoundaryMeasurement") {
+		t.Errorf("refusal does not mention the option that would satisfy it:\n%v", err)
+	}
+
+	// Measure on a handle with no floor to argue about, then re-open with the evidence.
+	probe := requireRealEngine(t, ctx)
+	report, err := probe.MeasureKernelBoundary(ctx, 2)
+	if err != nil {
+		t.Fatalf("measure: %v", err)
+	}
+	if report.Verdict != sandbox.BoundaryPrivateKernel {
+		t.Skipf("this engine measured %s, so it cannot satisfy a micro-VM floor and refusing it is correct", report.Verdict)
+	}
+
+	sb, err := sandbox.Open(ctx, realOptions(t, testImage(t), sandbox.IsolationMicroVM,
+		sandbox.WithBoundaryMeasurement(*report))...)
+	if err != nil {
+		t.Fatalf("a measured private kernel did not admit a micro-VM floor on the live engine: %v", err)
+	}
+	defer sb.Close()
+
+	st := sb.Status()
+	if st.Boundary == nil {
+		t.Fatalf("Status carries no measurement, so nothing explains why this handle was allowed")
+	}
+	if st.Isolation != sandbox.IsolationContainer {
+		t.Errorf("Status.Isolation = %q; the provider's own claim has to stay visible next to the evidence", st.Isolation)
+	}
+
+	rep, err := sb.Run(ctx, sandbox.Shell("go version"))
+	if err != nil {
+		t.Fatalf("run on a handle admitted by measurement: %v", err)
+	}
+	if rep.ExitCode != 0 || !strings.Contains(rep.Stdout, "go version") {
+		t.Errorf("run did not execute: exit %d stdout %q", rep.ExitCode, rep.Stdout)
+	}
+
+	diag, err := sb.Diagnose(ctx)
+	if err != nil {
+		t.Fatalf("diagnose: %v", err)
+	}
+	c, hit := findCheckNamed(diag, "isolation")
+	if !hit || !c.OK {
+		t.Fatalf("the health report contradicts admission: %+v", c)
+	}
+	if !strings.Contains(c.Got, "measured") {
+		t.Errorf("isolation line %q does not say the floor was met on measurement", c.Got)
 	}
 }
