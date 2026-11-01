@@ -384,3 +384,37 @@ A2 = 让实测出的私有内核满足 IsolationMicroVM 准入。实现要点：
 全站 840 条本地链接解析（TestSiteLinksResolve，先自检根、少于 100 条判空转）。
 分工：go test 覆盖文件目标与页内锚点（渲染器不校验 fragment），docs:build 覆盖渲染器能判的一切。
 真实引擎门复跑 44.6s 全绿、残留 0；-race 四包绿；docs:build 15.6s rc=0；覆盖 core 74.1%。
+
+## B3 完成记录（D-41：BoxLite provider，CLI 形状）
+
+**先纠正前提。** 早前把 B3 记成「macOS 无 /dev/kvm 所以做不了」是错的：本机 `container`/`docker`
+起的每个盒子都有自己的内核（4 盒 4 个 boot_id），HVF 是合法的微虚拟机基座，`boxlite info` 实测
+`virtualization: available`。真正的阻塞是「模块/二进制尚未引入」+「镜像源出网」。
+
+**上游文档不是证据。** 设计与 README 都写 `go get github.com/boxlite-ai/boxlite/sdks/go`（CGO），
+实测 v0.5.14 / 0.8.2 / 0.9.7 / 0.10.8 / 0.11.0 只发布 `sdks/{c,node,python}`，唯一 `sdks/go` 命中是
+`apps/e2e/sdks/go` 的端到端测试程序，仓库根无 `go.mod`（代理合成空壳），`go get` ⇒ does not contain
+package。故接入走 CLI：零新依赖、无 CGO、无 Rust 工具链。
+
+**真机实测（v0.11.0 darwin-arm64，release tarball + SHA256SUMS 双校验通过）**：
+`boxlite run alpine sh -c …` ⇒ guest `Linux 6.12.87`；两次启动 boot_id 不同、uptime 0.13s；
+payload `exit 7` ⇒ CLI exit 7。唯一出网障碍是 `index.docker.io` 25s 超时，换镜像源（`/v2/` 返回 401
+即可达）后拉取正常。
+
+**真机门抓出的三个引擎契约缺陷**（每个都修复并配一条单测锁死）：
+1. `exec` 不带 `-i` 时 guest `sh -s` 读不到 stdin/EOF ⇒ **挂死**，并持有 `BOXLITE_HOME` 排他锁，
+   遗留进程 5 分钟后仍占用，后续所有调用报 lock（实测，需 kill 才能恢复）。
+2. `rm` 不带 `-f` 对运行中 box 报成功而 box 仍在 ⇒ **静默泄漏**（`rm --force` 才真删）。
+3. `create --registry` 不写进 box 记录 ⇒ `start` 回退默认源；镜像引用必须由 provider 自己补全。
+另：`create` 无 `--detach`（传了会被当作可执行文件）；CLI 无 label（文档 0 命中）⇒ 归属不可证明。
+
+**设计落地**：能力只报 `session/streaming/port-forward/egress-allowlist`；`Probe` 问引擎而非按
+`GOOS` 分支（"没回答" ≠ "通过"）；`Prune` 拒绝并由 `SkippedPrune()` 说出原因；
+CLI 调用串行化；镜像引用自动补镜像源。验收目标 Linux（不硬编码，靠引擎自答）。
+
+**证据**：真机门 3/3 PASS / 28.4s（round-trip + exit 7 归类、2 box ⇒ 2 个不同 boot_id ⇒
+`private-kernel`、测量不残留）；CLI 面 `doctor --provider boxlite` 9 项、
+`boundary --provider boxlite` ⇒ private-kernel、`run -shell 'exit 3'` ⇒ rc=3；boxlite 侧残留 0。
+反证：去掉 `-i` / 去掉 `--force` / 去掉镜像源补全 ⇒ 各自精确红；boundary 反证**第一次打偏**
+（改的是永不被走到的分支，测试仍绿）⇒ 改打 private 分支后单元门与真机门同时红。
+覆盖率 boxlite 78.6%；`go build ./cmd/hno` + `-race` 三包绿。

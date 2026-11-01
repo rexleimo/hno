@@ -357,6 +357,45 @@ sb, err := sandbox.Open(ctx,
 hno sandbox run --isolation microvm --measure-boundary -- go version
 ```
 
+## 微虚拟机 provider
+
+`boxlite` 在本构建里注册为第二个引擎，也是笔记本上能把 VM 这一档真正落地的那一个。在把
+profile 指向它之前，有两点值得先知道，因为这两点都是实测出来的、不是读文档得来的：
+
+- 它**没有 Go SDK**。上游 README 写着 `go get github.com/boxlite-ai/boxlite/sdks/go` 并需要
+  CGO，而模块里只有 `sdks/{c,node,python}`，所有 `sdks/go` 命中都是端到端测试程序。所以这个
+  provider 像容器 provider 一样包 CLI：没有 cgo、不需要 Rust 工具链、不新增任何模块依赖。
+- 这个 CLI **没有 label 概念**。所以在一台机器上发现的 box 无法被归因到本进程，`Prune` 因此
+  拒绝删除而不是猜——`SkippedPrune()` 返回原因，并且会被打印出来，而不是藏进一个 0 里。容器
+  provider 敢删是因为它创建的每个 box 都带归属 label，这个做不到，就如实说做不到。
+
+```go
+sb, err := sandbox.Open(ctx,
+    sandbox.WithProvider("boxlite"),
+    sandbox.WithImage("alpine:latest"),
+    sandbox.WithAttrs(map[string]any{
+        "bin":      "/home/me/.local/bin/boxlite",
+        "registry": "mirror.example",
+    }),
+)
+```
+
+验收目标是 Linux。`Probe` 不按操作系统分支，而是问引擎：它的 `info` 会报
+`virtualization: available` 与否，不满足就返回带修复指引的 `UnavailableError`。**“没回答”
+不等于“通过”**：一个不回答这个问题的引擎不能被假定具备硬件虚拟化，而“每个 box 一个内核”
+正是这个 provider 的全部主张。
+
+引擎强加的两个运维事实：
+
+- `--registry` 是拉取期参数，不会写进 box 记录，所以 provider 自己把镜像引用补全成带镜像源的
+  形式。不这么做的话，`start` 会去默认源拉取，在只有镜像源可达的网络里直接失败。
+- 引擎对 `BOXLITE_HOME` 持有**排他锁**，一个目录只能有一个 runtime。provider 因此串行化自己
+  的 CLI 调用；第二个进程指向同一个 home 会拿到锁错误，而不是排队。
+
+声明的能力只是 CLI 面能兜住的那些：`session`、`streaming`、`port-forward`、
+`egress-allowlist`。快照、克隆、重建与文件桥缺失，因为引擎没有对应动词、或者桥还没写；核心
+无法兑现的能力会在绑定时被拒，而不是等到第四百次运行时才发现。
+
 ## 配方
 
 **钉住镜像，并拒绝任何比容器更松的隔离：**

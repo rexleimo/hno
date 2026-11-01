@@ -110,9 +110,15 @@ seam once, then attach providers to it.
 2. Integrate **external isolation engines as interchangeable providers**, ranked by tier, with
    explicit probing and no silent degradation — the same discipline `NewExecutor` already uses.
 3. For this release, the local strong-isolation tier is **BoxLite as a provider** (Apache-2.0,
-   Go SDK, OCI-native, persistent boxes, `allow_net` egress allowlist, secret placeholders,
+   OCI-native, persistent boxes, `allow_net` egress allowlist, secret placeholders,
    copy-on-write disk, PTY exec) — *behind our interface*, never as our architecture. LiteBox
    stays on strategic watch (§8).
+   **Correction (measured 2026-11, D-41):** this line used to say "Go SDK". There is no Go SDK.
+   Versions v0.5.14 / v0.8.2 / v0.9.7 / v0.10.8 / v0.11.0 ship `sdks/{c,node,python}` only; every
+   `sdks/go` entry in the module zip is an end-to-end test program under `apps/e2e`, the repo has
+   no root `go.mod`, and `go get github.com/boxlite-ai/boxlite/sdks/go` fails with "module found,
+   but does not contain package". The provider is therefore **CLI-backed**, like the container
+   one: no CGO, no Rust toolchain, no new module dependency.
 4. Cheapest first win that needs no new dependency: **gVisor (`runsc`) as an OCI runtime** for the
    existing container executor, which closes the doc's own admitted kernel-escape gap.
 
@@ -159,8 +165,10 @@ journal of whichever provider executes these.
 
 **P0 — Spike and go/no-go gate (timeboxed, throwaway code).**
 (a) gVisor: run the existing container executor against `runsc` with the current policy flags.
-(b) BoxLite Go SDK: minimal provider behind a fake seam — `Create/Exec/Stop/Resume` on
-`python:slim`, plus file copy and `allow_net`.
+(b) BoxLite: minimal provider behind a fake seam — `Create/Exec/Stop/Resume` on
+`alpine:latest`, plus egress allowlisting. (Was "Go SDK"; the SDK does not exist — see D-41.
+The CLI surface is `create/start/exec/cp/list/inspect/logs/stats/rm` plus
+`network inbound|outbound`.)
 Measure vs. today: cold start, per-exec latency, 20-turn session total time, RSS, and whether
 `/dev/kvm` exists in our real deployment (containers on managed k8s usually say no). Verify the
 CGO/Rust build story against `golang:1.24.11-alpine` + `alpine:3.22` (`Dockerfile`) — expect to
@@ -232,9 +240,11 @@ needs no restructuring — that is the point of widening the seam rather than sw
 2. **Deployment substrate:** is `/dev/kvm` available in production (bare metal / GCP nested
    virtualization / k8s with device plugin)? No KVM ⇒ no local microVM tier, and gVisor + E2B
    carry the release.
-3. **Build policy:** are we willing to carry CGO + a Rust-built runner image (BoxLite needs
-   `go get github.com/boxlite-ai/boxlite/sdks/go`, Go 1.24+ with CGO), or must the sandbox engine
-   stay a sidecar binary/service like `podman`/E2B today?
+3. **Build policy:** ~~are we willing to carry CGO + a Rust-built runner image~~ **Answered by
+   measurement, not by preference (D-41):** the premise was false. No Go SDK exists, so there is
+   no CGO or Rust build to carry — the provider shells out to the `boxlite` binary exactly like the
+   container provider does. The remaining question is only how the binary is delivered
+   (verified release tarball vs `curl | sh`); this project used the tarball plus `SHA256SUMS`.
 4. **Compatibility posture:** is `Executor` frozen for the 3.x line (recommended, → v3.1.0), or do
    we allow a breaking redesign (→ v4.0.0)?
 5. **Spending:** keep hosted E2B as the L4 escape hatch, or aim to be self-hostable only?

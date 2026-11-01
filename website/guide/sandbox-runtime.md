@@ -386,6 +386,54 @@ run does.
 hno sandbox run --isolation microvm --measure-boundary -- go version
 ```
 
+## The micro-VM provider
+
+`boxlite` is registered in this build as a second engine, and it is the one that reaches the
+VM tier on a laptop. Two facts about it are worth knowing before you point a profile at it,
+because both were measured rather than read:
+
+- There is **no Go SDK**. The upstream README documents
+  `go get github.com/boxlite-ai/boxlite/sdks/go` with CGO, and the module ships
+  `sdks/{c,node,python}` only — every `sdks/go` entry is an end-to-end test program. The
+  provider therefore wraps the CLI, exactly like the container provider, which means no cgo,
+  no Rust toolchain and no new module dependency.
+- The CLI has **no label concept**. So a box found on a host cannot be attributed to this
+  process, and `Prune` refuses instead of guessing — `SkippedPrune()` returns the reason,
+  which is printed rather than hidden behind a zero count. The container provider can delete
+  because every box it creates carries an ownership label; this one cannot, and says so.
+
+```go
+sb, err := sandbox.Open(ctx,
+    sandbox.WithProvider("boxlite"),
+    sandbox.WithImage("alpine:latest"),
+    sandbox.WithAttrs(map[string]any{
+        "bin":      "/home/me/.local/bin/boxlite",
+        "registry": "mirror.example",
+    }),
+)
+```
+
+The acceptance target is Linux. `Probe` does not branch on the operating system — it asks the
+engine, whose `info` verb reports `virtualization: available` or not, and refuses with a typed
+`UnavailableError` naming what is missing. Unknown is not a pass: an engine that does not
+answer the question cannot be assumed to virtualise, and a box per kernel is this provider's
+entire claim.
+
+Two operational details the engine imposes:
+
+- `--registry` is a pull-time flag that does not persist into the box record, so the provider
+  qualifies the image reference itself. Without that, `start` pulls from the default registry
+  and fails on a network where only the mirror answers.
+- the engine holds an **exclusive lock on `BOXLITE_HOME`**, one runtime per directory. The
+  provider serialises its own CLI calls for that reason; a second process pointed at the same
+  home gets a lock error rather than a queue.
+
+Capabilities claimed are the ones the CLI surface backs: `session`, `streaming`,
+`port-forward`, `egress-allowlist`. Snapshot, clone, rebuild and the file bridge are absent
+because the engine documents no verb for them or the bridge has not been written, and a claim
+the core cannot honour is refused at bind time rather than discovered on the four hundredth
+run.
+
 ## Recipes
 
 **Pin an image and refuse anything looser than a container:**

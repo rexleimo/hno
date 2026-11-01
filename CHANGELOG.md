@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 🚀 Added (B3 / D-41：BoxLite 微虚拟机 provider —— CLI 形状，零新依赖)
+
+- 新增 `pkg/hno/sandbox/provider/boxlite`：在冻结的 `Provider` 契约之上接入 boxlite 引擎。
+  - **上游文档是错的**：README 与设计文档都写 `go get github.com/boxlite-ai/boxlite/sdks/go`（CGO），
+    但 v0.5.14/0.8.2/0.9.7/0.10.8/0.11.0 只发布 `sdks/{c,node,python}`，`sdks/go` 命中全是
+    `apps/e2e` 端到端测试程序，`go get` 报 **does not contain package**。因此走 CLI：无 CGO、无 Rust、
+    不新增模块依赖。
+  - 能力只声明 CLI 面兜得住的 `session / streaming / port-forward / egress-allowlist`；snapshot、
+    clone、rebuild、file-bridge **不声明**（引擎无对应动词或尚未实现），核心在绑定时即校验。
+  - `Probe` 不按 `GOOS` 分支，而是问引擎 `info` 的 `virtualization:` 字段；**「没回答」不等于「通过」**，
+    拒绝时返回带修复指引的 `UnavailableError`（Linux + KVM）。
+  - `Prune` **拒绝**并保留原因（`SkippedPrune()`）：引擎没有 label 概念，无法证明某个 box 属于本进程，
+    「不在我的 map 里」不能作为放弃归属的证据。
+  - 镜像引用自动补镜像源（`--registry` 是拉取期参数、不写入 box 记录，`start` 会回退默认源）；
+    CLI 调用串行化以适配 `BOXLITE_HOME` 的排他锁。
+- 真机门（`integration_test.go`，`HNO_SANDBOX_BOXLITE=1` 开启；开启时**缺二进制即失败而非跳过**）：
+  round-trip（payload + `exit 7` 归类为 user-code）、`MeasureKernelBoundary`（2 box ⇒ 2 个不同
+  boot_id ⇒ `private-kernel`）、测量不残留。实测 **3/3 PASS / 28.4s**，boxlite 侧残留 0。
+- CLI 可达性：`hno sandbox doctor --provider boxlite` 9 项检查、`hno sandbox boundary --provider boxlite`
+  ⇒ `private-kernel`（guest `Linux 6.12.87` on `darwin/arm64`）、`hno sandbox run -shell 'exit 3'` ⇒ rc=3。
+- 真机门抓到三个引擎契约缺陷（均已修复并各配一条单测锁死）：`exec` 缺 `-i` ⇒ guest `sh -s` 挂死并
+  持有排他锁；`rm` 缺 `-f` ⇒ 运行中 box 报成功却仍存在（静默泄漏）；`create --registry` 不持久化。
+- 覆盖率：boxlite **78.6%**；核心 74.1%、`cmd/hno` 78.2% 不变。
+- 文档：`website/guide/sandbox-runtime.md` 与 `website/zh/guide/sandbox-runtime.md` 新增
+  「The micro-VM provider / 微虚拟机 provider」小节；设计文档中 `sdks/go` 的错误断言按实测更正。
+
 ### 🔗 Fixed (B6 / D-40：站点死链清零，检查开关不再可静默关闭)
 - `website/.vitepress/config.mjs` 的 **`ignoreDeadLinks` 由 `true` 改为 `false`**：此前注入死链后
   构建仍 `exit 0`（实测 68s），37 条死链与「每次构建成功」长期共存。
